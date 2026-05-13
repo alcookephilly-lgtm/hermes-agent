@@ -1748,7 +1748,8 @@ def _load_show_reasoning() -> bool:
 
 def _load_tool_progress_mode() -> str:
     env = os.environ.get("HERMES_TUI_TOOL_PROGRESS", "").strip().lower()
-    if env in {"off", "new", "all", "verbose"}:
+    modes = {"off", "compact", "new", "all", "verbose"}
+    if env in modes:
         return env
     raw = (_load_cfg().get("display") or {}).get("tool_progress", "all")
     if raw is False:
@@ -1756,7 +1757,7 @@ def _load_tool_progress_mode() -> str:
     if raw is True:
         return "all"
     mode = str(raw or "all").strip().lower()
-    return mode if mode in {"off", "new", "all", "verbose"} else "all"
+    return mode if mode in modes else "all"
 
 
 def _load_enabled_toolsets() -> list[str] | None:
@@ -2471,7 +2472,9 @@ def _session_info(agent, session: dict | None = None) -> dict:
     return info
 
 
-def _tool_ctx(name: str, args: dict) -> str:
+def _tool_ctx(name: str, args: dict, *, compact: bool = False) -> str:
+    if compact:
+        return ""
     try:
         from agent.display import build_tool_preview
 
@@ -2619,7 +2622,11 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
         payload = {
             "tool_id": tool_call_id,
             "name": name,
-            "context": _tool_ctx(name, args),
+            "context": _tool_ctx(
+                name,
+                args,
+                compact=_session_tool_progress_mode(sid) == "compact",
+            ),
         }
         if _session_verbose(sid):
             args_text = _tool_args_text(args)
