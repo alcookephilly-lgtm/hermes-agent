@@ -1484,7 +1484,7 @@ DEFAULT_CONFIG = {
         "interim_assistant_messages": True,  # Gateway: show natural mid-turn assistant status messages
         "tool_progress_command": False,  # Enable /verbose command in messaging gateway
         "tool_progress_overrides": {},  # DEPRECATED — use display.platforms instead
-        "tool_preview_length": 0,  # Max chars for tool call previews (0 = no limit, show full paths/commands)
+        "tool_preview_length": 0,  # Max chars for tool call previews (0 = no limit; display.tool_progress=compact hides args entirely)
         # How gateway tool-progress is grouped on platforms that support message
         # editing: "accumulate" (default) edits one bubble in place; "separate"
         # sends one message per tool (the pre-v0.9 behavior, noisier). Only
