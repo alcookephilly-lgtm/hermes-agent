@@ -33,8 +33,10 @@ import os
 import re
 import shlex
 import site
+import shutil
 import sys
 import signal
+import subprocess
 import tempfile
 import threading
 import time
@@ -3267,12 +3269,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @staticmethod
     def _is_goal_continuation_event(event_or_text: Any) -> bool:
-        """Return True for synthetic /goal continuation turns.
+        """Return True for synthetic /goal-owned queued turns.
 
-        Goal continuations are normal queued user-role events, so pause/clear
-        must distinguish them from real user /queue messages before removing or
-        suppressing them.
+        Covers both post-judge continuation prompts and the initial synthetic
+        kickoff/resume events queued by the gateway itself. User-authored
+        /queue messages must be preserved even if their text resembles a goal.
         """
+        raw = getattr(event_or_text, "raw_message", None)
+        if isinstance(raw, dict) and raw.get("goal_synthetic"):
+            return True
         text = getattr(event_or_text, "text", event_or_text) or ""
         return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
 
@@ -9895,6 +9900,153 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return GoalManager(session_id=sid, default_max_turns=max_turns), session_entry
 
 
+    async def _handle_goal_command(self, event: "MessageEvent") -> str:
+        """Handle /goal for gateway platforms.
+
+        Subcommands: ``/goal`` / ``/goal status`` / ``/goal pause`` /
+        ``/goal resume`` / ``/goal clear``. Any other text becomes the
+        new goal.
+
+        Setting a new goal queues the goal text as the next turn so the
+        agent starts working on it immediately — the post-turn
+        continuation hook then takes over from there.
+        """
+        args = (event.get_command_args() or "").strip()
+        lower = args.lower()
+
+        mgr, session_entry = self._get_goal_manager_for_event(event)
+        if mgr is None:
+            return t("gateway.goal.unavailable")
+
+        if not args or lower == "status":
+            return mgr.status_line()
+
+        if lower == "pause":
+            state = mgr.pause(reason="user-paused")
+            if state is None:
+                return t("gateway.goal.no_goal_set")
+            try:
+                adapter = self.adapters.get(event.source.platform) if event.source else None
+                _quick_key = self._session_key_for_source(event.source) if event.source else None
+                if adapter and _quick_key:
+                    self._clear_goal_pending_continuations(_quick_key, adapter)
+            except Exception as exc:
+                logger.debug("goal pause: pending continuation cleanup failed: %s", exc)
+            return t("gateway.goal.paused", goal=state.goal)
+
+        if lower == "resume":
+            state = mgr.resume()
+            if state is None:
+                return t("gateway.goal.no_resume")
+            adapter = self.adapters.get(event.source.platform) if event.source else None
+            _quick_key = self._session_key_for_source(event.source) if event.source else None
+            if adapter and _quick_key:
+                try:
+                    self._clear_goal_pending_continuations(_quick_key, adapter)
+                    prompt = mgr.next_continuation_prompt() or state.goal
+                    kickoff_event = MessageEvent(
+                        text=prompt,
+                        message_type=MessageType.TEXT,
+                        source=event.source,
+                        message_id=event.message_id,
+                        channel_prompt=event.channel_prompt,
+                        raw_message={"goal_synthetic": True, "goal_origin": "resume"},
+                        internal=True,
+                    )
+                    self._enqueue_fifo(_quick_key, kickoff_event, adapter)
+                except Exception as exc:
+                    logger.debug("goal resume enqueue failed: %s", exc)
+            return t("gateway.goal.resumed", goal=state.goal)
+
+        if lower in {"clear", "stop", "done"}:
+            had = mgr.has_goal()
+            mgr.clear()
+            try:
+                adapter = self.adapters.get(event.source.platform) if event.source else None
+                _quick_key = self._session_key_for_source(event.source) if event.source else None
+                if adapter and _quick_key:
+                    self._clear_goal_pending_continuations(_quick_key, adapter)
+            except Exception as exc:
+                logger.debug("goal clear: pending continuation cleanup failed: %s", exc)
+            return t("gateway.goal_cleared") if had else t("gateway.no_active_goal")
+
+        # Otherwise — treat the remaining text as the new goal.
+        try:
+            state = mgr.set(args)
+        except ValueError as exc:
+            return t("gateway.goal.invalid", error=str(exc))
+
+        # Queue the goal text as an immediate first turn so the agent
+        # starts making progress. The post-turn hook takes over after.
+        adapter = self.adapters.get(event.source.platform) if event.source else None
+        _quick_key = self._session_key_for_source(event.source) if event.source else None
+        if adapter and _quick_key:
+            try:
+                kickoff_event = MessageEvent(
+                    text=state.goal,
+                    message_type=MessageType.TEXT,
+                    source=event.source,
+                    message_id=event.message_id,
+                    channel_prompt=event.channel_prompt,
+                    raw_message={"goal_synthetic": True, "goal_origin": "set"},
+                    internal=True,
+                )
+                self._enqueue_fifo(_quick_key, kickoff_event, adapter)
+            except Exception as exc:
+                logger.debug("goal kickoff enqueue failed: %s", exc)
+
+        return t("gateway.goal.set", budget=state.max_turns, goal=state.goal)
+
+    async def _handle_subgoal_command(self, event: "MessageEvent") -> str:
+        """Handle /subgoal for gateway platforms (mirror of CLI handler).
+
+        Subgoals are extra criteria appended to the active goal mid-loop.
+        They modify state read at the next turn boundary, so this is safe
+        to invoke while the agent is running.
+        """
+        args = (event.get_command_args() or "").strip()
+        mgr, _session_entry = self._get_goal_manager_for_event(event)
+        if mgr is None:
+            return t("gateway.goal.unavailable")
+        if not mgr.has_goal():
+            return "No active goal. Set one with /goal <text>."
+
+        # No args → list current subgoals.
+        if not args:
+            return f"{mgr.status_line()}\n{mgr.render_subgoals()}"
+
+        tokens = args.split(None, 1)
+        verb = tokens[0].lower()
+        rest = tokens[1].strip() if len(tokens) > 1 else ""
+
+        if verb == "remove":
+            if not rest:
+                return "Usage: /subgoal remove <n>"
+            try:
+                idx = int(rest.split()[0])
+            except ValueError:
+                return "/subgoal remove: <n> must be an integer (1-based index)."
+            try:
+                removed = mgr.remove_subgoal(idx)
+            except (IndexError, RuntimeError) as exc:
+                return f"/subgoal remove: {exc}"
+            return f"✓ Removed subgoal {idx}: {removed}"
+
+        if verb == "clear":
+            try:
+                prev = mgr.clear_subgoals()
+            except RuntimeError as exc:
+                return f"/subgoal clear: {exc}"
+            if prev:
+                return f"✓ Cleared {prev} subgoal{'s' if prev != 1 else ''}."
+            return "No subgoals to clear."
+
+        try:
+            text = mgr.add_subgoal(args)
+        except (ValueError, RuntimeError) as exc:
+            return f"/subgoal: {exc}"
+        idx = len(mgr.state.subgoals) if mgr.state else 0
+        return f"✓ Added subgoal {idx}: {text}"
 
     async def _send_goal_status_notice(self, source: Any, message: str) -> None:
         """Send a /goal judge status line back to the originating chat/thread."""
@@ -10022,6 +10174,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    raw_message={"goal_synthetic": True, "goal_origin": "continuation"},
+                    internal=True,
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
