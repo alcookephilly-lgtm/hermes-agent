@@ -400,6 +400,55 @@ def test_dispatch_rejects_non_object_params():
     }
 
 
+
+def test_notification_event_belongs_only_to_own_session_key():
+    session = {"session_key": "sess-owner"}
+
+    assert server._notification_event_belongs_to_session(
+        {"type": "watch_match", "session_key": "sess-owner"}, session
+    ) is True
+    assert server._notification_event_belongs_to_session(
+        {"type": "watch_match", "session_key": "sess-other"}, session
+    ) is False
+    assert server._notification_event_belongs_to_session(
+        {"type": "watch_match"}, session
+    ) is False
+
+
+def test_foreign_notification_event_is_requeued_not_delivered(monkeypatch):
+    evt = {"type": "watch_match", "session_key": "sess-other"}
+    queued = []
+
+    class FakeQueue:
+        def put(self, item):
+            queued.append(item)
+
+    class FakeRegistry:
+        completion_queue = FakeQueue()
+
+    assert server._requeue_foreign_notification_event(
+        evt, current_session_key="sess-owner", process_registry=FakeRegistry, max_attempts=3
+    ) is True
+    assert queued == [evt]
+    assert evt["_tui_requeue_attempts"] == 1
+
+
+def test_foreign_notification_event_drops_after_requeue_limit():
+    evt = {"type": "watch_match", "session_key": "sess-other", "_tui_requeue_attempts": 3}
+    queued = []
+
+    class FakeQueue:
+        def put(self, item):
+            queued.append(item)
+
+    class FakeRegistry:
+        completion_queue = FakeQueue()
+
+    assert server._requeue_foreign_notification_event(
+        evt, current_session_key="sess-owner", process_registry=FakeRegistry, max_attempts=3
+    ) is False
+    assert queued == []
+
 def test_voice_toggle_returns_configured_record_key(monkeypatch):
     monkeypatch.setattr(
         server,
@@ -6636,6 +6685,7 @@ def test_notification_poller_delivers_completion(monkeypatch):
     process_registry.completion_queue.put({
         "type": "completion",
         "session_id": "proc_poller_test",
+        "session_key": sess["session_key"],
         "command": "echo hello",
         "exit_code": 0,
         "output": "hello",
@@ -6690,6 +6740,7 @@ def test_notification_poller_skips_consumed(monkeypatch):
     process_registry.completion_queue.put({
         "type": "completion",
         "session_id": "proc_already_done",
+        "session_key": sess["session_key"],
         "command": "echo x",
         "exit_code": 0,
         "output": "x",
@@ -6732,6 +6783,7 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
     evt = {
         "type": "completion",
         "session_id": "proc_busy_test",
+        "session_key": sess["session_key"],
         "command": "make build",
         "exit_code": 0,
         "output": "ok",
