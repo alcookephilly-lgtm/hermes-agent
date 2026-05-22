@@ -7532,6 +7532,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "status":
             return await self._handle_status_command(event)
 
+        if canonical == "tgtocli":
+            return await self._handle_tgtocli_command(event)
+
         if canonical == "agents":
             return await self._handle_agents_command(event)
 
@@ -9687,6 +9690,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
+    async def _handle_tgtocli_command(self, event: MessageEvent) -> str:
+        """Handle /tgtocli by printing manual CLI resume instructions.
+
+        Keep this command side-effect free. It should not spawn tmux or try to
+        mutate an already-open CLI; the user chooses where to run the resume.
+        """
+        source = event.source
+        if getattr(source, "platform", None) is None or source.platform.value != "telegram":
+            return "/tgtocli only works from Telegram. Use `hermes --resume <session_id>` from CLI for other platforms."
+
+        session_entry = self.session_store.get_or_create_session(source)
+        session_id = str(session_entry.session_id)
+        short_id = session_id.split("_")[-1][:8] if session_id else "session"
+        safe_short = re.sub(r"[^A-Za-z0-9_-]", "", short_id) or "session"
+        tmux_name = f"hermes-tgtocli-{safe_short}"
+        resume_cmd = f"hermes --resume {shlex.quote(session_id)}"
+        tmux_cmd = f"tmux new-session -s {shlex.quote(tmux_name)} {shlex.quote(resume_cmd)}"
+
+        title = None
+        if self._session_db:
+            try:
+                title = self._session_db.get_session_title(session_id)
+            except Exception:
+                title = None
+        title_line = f"\nTitle: {title}" if title else ""
+
+        return (
+            "Open this Telegram session in CLI manually.\n\n"
+            "Run in a terminal:\n"
+            f"`{resume_cmd}`\n\n"
+            "Optional tmux:\n"
+            f"`{tmux_cmd}`\n\n"
+            "Note: this does not switch an already-open CLI.\n\n"
+            f"Session: `{session_id}`{title_line}"
+        )
 
     def _is_stale_restart_redelivery(self, event: MessageEvent) -> bool:
         """Return True if this /restart is a Telegram re-delivery we already handled.
