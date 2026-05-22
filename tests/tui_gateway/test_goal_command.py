@@ -134,13 +134,15 @@ def test_goal_pause_after_set(server, session):
     assert GoalManager(session_key).state.status == "paused"
 
 
-def test_goal_resume_reactivates(server, session):
+def test_goal_resume_reactivates_and_kicks_off(server, session):
     sid, session_key, _ = session
     _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)
     _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
     r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
-    assert r["result"]["type"] == "exec"
-    assert "resumed" in r["result"]["output"].lower()
+    assert r["result"]["type"] == "send"
+    assert "resumed" in r["result"]["notice"].lower()
+    assert "Queued the next continuation turn now" in r["result"]["notice"]
+    assert "Continuing toward your standing goal" in r["result"]["message"]
 
     from hermes_cli.goals import GoalManager
 
