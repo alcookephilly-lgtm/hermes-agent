@@ -42,7 +42,7 @@ What you'll see:
 | `/goal <text>` | Set (or replace) the standing goal. Kicks off the first turn immediately so you don't need to send a separate message. |
 | `/goal` or `/goal status` | Show the current goal, its status, and turns used. |
 | `/goal pause` | Stop the auto-continuation loop without clearing the goal. |
-| `/goal resume` | Resume the loop (resets the turn counter back to zero). |
+| `/goal resume` | Resume the loop, reset the turn counter, and immediately queue the next continuation turn. |
 | `/goal clear` | Drop the goal entirely. |
 
 Works identically on the CLI and every gateway platform (Telegram, Discord, Slack, Matrix, Signal, WhatsApp, SMS, iMessage, Webhook, API server, and the web dashboard).
