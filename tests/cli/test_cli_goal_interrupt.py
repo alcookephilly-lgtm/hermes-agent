@@ -197,6 +197,49 @@ class TestHealthyTurnStillRuns:
         assert mgr.state.status == "done"
 
 
+class TestGoalControlQueueCleanup:
+    def test_resume_queues_continuation_immediately(self, hermes_home):
+        sid = f"sid-resume-kickoff-{uuid.uuid4().hex}"
+        cli, mgr = _make_cli_with_goal(sid)
+        mgr.pause(reason="user-paused")
+
+        with patch("cli._cprint"):
+            cli._handle_goal_command("/goal resume")
+
+        assert mgr.state.status == "active"
+        queued = cli._pending_input.get_nowait()
+        assert "Continuing toward your standing goal" in queued
+        assert sid == cli.session_id
+
+    def test_pause_clears_stale_continuation_prompt(self, hermes_home):
+        sid = f"sid-pause-cleanup-{uuid.uuid4().hex}"
+        cli, mgr = _make_cli_with_goal(sid)
+        cli._pending_input.put(mgr.next_continuation_prompt())
+        cli._pending_input.put("/goal pause")
+
+        with patch("cli._cprint"):
+            cli._handle_goal_command("/goal pause")
+
+        assert mgr.state.status == "paused"
+        leftovers = list(cli._pending_input.queue)
+        assert all("Continuing toward your standing goal" not in str(item) for item in leftovers)
+        assert leftovers == ["/goal pause"]
+
+    def test_clear_clears_stale_continuation_prompt(self, hermes_home):
+        sid = f"sid-clear-cleanup-{uuid.uuid4().hex}"
+        cli, mgr = _make_cli_with_goal(sid)
+        cli._pending_input.put(mgr.next_continuation_prompt())
+        cli._pending_input.put("/goal clear")
+
+        with patch("cli._cprint"):
+            cli._handle_goal_command("/goal clear")
+
+        assert mgr.state is None
+        leftovers = list(cli._pending_input.queue)
+        assert all("Continuing toward your standing goal" not in str(item) for item in leftovers)
+        assert leftovers == ["/goal clear"]
+
+
 class TestInterruptFlagLifecycle:
     def test_chat_resets_flag_at_entry(self, hermes_home):
         """chat() must reset _last_turn_interrupted at the top of each turn.

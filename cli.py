@@ -7844,7 +7844,191 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._goal_manager = mgr
         return mgr
 
+    def _is_goal_continuation_payload(self, entry: object) -> bool:
+        """Return True when a pending-queue entry is a goal continuation prompt."""
+        if isinstance(entry, tuple) and entry:
+            entry = entry[0]
+        return isinstance(entry, str) and entry.startswith("[Continuing toward your standing goal]")
 
+    def _clear_goal_pending_continuations(self) -> int:
+        """Drop queued goal continuation prompts from ``_pending_input``.
+
+        Needed when the user pauses/clears/resumes a goal while a prior
+        continuation is already queued. Without this, the stale queued prompt
+        can fire one extra turn after the control command is processed.
+        """
+        pending = getattr(self, "_pending_input", None)
+        if pending is None:
+            return 0
+        try:
+            with pending.mutex:
+                original = list(pending.queue)
+                kept = [entry for entry in original if not self._is_goal_continuation_payload(entry)]
+                removed = len(original) - len(kept)
+                if removed:
+                    pending.queue.clear()
+                    pending.queue.extend(kept)
+                    pending.unfinished_tasks = max(0, pending.unfinished_tasks - removed)
+                    pending.not_full.notify_all()
+                return removed
+        except Exception:
+            return 0
+
+    def _enqueue_goal_followup(self, prompt: str) -> bool:
+        if not prompt:
+            return False
+        try:
+            self._pending_input.put(prompt)
+            return True
+        except Exception:
+            return False
+
+    def _handle_goal_command(self, cmd: str) -> None:
+        """Dispatch /goal subcommands: set / status / pause / resume / clear."""
+        parts = (cmd or "").strip().split(None, 1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        mgr = self._get_goal_manager()
+        if mgr is None:
+            _cprint(f"  {_DIM}Goals unavailable (no active session).{_RST}")
+            return
+
+        lower = arg.lower()
+
+        # Bare /goal or /goal status → show current state
+        if not arg or lower == "status":
+            _cprint(f"  {mgr.status_line()}")
+            return
+
+        if lower == "pause":
+            state = mgr.pause(reason="user-paused")
+            if state is None:
+                _cprint(f"  {_DIM}No goal set.{_RST}")
+            else:
+                self._clear_goal_pending_continuations()
+                _cprint(f"  ⏸ Goal paused: {state.goal}")
+            return
+
+        if lower == "resume":
+            state = mgr.resume()
+            if state is None:
+                _cprint(f"  {_DIM}No goal to resume.{_RST}")
+            else:
+                self._clear_goal_pending_continuations()
+                prompt = mgr.next_continuation_prompt() or state.goal
+                kicked = self._enqueue_goal_followup(prompt)
+                _cprint(f"  ▶ Goal resumed: {state.goal}")
+                if kicked:
+                    _cprint(f"  {_DIM}Queued the next continuation turn now.{_RST}")
+                else:
+                    _cprint(
+                        f"  {_DIM}Resume succeeded, but automatic kickoff could not be queued. "
+                        f"Send any message to continue.{_RST}"
+                    )
+            return
+
+        if lower in {"clear", "stop", "done"}:
+            had = mgr.has_goal()
+            mgr.clear()
+            self._clear_goal_pending_continuations()
+            if had:
+                _cprint("  ✓ Goal cleared.")
+            else:
+                _cprint(f"  {_DIM}No active goal.{_RST}")
+            return
+
+        # Otherwise treat the arg as the goal text.
+        try:
+            state = mgr.set(arg)
+        except ValueError as exc:
+            _cprint(f"  Invalid goal: {exc}")
+            return
+
+        _cprint(f"  ⊙ Goal set ({state.max_turns}-turn budget): {state.goal}")
+        _cprint(
+            f"  {_DIM}After each turn, a judge model will check if the goal is done. "
+            f"Hermes keeps working until it is, you pause/clear it, or the budget is "
+            f"exhausted. Use /goal status, /goal pause, /goal resume, /goal clear.{_RST}"
+        )
+        # Kick the loop off immediately so the user doesn't have to send a
+        # separate message after setting the goal.
+        self._clear_goal_pending_continuations()
+        self._enqueue_goal_followup(state.goal)
+
+    def _handle_subgoal_command(self, cmd: str) -> None:
+        """Dispatch /subgoal subcommands.
+
+        Forms:
+          /subgoal                              show current subgoals
+          /subgoal <text>                       append a criterion
+          /subgoal remove <n>                   drop subgoal n (1-based)
+          /subgoal clear                        wipe all subgoals
+
+        Subgoals are extra criteria the user adds mid-loop. They get
+        appended to both the judge prompt (verdict must consider them)
+        and the continuation prompt (agent sees them) on the next turn
+        boundary. No special kick — the running turn finishes, the next
+        judge call includes them.
+        """
+        parts = (cmd or "").strip().split(None, 2)
+        arg = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
+
+        mgr = self._get_goal_manager()
+        if mgr is None:
+            _cprint(f"  {_DIM}Goals unavailable (no active session).{_RST}")
+            return
+
+        if not mgr.has_goal():
+            _cprint(f"  {_DIM}No active goal. Set one with /goal <text>.{_RST}")
+            return
+
+        # No args → list current subgoals.
+        if not arg:
+            _cprint(f"  {mgr.status_line()}")
+            _cprint(f"  {mgr.render_subgoals()}")
+            return
+
+        tokens = arg.split(None, 1)
+        verb = tokens[0].lower()
+        rest = tokens[1].strip() if len(tokens) > 1 else ""
+
+        if verb == "remove":
+            if not rest:
+                _cprint("  Usage: /subgoal remove <n>")
+                return
+            try:
+                idx = int(rest.split()[0])
+            except ValueError:
+                _cprint("  /subgoal remove: <n> must be an integer (1-based index).")
+                return
+            try:
+                removed = mgr.remove_subgoal(idx)
+            except (IndexError, RuntimeError) as exc:
+                _cprint(f"  /subgoal remove: {exc}")
+                return
+            _cprint(f"  ✓ Removed subgoal {idx}: {removed}")
+            return
+
+        if verb == "clear":
+            try:
+                prev = mgr.clear_subgoals()
+            except RuntimeError as exc:
+                _cprint(f"  /subgoal clear: {exc}")
+                return
+            if prev:
+                _cprint(f"  ✓ Cleared {prev} subgoal{'s' if prev != 1 else ''}.")
+            else:
+                _cprint(f"  {_DIM}No subgoals to clear.{_RST}")
+            return
+
+        # Otherwise — append the whole arg as a new subgoal.
+        try:
+            text = mgr.add_subgoal(arg)
+        except (ValueError, RuntimeError) as exc:
+            _cprint(f"  /subgoal: {exc}")
+            return
+        idx = len(mgr.state.subgoals) if mgr.state else 0
+        _cprint(f"  ✓ Added subgoal {idx}: {text}")
 
     def _maybe_continue_goal_after_turn(self) -> None:
         """Hook run after every CLI turn. Judges + maybe re-queues.
