@@ -476,45 +476,72 @@ def compress_context(
             ),
         })
 
-    try:
-        compressed = agent.context_compressor.compress(
-            messages_for_compression,
-            current_tokens=approx_tokens,
-            focus_topic=focus_topic,
-            force=force,
-        )
-    except TypeError:
-        # Plugin context engine with strict signature that doesn't accept
-        # focus_topic / force — fall back to calling without them.
-        compressed = agent.context_compressor.compress(
-            messages_for_compression,
-            current_tokens=approx_tokens,
-        )
-    except BaseException:
-        # ANY exception during compress() must release the lock so the
-        # session isn't permanently blocked from future compression.
-        _release_lock()
-        raise
+    source_of_truth_compressed = []
+    if agent._memory_manager:
+        try:
+            source_of_truth_compressed = agent._memory_manager.build_source_of_truth_compaction(
+                messages,
+                last_user_message=last_user_message,
+                memory_context=memory_compression_context,
+                session_id=agent.session_id or "",
+                focus_topic=focus_topic or "",
+            ) or []
+        except Exception:
+            source_of_truth_compressed = []
 
-    # If compression aborted (aux LLM failed to produce a usable summary)
-    # the compressor returns the input messages unchanged.  Surface the
-    # error to the user, skip the session-rotation work entirely (no
-    # session has logically ended), and let auto-compress callers detect
-    # the no-op via len(returned) == len(input).
-    if getattr(agent.context_compressor, "_last_compress_aborted", False):
-        _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
-        if getattr(agent, "_last_compression_summary_warning", None) != _err:
-            agent._last_compression_summary_warning = _err
-            agent._emit_warning(
-                f"⚠ Compression aborted: {_err}. "
-                "No messages were dropped — conversation continues unchanged. "
-                "Run /compress to retry, or /new to start a fresh session."
+    if source_of_truth_compressed:
+        compressed = source_of_truth_compressed
+        try:
+            agent.context_compressor._last_summary_error = None
+            agent.context_compressor._last_aux_model_failure_model = None
+            agent.context_compressor._last_aux_model_failure_error = None
+            agent.context_compressor.compression_count += 1
+        except Exception:
+            pass
+        logger.info(
+            "context compression used memory provider source-of-truth checkpoint: session=%s messages=%d->%d",
+            agent.session_id or "none", _pre_msg_count, len(compressed),
+        )
+    else:
+        try:
+            compressed = agent.context_compressor.compress(
+                messages_for_compression,
+                current_tokens=approx_tokens,
+                focus_topic=focus_topic,
+                force=force,
             )
-        _existing_sp = getattr(agent, "_cached_system_prompt", None)
-        if not _existing_sp:
-            _existing_sp = agent._build_system_prompt(system_message)
-        _release_lock()  # compression aborted — no rotation will happen
-        return messages, _existing_sp
+        except TypeError:
+            # Plugin context engine with strict signature that doesn't accept
+            # focus_topic / force — fall back to calling without them.
+            compressed = agent.context_compressor.compress(
+                messages_for_compression,
+                current_tokens=approx_tokens,
+            )
+        except BaseException:
+            # ANY exception during compress() must release the lock so the
+            # session isn't permanently blocked from future compression.
+            _release_lock()
+            raise
+
+        # If compression aborted (aux LLM failed to produce a usable summary)
+        # the compressor returns the input messages unchanged.  Surface the
+        # error to the user, skip the session-rotation work entirely (no
+        # session has logically ended), and let auto-compress callers detect
+        # the no-op via len(returned) == len(input).
+        if getattr(agent.context_compressor, "_last_compress_aborted", False):
+            _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
+            if getattr(agent, "_last_compression_summary_warning", None) != _err:
+                agent._last_compression_summary_warning = _err
+                agent._emit_warning(
+                    f"⚠ Compression aborted: {_err}. "
+                    "No messages were dropped — conversation continues unchanged. "
+                    "Run /compress to retry, or /new to start a fresh session."
+                )
+            _existing_sp = getattr(agent, "_cached_system_prompt", None)
+            if not _existing_sp:
+                _existing_sp = agent._build_system_prompt(system_message)
+            _release_lock()  # compression aborted — no rotation will happen
+            return messages, _existing_sp
 
     summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
     if summary_error:
@@ -544,7 +571,8 @@ def compress_context(
 
     todo_snapshot = agent._todo_store.format_for_injection()
     if todo_snapshot:
-        compressed.append({"role": "user", "content": todo_snapshot})
+        todo_role = "system" if compressed and compressed[-1].get("role") == "user" else "user"
+        compressed.append({"role": todo_role, "content": todo_snapshot})
 
     agent._invalidate_system_prompt()
     new_system_prompt = agent._build_system_prompt(system_message)
