@@ -1193,10 +1193,50 @@ class MemoryMunchProvider(MemoryProvider):
         rows.sort(key=lambda item: (item.get("ts") or "", item.get("session_id") or ""))
         return rows
 
+    MEMORYMUNCH_CURATOR_STOPWORDS = {
+        "the", "and", "for", "with", "that", "this", "from", "what", "when", "where",
+        "why", "how", "you", "your", "are", "was", "were", "have", "has", "had",
+        "about", "into", "give", "tell", "make", "need", "needs", "issue", "issues",
+        "memory", "memories", "memorymunch", "hermes", "hermies", "openclaw", "plugin",
+        "audit", "parity", "build", "fix", "fixed", "missed", "consistent", "document",
+        "prompt", "reference", "refs", "file", "path", "agent", "system", "capture",
+        "curator", "janitor", "compare", "comparison", "session", "sessions",
+    }
+
+    def _query_terms(self, query: str) -> list[str]:
+        raw = re.findall(r"[A-Za-z0-9_./:-]+", (query or "").lower())
+        terms: list[str] = []
+        for term in raw:
+            if len(term) < 4:
+                continue
+            if term in self.MEMORYMUNCH_CURATOR_STOPWORDS:
+                continue
+            if term not in terms:
+                terms.append(term)
+        return terms[:12]
+
     def _match_terms(self, query: str, text: str) -> list[str]:
-        terms = [t for t in re.findall(r"[A-Za-z0-9_./:-]+", (query or "").lower()) if len(t) >= 3]
+        terms = self._query_terms(query)
         hay = (text or "").lower()
         return [term for term in dict.fromkeys(terms) if term in hay]
+
+    def _is_absolute_rule_row(self, row: dict[str, Any]) -> bool:
+        atom = str(row.get("atom_id") or row.get("id") or "").lower()
+        text = str(row.get("content_preview") or row.get("content") or "").lower()
+        memory_type = str(row.get("memory_type") or row.get("type") or "").lower()
+        return (
+            atom.startswith("rule::")
+            or "::absolute-rule" in atom
+            or ("absolute" in text and "rule" in text)
+            or memory_type == "procedural"
+        )
+
+    def _is_query_relevant_row(self, row: dict[str, Any], query: str, matched: list[str]) -> bool:
+        if self._is_absolute_rule_row(row):
+            return True
+        if not self._query_terms(query):
+            return False
+        return bool(matched)
 
     def _snippet_for_match(self, text: str, terms: list[str], width: int = 220) -> str:
         clean = " ".join((text or "").split())
@@ -1304,18 +1344,30 @@ class MemoryMunchProvider(MemoryProvider):
                 "GRAPH_LINKED_OUTWARD": 1.0,
                 "OLD_CONVERSATION_SEARCH": 0.5,
             }.get(provenance, 1.5)
+            is_absolute_rule = self._is_absolute_rule_row(row)
+            meaningful_terms = self._query_terms(query)
+            relevance_kept = provenance == "ACTIVE_SESSION_LEDGER_CURRENT" or is_absolute_rule or bool(matched)
+            if provenance == "ACTIVE_SESSION_LINEAGE" and meaningful_terms and not matched and not is_absolute_rule:
+                # Keep current turn unconditionally, but do not let stale lineage bleed across topics.
+                continue
+            if provenance not in {"ACTIVE_SESSION_LEDGER_CURRENT", "ACTIVE_SESSION_LINEAGE"}:
+                if not self._is_query_relevant_row(row, query, matched):
+                    # Activation-only vault/personal facts must never beat query relevance.
+                    # Live bug this blocks: Lake View Drive / email / income facts in plugin audits.
+                    continue
+                relevance_kept = relevance_kept or bool(matched)
             match_score = len(matched) * 10.0
             activation_score = min(max(activation, 0.0), 1.0)
-            # Activation-only vault/personal facts are common noise. They can
-            # survive only as tail continuity if nothing matches the query.
+            # Activation is a tie-breaker only, never a reason to inject unrelated facts.
             if not matched and ("activation" in source.lower() or provenance in {"OWN_SCOPE", "OBSIDIAN_VAULT_OWN_SCOPE"}):
-                authority -= 2.0
+                authority -= 4.0
             curated = dict(row)
             curated["matched_terms"] = matched
+            curated["relevance_kept"] = relevance_kept
             scored.append((match_score + authority + activation_score, idx, curated))
-        has_match = any(item[2].get("matched_terms") for item in scored)
+        has_match = any(item[2].get("matched_terms") or item[2].get("relevance_kept") for item in scored)
         if has_match:
-            scored = [item for item in scored if item[2].get("matched_terms")]
+            scored = [item for item in scored if item[2].get("matched_terms") or item[2].get("relevance_kept")]
         else:
             scored = sorted(scored, key=lambda item: (item[0], -item[1]), reverse=True)[:max(0, keep_if_no_match)]
         scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
@@ -1643,13 +1695,29 @@ class MemoryMunchProvider(MemoryProvider):
 
     def _maybe_live_capture_exchange(self, session_id: str, user_content: str, assistant_content: str) -> None:
         if not self._live_capture_enabled():
+            self._append_session_event(
+                session_id,
+                "live_capture_skipped",
+                reason="env_gates_disabled",
+                live_db_write=False,
+                live_vault_write=False,
+                env_live_write=os.environ.get("HERMES_MEMORYMUNCH_LIVE_WRITE_ENABLE", ""),
+                env_auto_capture=os.environ.get("HERMES_MEMORYMUNCH_AUTO_CAPTURE_ENABLE", ""),
+            )
             return
         clean_user = redact_for_shadow_seed(user_content)
         clean_assistant = redact_for_shadow_seed(assistant_content)
         if _has_secret_like_text(clean_user) or _has_secret_like_text(clean_assistant):
-            self._append_session_event(session_id, "live_capture_skipped", reason="secret_like_content")
+            self._append_session_event(session_id, "live_capture_skipped", reason="secret_like_content", live_db_write=False, live_vault_write=False)
             return
         facts = self._facts_for_live_capture(session_id, clean_user, clean_assistant)
+        self._append_session_event(
+            session_id,
+            "live_capture_attempted",
+            live_db_write=False,
+            live_vault_write=False,
+            facts_candidate_count=len(facts),
+        )
         try:
             payload = self._run_original_bridge("ingest_exchange", {
                 "user_message": clean_user,
