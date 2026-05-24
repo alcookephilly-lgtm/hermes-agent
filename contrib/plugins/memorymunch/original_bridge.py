@@ -66,6 +66,60 @@ async def edge_cleanup() -> dict[str, Any]:
         "total_edges_after": total_edges_after,
     }
 
+async def archive_memory(memory_id: str) -> dict[str, Any]:
+    protected_prefixes = ("system::", "identity::", "hub::", "skill-", "rule::")
+    if memory_id.lower().startswith(protected_prefixes) or "absolute-rule" in memory_id.lower():
+        raise ValueError(f"refusing to archive protected atom: {memory_id}")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        before = await conn.fetchrow("SELECT id, archived FROM memories WHERE id=$1", memory_id)
+        if not before:
+            raise ValueError(f"memory not found: {memory_id}")
+        result = await conn.execute("UPDATE memories SET archived=true WHERE id=$1", memory_id)
+        edge_result = await conn.execute("DELETE FROM edges WHERE source_id=$1 OR target_id=$1", memory_id)
+    def _affected(text: str) -> int:
+        try:
+            return int(str(text).split()[-1])
+        except Exception:
+            return 0
+    return {
+        "memory_id": memory_id,
+        "already_archived": bool(before["archived"]),
+        "archived_rows": _affected(result),
+        "edges_deleted": _affected(edge_result),
+    }
+
+
+async def edge_prune(atom_id: str, max_edges: int = 50) -> dict[str, Any]:
+    protected_prefixes = ("system::", "identity::", "hub::", "skill-", "rule::")
+    if atom_id.lower().startswith(protected_prefixes) or "absolute-rule" in atom_id.lower():
+        raise ValueError(f"refusing to prune protected atom: {atom_id}")
+    keep = max(1, int(max_edges or 50))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        before = await conn.fetchval("SELECT COUNT(*) FROM edges WHERE source_id=$1", atom_id)
+        result = await conn.execute(
+            """
+            DELETE FROM edges
+            WHERE ctid IN (
+              SELECT ctid FROM (
+                SELECT ctid, row_number() OVER (ORDER BY weight DESC, target_id ASC) AS rn
+                FROM edges
+                WHERE source_id=$1
+              ) ranked
+              WHERE ranked.rn > $2
+            )
+            """,
+            atom_id,
+            keep,
+        )
+        after = await conn.fetchval("SELECT COUNT(*) FROM edges WHERE source_id=$1", atom_id)
+    try:
+        deleted = int(str(result).split()[-1])
+    except Exception:
+        deleted = 0
+    return {"atom_id": atom_id, "max_edges": keep, "edges_before": before, "edges_after": after, "edges_deleted": deleted}
+
 
 async def schema_counts() -> dict[str, Any]:
     pool = await get_pool()
@@ -160,6 +214,10 @@ async def run_tool(tool: str, args: dict[str, Any]) -> Any:
         )
     if tool == "edge_cleanup":
         return await edge_cleanup()
+    if tool == "archive_memory":
+        return await archive_memory(memory_id=args["memory_id"])
+    if tool == "edge_prune":
+        return await edge_prune(atom_id=args["atom_id"], max_edges=args.get("max_edges", 50))
     if tool == "brain_health":
         return await brain_health()
     if tool == "schema_counts":
