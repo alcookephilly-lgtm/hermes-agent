@@ -24,6 +24,26 @@ sessions, stale activation memories, or bad compaction summaries into the answer
 
 The plugin is the engine. The source/test branch proves the engine stays safe.
 
+## Compaction ownership
+
+MemoryMunch owns its compaction protocols when the plugin is enabled. Hermes core
+is only the wall outlet/hook: it asks the active memory provider whether it wants
+to build a source-of-truth compaction checkpoint. If MemoryMunch is off or says
+no, Hermes uses normal compaction.
+
+Switches:
+
+```bash
+# MemoryMunch off: Hermes normal compaction
+unset HERMES_MEMORYMUNCH_ENABLE
+
+# MemoryMunch on: MemoryMunch source-of-truth compaction protocols are on by default
+export HERMES_MEMORYMUNCH_ENABLE=1
+
+# Debug override: MemoryMunch recall/tools on, but Hermes normal compaction
+export HERMES_MEMORYMUNCH_COMPACTION_ENABLE=0
+```
+
 ## Watchdog commands
 
 Read-only check:
@@ -46,5 +66,6 @@ python contrib/plugins/memorymunch/watchdog.py --repair --json
   tests/run_agent/test_memorymunch_compression_context.py \
   tests/run_agent/test_memorymunch_softwall.py \
   tests/plugins/test_memorymunch_watchdog.py \
+  tests/plugins/test_memorymunch_compaction_ownership.py \
   -q -o 'addopts='
 ```
