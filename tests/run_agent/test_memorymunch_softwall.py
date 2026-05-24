@@ -100,3 +100,96 @@ def test_prefetch_cache_is_query_and_scope_aware(monkeypatch):
 
     assert "STALE_QUERY_CONTEXT" not in context
     assert "COLD_CONTEXT query=new query" in context
+
+
+def test_curator_briefing_filters_unrelated_active_ledger_rows():
+    mm = _load_memorymunch_module()
+    provider = mm.MemoryMunchProvider()
+    provider._session_id = "sid-curator"
+    provider._scope_entity = "scope-a"
+    provider._domain = "general"
+    provider._harness = "hermes/cli/primary/default"
+    provider._wrapper = "/definitely/missing/wrapper.py"
+    provider._recent_exchanges["sid-curator"] = [
+        {
+            "user": "Tell me about 245 Lake View Drive Sebring closing and unrelated email facts.",
+            "assistant": "Unrelated real estate memory.",
+            "source": "ACTIVE_SESSION_LEDGER",
+        },
+        {
+            "user": "Fix MemoryMunch curator briefing so raw noisy ledger rows are filtered.",
+            "assistant": "Relevant MemoryMunch curator work.",
+            "source": "ACTIVE_SESSION_LEDGER",
+        },
+    ]
+
+    context = provider._compose_prefetch_context(
+        "MemoryMunch curator briefing raw noisy ledger rows",
+        "sid-curator",
+    )
+
+    assert "Relevant MemoryMunch curator work" in context
+    assert "245 Lake View" not in context
+    assert "unrelated email" not in context
+
+
+def test_curator_briefing_downranks_activation_only_smart_search_noise(monkeypatch):
+    mm = _load_memorymunch_module()
+    provider = mm.MemoryMunchProvider()
+    provider._session_id = "sid-search"
+    provider._scope_entity = "scope-a"
+    provider._domain = "general"
+    provider._harness = "hermes/cli/primary/default"
+    provider._wrapper = __file__
+    provider._recent_exchanges["sid-search"] = []
+
+    def fake_recall(query, *, max_results=6):
+        return {
+            "results": [
+                {
+                    "id": "activation-only-personal",
+                    "provenance_class": "OWN_SCOPE",
+                    "source": "vault,activation",
+                    "activation_weight": 0.99,
+                    "hop_depth": 0,
+                    "content_preview": "Al Cooke closed on 245 Lake View Drive and has unrelated income streams.",
+                },
+                {
+                    "id": "relevant-memorymunch",
+                    "provenance_class": "OBSIDIAN_VAULT_OWN_SCOPE",
+                    "source": "vault,db,vector",
+                    "activation_weight": 0.55,
+                    "hop_depth": 0,
+                    "content_preview": "MemoryMunch curator briefing filters raw noisy ledger and smart_search rows.",
+                },
+            ]
+        }
+
+    monkeypatch.setattr(provider, "_run_readonly_recall", fake_recall)
+
+    context = provider._compose_prefetch_context(
+        "MemoryMunch curator briefing smart_search noise",
+        "sid-search",
+    )
+
+    assert "MemoryMunch curator briefing filters" in context
+    assert "245 Lake View" not in context
+    assert "income streams" not in context
+
+
+def test_new_session_switch_clears_old_rolling_state_and_prefetch_cache():
+    mm = _load_memorymunch_module()
+    provider = mm.MemoryMunchProvider()
+    provider._session_id = "old-session"
+    provider._scope_entity = "scope-a"
+    provider._recent_exchanges["old-session"] = [{"user": "old", "assistant": "stale"}]
+    provider._pending_reassertions["old-session"] = "STALE_REASSERTION"
+    provider._prefetch_cache["old-session"] = {"context": "STALE_CONTEXT"}
+
+    provider.on_session_switch("new-session", parent_session_id="old-session", reset=True)
+
+    assert "old-session" not in provider._recent_exchanges
+    assert "old-session" not in provider._pending_reassertions
+    assert "old-session" not in provider._prefetch_cache
+    assert "new-session" not in provider._recent_exchanges
+    assert "new-session" not in provider._pending_reassertions
