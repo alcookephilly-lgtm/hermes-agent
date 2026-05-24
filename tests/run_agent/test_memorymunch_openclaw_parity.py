@@ -115,3 +115,38 @@ def test_janitor_apply_gate_blocks_without_exact_approval(tmp_path, monkeypatch)
     assert result["status"] == "BLOCKED"
     assert result["expected_approval_phrase"] == "APPROVE memorymunch janitor apply sid-janitor"
     assert result["live_db_write"] is False
+
+
+def test_live_capture_sanitizes_recalled_memory_before_ingest(monkeypatch):
+    mm = load_plugin()
+    provider = mm.MemoryMunchProvider()
+    provider._session_id = "sid-capture-sanitize"
+    provider._scope_entity = "tg-7475127948"
+    provider._domain = "general"
+
+    captured = {}
+
+    def fake_bridge(tool, args, timeout=180):
+        assert tool == "ingest_exchange"
+        captured.update(args)
+        return {"result": {"exchange_id": "conv::safe", "facts_stored": len(args.get("facts") or []), "facts_failed": 0, "_meta": {"total_atoms_created": 1}}}
+
+    monkeypatch.setenv("HERMES_MEMORYMUNCH_LIVE_WRITE_ENABLE", "1")
+    monkeypatch.setenv("HERMES_MEMORYMUNCH_AUTO_CAPTURE_ENABLE", "1")
+    monkeypatch.setattr(provider, "_run_original_bridge", fake_bridge)
+
+    assistant = """
+Here is the answer.
+<memorymunch-briefing isolation="soft" scope_entity="tg-7475127948" domain="general">
+OWN_SCOPE:
+- Al Cooke closed on 245 Lake View Drive and has unrelated income streams. [source=vault,activation; atom=noise]
+</memorymunch-briefing>
+Final answer should not persist recalled briefing facts.
+"""
+
+    provider._maybe_live_capture_exchange("sid-capture-sanitize", "Fix MemoryMunch capture sanitizer", assistant)
+
+    assert "245 Lake View" not in captured["bot_response"]
+    assert "income streams" not in captured["bot_response"]
+    assert "memorymunch-briefing" not in captured["bot_response"]
+    assert all("245 Lake View" not in fact.get("fact", "") for fact in captured.get("facts") or [])
