@@ -64,6 +64,18 @@ The provider only reports available when explicitly enabled and wrapper exists:
 export HERMES_MEMORYMUNCH_ENABLE=1
 ```
 
+Compaction ownership follows the plugin switch:
+
+```bash
+# default when plugin is enabled: MemoryMunch owns source-of-truth compaction
+export HERMES_MEMORYMUNCH_ENABLE=1
+
+# optional diagnostic override: keep plugin on, but force normal Hermes compaction
+export HERMES_MEMORYMUNCH_COMPACTION_ENABLE=0
+```
+
+Lame terms: MemoryMunch off = Hermes normal compaction. MemoryMunch on = MemoryMunch compaction protocols. Override `HERMES_MEMORYMUNCH_COMPACTION_ENABLE=0` only when debugging.
+
 Live DB/vault capture remains off unless both are set:
 
 ```bash
@@ -89,5 +101,6 @@ Do not enable live capture without a rollback pack and explicit approval.
   tests/run_agent/test_memorymunch_compression_context.py \
   tests/run_agent/test_memorymunch_softwall.py \
   tests/plugins/test_memorymunch_watchdog.py \
+  tests/plugins/test_memorymunch_compaction_ownership.py \
   -q -o 'addopts='
 ```

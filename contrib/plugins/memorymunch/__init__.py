@@ -908,12 +908,29 @@ class MemoryMunchProvider(MemoryProvider):
     def name(self) -> str:
         return "memorymunch"
 
+    def _plugin_enabled(self) -> bool:
+        return os.environ.get("HERMES_MEMORYMUNCH_ENABLE", "").lower() in {"1", "true", "yes"}
+
+    def _compaction_protocols_enabled(self) -> bool:
+        """Return whether MemoryMunch owns source-of-truth compaction.
+
+        The plugin enable gate is the master switch: when MemoryMunch is off,
+        Hermes must keep normal compaction. A separate compaction override lets
+        operators disable only the MemoryMunch compaction protocol while keeping
+        other MemoryMunch recall/tools available for diagnosis.
+        """
+        if not self._plugin_enabled():
+            return False
+        raw = os.environ.get("HERMES_MEMORYMUNCH_COMPACTION_ENABLE")
+        if raw is None or raw == "":
+            return True
+        return raw.lower() in {"1", "true", "yes", "on"}
+
     def is_available(self) -> bool:
         # Conservative: provider can load/discover, but only reports available when
         # explicitly enabled and the read-only wrapper exists. This prevents
         # accidental activation during discovery.
-        enabled = os.environ.get("HERMES_MEMORYMUNCH_ENABLE", "").lower() in {"1", "true", "yes"}
-        return enabled and Path(self._wrapper).exists()
+        return self._plugin_enabled() and Path(self._wrapper).exists()
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
@@ -1748,6 +1765,15 @@ class MemoryMunchProvider(MemoryProvider):
         focus_topic: str = "",
     ) -> List[Dict[str, Any]]:
         sid = session_id or self._session_id
+        if not self._compaction_protocols_enabled():
+            self._append_session_event(
+                sid,
+                "source_of_truth_compaction_skipped",
+                reason="memorymunch_compaction_protocols_disabled",
+                live_db_write=False,
+                live_vault_write=False,
+            )
+            return []
         self._append_session_event(
             sid,
             "source_of_truth_compaction_checkpoint",
