@@ -433,6 +433,58 @@ def _has_secret_like_text(value: Any) -> bool:
     return any(pattern.search(text or "") for pattern in _SECRET_PATTERNS)
 
 
+def _strip_memorymunch_recall_context(text: str) -> tuple[str, bool]:
+    """Remove recalled-memory briefing blocks before live capture.
+
+    Live capture writes the visible exchange back through original
+    MemoryMunch ingest. If assistant text contains recalled MemoryMunch
+    context, persisting it would turn background evidence into a fresh
+    conversational atom and amplify bleed. Keep the answer text, drop the
+    fenced memory evidence.
+    """
+    original = text or ""
+    cleaned = original
+    patterns = (
+        r"(?is)<memorymunch-briefing\b[^>]*>.*?</memorymunch-briefing>",
+        r"(?is)<memory-context\b[^>]*>.*?</memory-context>",
+        r"(?is)<memory_context\b[^>]*>.*?</memory_context>",
+    )
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "\n[MemoryMunch recalled context stripped before live capture.]\n", cleaned)
+    # If a platform/worker flattened the block tags, remove obvious source rows.
+    filtered_lines: list[str] = []
+    stripped_line = False
+    source_row = re.compile(
+        r"^\s*[-*]?\s*.*\[(?:source|sources)=.*(?:atom|activation_weight|identity_promotable)=.*\]\s*$",
+        re.IGNORECASE,
+    )
+    for line in cleaned.splitlines():
+        marker = line.strip().upper().rstrip(":")
+        if marker in {
+            "ACTIVE_SESSION_LEDGER_CURRENT",
+            "OWN_SCOPE",
+            "ACTIVE_SESSION_LINEAGE",
+            "OBSIDIAN_VAULT_OWN_SCOPE",
+            "SYSTEM_SHARED",
+            "GENERAL_SHARED",
+            "DB_GRAPH_VECTOR_OWN_SCOPE",
+            "DB_GRAPH_VECTOR_SHARED",
+            "GRAPH_LINKED_OUTWARD",
+            "GRAPHIFY_CODE_CONTEXT_ONLY",
+            "HERMES_BUILTIN_MEMORY",
+            "OLD_CONVERSATION_SEARCH",
+        }:
+            stripped_line = True
+            continue
+        if source_row.match(line):
+            stripped_line = True
+            continue
+        filtered_lines.append(line)
+    cleaned = "\n".join(filtered_lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, (cleaned != original.strip()) or stripped_line
+
+
 def validate_live_write_promotion_gate(
     *,
     candidates: list[dict[str, Any]],
@@ -1949,7 +2001,18 @@ class MemoryMunchProvider(MemoryProvider):
             )
             return
         clean_user = redact_for_shadow_seed(user_content)
-        clean_assistant = redact_for_shadow_seed(assistant_content)
+        stripped_assistant, stripped_recall_context = _strip_memorymunch_recall_context(assistant_content)
+        clean_assistant = redact_for_shadow_seed(stripped_assistant)
+        if stripped_recall_context:
+            self._append_session_event(
+                session_id,
+                "live_capture_sanitized",
+                reason="recalled_memory_context_stripped",
+                live_db_write=False,
+                live_vault_write=False,
+                assistant_original_chars=len(assistant_content or ""),
+                assistant_sanitized_chars=len(clean_assistant or ""),
+            )
         if _has_secret_like_text(clean_user) or _has_secret_like_text(clean_assistant):
             self._append_session_event(session_id, "live_capture_skipped", reason="secret_like_content", live_db_write=False, live_vault_write=False)
             return
