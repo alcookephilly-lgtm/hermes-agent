@@ -1983,15 +1983,59 @@ class MemoryMunchProvider(MemoryProvider):
         if blockers:
             return {"status": "BLOCKED", "expected_approval_phrase": expected, "blocked_by": blockers, "proposed_actions": actions, "live_db_write": False, "live_vault_write": False}
         applied: list[Any] = []
+        archive_results: list[dict[str, Any]] = []
         for atom_id in archive_ids:
-            applied.append(self._bridge_result(self._run_original_bridge("archive_memory", {"memory_id": atom_id}, timeout=120)))
+            archive_result = self._bridge_result(self._run_original_bridge("archive_memory", {"memory_id": atom_id}, timeout=120))
+            if isinstance(archive_result, dict):
+                archive_result.setdefault("memory_id", atom_id)
+                archive_results.append(archive_result)
+            else:
+                archive_results.append({"memory_id": atom_id, "vault_archived": False, "vault_reason": "archive_result_not_dict"})
+            applied.append(archive_result)
         if actions.get("edge_cleanup"):
             applied.append(self._bridge_result(self._run_original_bridge("edge_cleanup", {}, timeout=180)))
         for item in prune_items:
             if isinstance(item, dict):
                 applied.append(self._bridge_result(self._run_original_bridge("edge_prune", {"atom_id": str(item.get("atom_id") or ""), "max_edges": int(item.get("max_edges") or 50)}, timeout=180)))
-        vault_written = any(isinstance(item, dict) and item.get("vault_archived") for item in applied)
-        return {"status": "APPLIED", "hermes_mode": "approved_openclaw_janitor_apply", "applied": applied, "approval_phrase": expected, "rollback_pack_path": str(rollback), "live_db_write": True, "live_vault_write": vault_written}
+        vault_details: list[dict[str, Any]] = []
+        for item in archive_results:
+            atom_id = str(item.get("memory_id") or item.get("id") or "")
+            if item.get("vault_archived"):
+                detail = {"memory_id": atom_id, "status": "vault_moved_true"}
+                if item.get("archived_vault_path"):
+                    detail["archived_vault_path"] = str(item.get("archived_vault_path"))
+            else:
+                reason = str(item.get("vault_reason") or item.get("error") or "vault_move_failed")
+                status = "no_vault_file_to_move" if reason == "vault_atom_not_found" else "vault_move_failed"
+                detail = {"memory_id": atom_id, "status": status, "reason": reason}
+            vault_details.append(detail)
+        vault_counts = {
+            "requested": len(archive_results),
+            "moved": sum(1 for item in vault_details if item.get("status") == "vault_moved_true"),
+            "not_found": sum(1 for item in vault_details if item.get("status") == "no_vault_file_to_move"),
+            "failed": sum(1 for item in vault_details if item.get("status") == "vault_move_failed"),
+        }
+        if vault_counts["moved"]:
+            vault_status = "vault_moved_true"
+        elif vault_counts["failed"]:
+            vault_status = "vault_move_failed"
+        elif vault_counts["not_found"]:
+            vault_status = "no_vault_file_to_move"
+        else:
+            vault_status = "no_archive_actions_requested"
+        vault_written = bool(vault_counts["moved"])
+        return {
+            "status": "APPLIED",
+            "hermes_mode": "approved_openclaw_janitor_apply",
+            "applied": applied,
+            "approval_phrase": expected,
+            "rollback_pack_path": str(rollback),
+            "live_db_write": True,
+            "live_vault_write": vault_written,
+            "vault_archive_status": vault_status,
+            "vault_archive_counts": vault_counts,
+            "vault_archive_details": vault_details,
+        }
 
     def _format_briefing(self, data: Dict[str, Any]) -> str:
         return format_memorymunch_briefing(
@@ -2113,6 +2157,9 @@ class MemoryMunchProvider(MemoryProvider):
                 status=result.get("status") or "REVIEWED",
                 proposed_actions=result.get("proposed_actions"),
                 blocked_by=result.get("blocked_by"),
+                vault_archive_status=result.get("vault_archive_status"),
+                vault_archive_counts=result.get("vault_archive_counts"),
+                vault_archive_details=result.get("vault_archive_details"),
             )
         except Exception as exc:
             self._append_session_event(session_id, "janitor_cycle_failed", live_db_write=False, live_vault_write=False, error=str(exc)[:500])
