@@ -256,8 +256,96 @@ def test_janitor_apply_accepts_al_direct_approval_with_rollback(tmp_path, monkey
 
     assert result["status"] == "APPLIED"
     assert result["live_vault_write"] is True
+    assert result["vault_archive_status"] == "vault_moved_true"
+    assert result["vault_archive_counts"] == {"requested": 1, "moved": 1, "not_found": 0, "failed": 0}
+    assert result["vault_archive_details"][0]["memory_id"] == "dup-1"
+    assert result["vault_archive_details"][0]["status"] == "vault_moved_true"
+    assert result["vault_archive_details"][0]["archived_vault_path"] == "/vault/_archived/dup-1.md"
     assert ("archive_memory", {"memory_id": "dup-1"}) in calls
     assert any(tool == "edge_cleanup" for tool, _ in calls)
+
+
+def test_janitor_apply_telemetry_distinguishes_no_vault_file(monkeypatch, tmp_path):
+    mm = load_plugin()
+    provider = mm.MemoryMunchProvider()
+    provider._session_id = "sid-janitor-telemetry-no-file"
+    rollback = tmp_path / "rollback"
+    (rollback / "db").mkdir(parents=True)
+    (rollback / "vault").mkdir(parents=True)
+
+    monkeypatch.setenv("HERMES_MEMORYMUNCH_JANITOR_APPLY_ENABLE", "1")
+    monkeypatch.setattr(provider, "_run_janitor_model_review", lambda exchange_text, max_candidates=20: {"archive": ["dup-no-file"], "edge_cleanup": False, "edge_prune": []})
+    monkeypatch.setattr(provider, "_run_original_bridge", lambda tool, args, timeout=180: {"result": {"ok": True, "memory_id": args["memory_id"], "vault_archived": False, "vault_reason": "vault_atom_not_found"}})
+
+    result = provider.run_janitor_cycle(
+        "User: cleanup\nBot: ok",
+        apply=True,
+        approval_phrase="AL_DIRECT_APPROVAL",
+        rollback_pack_path=str(rollback),
+    )
+
+    assert result["status"] == "APPLIED"
+    assert result["live_db_write"] is True
+    assert result["live_vault_write"] is False
+    assert result["vault_archive_status"] == "no_vault_file_to_move"
+    assert result["vault_archive_counts"] == {"requested": 1, "moved": 0, "not_found": 1, "failed": 0}
+    assert result["vault_archive_details"] == [{"memory_id": "dup-no-file", "status": "no_vault_file_to_move", "reason": "vault_atom_not_found"}]
+
+
+def test_janitor_apply_telemetry_distinguishes_vault_move_failed(monkeypatch, tmp_path):
+    mm = load_plugin()
+    provider = mm.MemoryMunchProvider()
+    provider._session_id = "sid-janitor-telemetry-failed"
+    rollback = tmp_path / "rollback"
+    (rollback / "db").mkdir(parents=True)
+    (rollback / "vault").mkdir(parents=True)
+
+    monkeypatch.setenv("HERMES_MEMORYMUNCH_JANITOR_APPLY_ENABLE", "1")
+    monkeypatch.setattr(provider, "_run_janitor_model_review", lambda exchange_text, max_candidates=20: {"archive": ["dup-failed"], "edge_cleanup": False, "edge_prune": []})
+    monkeypatch.setattr(provider, "_run_original_bridge", lambda tool, args, timeout=180: {"result": {"ok": True, "memory_id": args["memory_id"], "vault_archived": False, "vault_reason": "permission_denied"}})
+
+    result = provider.run_janitor_cycle(
+        "User: cleanup\nBot: ok",
+        apply=True,
+        approval_phrase="AL_DIRECT_APPROVAL",
+        rollback_pack_path=str(rollback),
+    )
+
+    assert result["status"] == "APPLIED"
+    assert result["live_db_write"] is True
+    assert result["live_vault_write"] is False
+    assert result["vault_archive_status"] == "vault_move_failed"
+    assert result["vault_archive_counts"] == {"requested": 1, "moved": 0, "not_found": 0, "failed": 1}
+    assert result["vault_archive_details"] == [{"memory_id": "dup-failed", "status": "vault_move_failed", "reason": "permission_denied"}]
+
+
+def test_maybe_janitor_cycle_logs_vault_archive_telemetry(monkeypatch):
+    mm = load_plugin()
+    provider = mm.MemoryMunchProvider()
+    provider._session_id = "sid-janitor-event-telemetry"
+    events = []
+
+    monkeypatch.setenv("HERMES_MEMORYMUNCH_JANITOR_APPLY_ENABLE", "1")
+    monkeypatch.setenv("HERMES_MEMORYMUNCH_JANITOR_APPROVAL_PHRASE", "AL_DIRECT_APPROVAL")
+    monkeypatch.setenv("HERMES_MEMORYMUNCH_JANITOR_ROLLBACK_PACK", "/tmp/rollback-proof")
+    monkeypatch.setattr(provider, "_append_session_event", lambda session_id, event, **kwargs: events.append((event, kwargs)))
+    monkeypatch.setattr(provider, "run_janitor_cycle", lambda *args, **kwargs: {
+        "status": "APPLIED",
+        "hermes_mode": "approved_openclaw_janitor_apply",
+        "live_db_write": True,
+        "live_vault_write": False,
+        "vault_archive_status": "no_vault_file_to_move",
+        "vault_archive_counts": {"requested": 1, "moved": 0, "not_found": 1, "failed": 0},
+        "vault_archive_details": [{"memory_id": "dup-no-file", "status": "no_vault_file_to_move", "reason": "vault_atom_not_found"}],
+    })
+
+    provider._maybe_janitor_cycle("sid-janitor-event-telemetry", "User cleanup", "Assistant ok")
+
+    event, payload = events[-1]
+    assert event == "janitor_cycle_completed"
+    assert payload["vault_archive_status"] == "no_vault_file_to_move"
+    assert payload["vault_archive_counts"] == {"requested": 1, "moved": 0, "not_found": 1, "failed": 0}
+    assert payload["vault_archive_details"][0]["reason"] == "vault_atom_not_found"
 
 
 def test_live_capture_sanitizes_recalled_memory_before_ingest(monkeypatch):
