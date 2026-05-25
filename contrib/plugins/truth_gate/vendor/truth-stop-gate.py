@@ -229,9 +229,9 @@ FOOTER_HEADER_RE = re.compile(r"(?im)^\s*TRUTH:\s*$")
 FOOTER_BULLET_RE = re.compile(r"(?im)^\s*-\s*(PROVEN|PARTIAL|GAP)\s*:")
 
 # Pack 1J-W schema v2: extended section set + Metrics Gate.
-SCHEMA_V2_SECTIONS = ("PROVEN", "PARTIAL", "GAP", "CURRENT_STATE", "NEXT", "BEHAVIOR_FAIL")
+SCHEMA_V2_SECTIONS = ("PROVEN", "PARTIAL", "GAP", "STATE_NEXT", "NEXT", "BEHAVIOR_FAIL")
 FOOTER_BULLET_V2_RE = re.compile(
-    r"(?im)^\s*-\s*(PROVEN|PARTIAL|GAP|CURRENT_STATE|NEXT|BEHAVIOR_FAIL)\s*:"
+    r"(?im)^\s*-\s*(PROVEN|PARTIAL|GAP|STATE_NEXT|NEXT|BEHAVIOR_FAIL)\s*:"
 )
 METRICS_GATE_HEADER_RE = re.compile(r"(?im)^\s*(?:BUILD\s+)?METRICS\s+GATE\s*:?\s*$")
 METRICS_ROW_RE = re.compile(
@@ -256,15 +256,15 @@ METRICS_REQUIRED_GAPS_FILLED = 100
 METRICS_REQUIRED_DISCOVERY = 100
 # Pack 1J-BN: canonical strict-grid regexes. Legacy TRUTH bullets are no
 # longer accepted as a final footer. Each row is a literal Markdown pipe row.
-TRUTH_PROVEN_HEADER_RE = re.compile(r"(?im)^\s*(?:TRUTH|TRUTH_PROVEN)\s*:?\s*$")
+TRUTH_HEADER_RE = re.compile(r"(?im)^\s*(?:TRUTH|TRUTH)\s*:?\s*$")
 TRUTH_PARTIAL_HEADER_RE = re.compile(r"(?im)^\s*TRUTH_PARTIAL\s*:?\s*$")
-TRUTH_GAP_HEADER_RE = re.compile(r"(?im)^\s*(?:GAP|TRUTH_GAP)\s*:?\s*$")
-CURRENT_STATE_HEADER_RE = re.compile(r"(?im)^\s*CURRENT_STATE\s*:?\s*$")
+GAP_HEADER_RE = re.compile(r"(?im)^\s*(?:GAP|GAP)\s*:?\s*$")
+STATE_NEXT_HEADER_RE = re.compile(r"(?im)^\s*STATE_NEXT\s*:?\s*$")
 NEXT_HEADER_RE = re.compile(r"(?im)^\s*NEXT\s*:?\s*$")
 STATE_NEXT_HEADER_RE = re.compile(r"(?im)^\s*STATE_NEXT\s*:?\s*$")
 BEHAVIOR_FAIL_HEADER_RE = re.compile(r"(?im)^\s*BEHAVIOR_FAIL\s*:?\s*$")
-TRUTH_PROVEN_ROW_RE = re.compile(
-    r"(?im)^\s*\|\s*([TP]\d+)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*(YES|NO)\s*\|\s*$"
+TRUTH_ROW_RE = re.compile(
+    r"(?im)^\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*(YES|NO)\s*\|\s*$"
 )
 SHORT_TRUTH_ROW_RE = re.compile(
     r"(?im)^\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*(YES|NO)\s*\|\s*$"
@@ -272,18 +272,16 @@ SHORT_TRUTH_ROW_RE = re.compile(
 TRUTH_PARTIAL_ROW_RE = re.compile(
     r"(?im)^\s*\|\s*(PT\d+)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*(YES|NO)\s*\|\s*$"
 )
-TRUTH_GAP_ROW_RE = re.compile(
+GAP_ROW_RE = re.compile(
     r"(?im)^\s*\|\s*(G\d+)\s*\|\s*([^|]+?)\s*\|\s*(YES|NO)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*(YES|NO)\s*\|\s*$"
 )
-CURRENT_STATE_ROW_RE = re.compile(
+STATE_NEXT_ROW_RE = re.compile(
     r"(?im)^\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*$"
 )
 NEXT_ROW_RE = re.compile(
     r"(?im)^\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*$"
 )
-STATE_NEXT_ROW_RE = re.compile(
-    r"(?im)^\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*$"
-)
+STATE_NEXT_ROW_RE = re.compile(r"(?im)^\s*\|\s*([^|]+?)\s*\|\s*$")
 BEHAVIOR_FAIL_ROW_RE = re.compile(
     r"(?im)^\s*\|\s*(BF\d+)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*(YES|NO)\s*\|\s*$"
 )
@@ -312,12 +310,12 @@ INVALID_CELL_VALUES = ("HOLD", "DEFERRED", "N/A", "TBD", "UNKNOWN", "PARTIAL")
 INVALID_CELL_RE = re.compile(
     r"\|\s*(HOLD|DEFERRED|N/A|TBD|UNKNOWN|PARTIAL)\s*\|"
 )
-# Pack 1J-AP: detect key/value fake-grid form. After TRUTH_PROVEN: header,
-# look for non-pipe-table lines like "ID: P1" / "Claim:" / "Ledger anchor:"
+# Pack 1J-AP: detect key/value fake-grid form. After TRUTH: header,
+# look for non-pipe-table lines like "ID: P1" / "Claim:" / "Proof:"
 # / "Verified:" / "What proven:" / "Gap:" / "Fillable:" -- these are key/value
 # blocks masquerading as grids and must be rejected when v3 required.
 KV_FAKE_GRID_KEY_RE = re.compile(
-    r"(?im)^\s*(ID|Claim|Ledger anchor|Proof|Verified|What proven|What not proven|"
+    r"(?im)^\s*(ID|Claim|Proof|Verified|What proven|What not proven|"
     r"Why partial|What closes it|Objective-critical|Gap|Fillable|"
     r"Missing proof|Next read-test-action|Blocks PASS|State|Next action|Owner|"
     r"Metric|Required|Actual|Pass/Fail|Failure)\s*:"
@@ -580,14 +578,14 @@ def _extract_proven_lines(text):
     if not isinstance(text, str):
         return []
     proven = []
-    # Pack 1J-AP: also walk v3 TRUTH_PROVEN pipe grid rows; append synthetic
-    # "<claim> <ledger_anchor>" string per row so existing _has_ledger_anchor
+    # Pack 1J-AP: also walk v3 TRUTH pipe grid rows; append synthetic
+    # "<claim> <proof>" string per row so existing _has_proof
     # substring match works against v3 grid bodies. Forward-ref to
     # _parse_truth_proven_grid (defined later in file) resolves at call time.
     try:
         for row in _parse_truth_proven_grid(text):
             claim = row.get("claim", "") or ""
-            anchor = row.get("ledger_anchor", "") or ""
+            anchor = row.get("proof", "") or ""
             combined = (claim + " " + anchor).strip()
             if combined:
                 proven.append(combined)
@@ -630,7 +628,7 @@ def _extract_proven_lines(text):
     return proven
 
 
-def _ledger_anchors_for_session(session_id, lookback=LEDGER_LOOKBACK):
+def _proofs_for_session(session_id, lookback=LEDGER_LOOKBACK):
     if not session_id or not LEDGER.exists():
         return []
     try:
@@ -668,7 +666,7 @@ def _ledger_anchors_for_session(session_id, lookback=LEDGER_LOOKBACK):
     return anchors
 
 
-def _has_ledger_anchor(proven_lines, anchors):
+def _has_proof(proven_lines, anchors):
     """Substring match with slash-direction normalization.
 
     A path stored as 'C:\\Users\\X' in the ledger should still match a
@@ -746,8 +744,8 @@ def _truth_footer_region(text):
         return ""
     starts = []
     for rx in (
-        TRUTH_PROVEN_HEADER_RE,
-        TRUTH_GAP_HEADER_RE,
+        TRUTH_HEADER_RE,
+        GAP_HEADER_RE,
         STATE_NEXT_HEADER_RE,
         METRICS_GATE_HEADER_RE,
         BEHAVIOR_FAIL_HEADER_RE,
@@ -875,7 +873,7 @@ def _flag_age_seconds(flag):
         return None
 
 
-def _ledger_anchors_with_ts(session_id, lookback=LEDGER_LOOKBACK):
+def _proofs_with_ts(session_id, lookback=LEDGER_LOOKBACK):
     """Return list[(ts_datetime_or_None, anchor_text_str)] for session."""
     if not session_id or not LEDGER.exists():
         return []
@@ -1455,10 +1453,10 @@ def _extract_section_lines(text, section):
 
 
 def _has_metrics_gate(text):
-    """True if `METRICS GATE:` header appears after TRUTH_PROVEN."""
+    """True if `METRICS GATE:` header appears after TRUTH."""
     if not isinstance(text, str):
         return False
-    m_v3 = TRUTH_PROVEN_HEADER_RE.search(text)
+    m_v3 = TRUTH_HEADER_RE.search(text)
     if not m_v3:
         return False
     return bool(METRICS_GATE_HEADER_RE.search(text[m_v3.end():]))
@@ -1468,12 +1466,12 @@ def _parse_metrics_gate(text):
     """Parse METRICS GATE table rows. Returns dict with 4 keys; missing
     rows = None. Numeric values stripped of '%' and parsed as int when
     possible; non-numeric (e.g. 'PASS', '__') passed through as str.
-    Pack 1J-BN: only canonical `TRUTH_PROVEN:` anchors metrics parsing."""
+    Pack 1J-BN: only canonical `TRUTH:` anchors metrics parsing."""
     out = {"GAPS_FILLED": None, "DISCOVERY": None,
            "BUILD_CONFIDENCE": None, "METRICS_GATE": None}
     if not isinstance(text, str):
         return out
-    m_v3 = TRUTH_PROVEN_HEADER_RE.search(text)
+    m_v3 = TRUTH_HEADER_RE.search(text)
     if not m_v3:
         return out
     body = text[m_v3.end():]
@@ -1630,23 +1628,28 @@ def _schema_v3_required():
 
 
 def _parse_truth_proven_grid(text):
-    """Returns list of dicts: {id, claim, ledger_anchor/proof, verified}."""
+    """Returns canonical TRUTH rows: {id, claim, proof, verified}."""
     if not isinstance(text, str):
         return []
-    m = TRUTH_PROVEN_HEADER_RE.search(text)
+    m = TRUTH_HEADER_RE.search(text)
     if not m:
         return []
     body = text[m.end():]
-    end = TRUTH_GAP_HEADER_RE.search(body) or TRUTH_PARTIAL_HEADER_RE.search(body)
+    end = GAP_HEADER_RE.search(body) or TRUTH_PARTIAL_HEADER_RE.search(body)
     if end:
         body = body[:end.start()]
     rows = []
-    for rm in TRUTH_PROVEN_ROW_RE.finditer(body):
+    n = 0
+    for rm in TRUTH_ROW_RE.finditer(body):
+        cells = [rm.group(1).strip(), rm.group(2).strip(), rm.group(3).strip()]
+        if cells[0].lower() == "claim" or _is_separator_cells(cells):
+            continue
+        n += 1
         rows.append({
-            "id": rm.group(1),
-            "claim": rm.group(2).strip(),
-            "ledger_anchor": rm.group(3).strip(),
-            "verified": rm.group(4).strip().upper(),
+            "id": f"T{n}",
+            "claim": cells[0],
+            "proof": cells[1],
+            "verified": cells[2].upper(),
         })
     return rows
 
@@ -1659,7 +1662,7 @@ def _parse_truth_partial_grid(text):
     if not m:
         return []
     body = text[m.end():]
-    end = TRUTH_GAP_HEADER_RE.search(body)
+    end = GAP_HEADER_RE.search(body)
     if end:
         body = body[:end.start()]
     rows = []
@@ -1679,12 +1682,12 @@ def _parse_truth_gap_grid(text):
     """Returns list of dicts with GAP row fields."""
     if not isinstance(text, str):
         return []
-    m = TRUTH_GAP_HEADER_RE.search(text)
+    m = GAP_HEADER_RE.search(text)
     if not m:
         return []
     body = text[m.end():]
     rows = []
-    for rm in TRUTH_GAP_ROW_RE.finditer(body):
+    for rm in GAP_ROW_RE.finditer(body):
         rows.append({
             "id": rm.group(1),
             "gap": rm.group(2).strip(),
@@ -1726,9 +1729,9 @@ def _simple_pipe_rows(body, row_re, header_names):
 
 
 def _parse_current_state_grid(text):
-    body = _section_body(text, CURRENT_STATE_HEADER_RE,
+    body = _section_body(text, STATE_NEXT_HEADER_RE,
                          (NEXT_HEADER_RE, BEHAVIOR_FAIL_HEADER_RE, METRICS_GATE_HEADER_RE))
-    return _simple_pipe_rows(body, CURRENT_STATE_ROW_RE, {"item"})
+    return _simple_pipe_rows(body, STATE_NEXT_ROW_RE, {"item"})
 
 
 def _parse_next_grid(text):
@@ -1740,7 +1743,14 @@ def _parse_next_grid(text):
 def _parse_state_next_grid(text):
     body = _section_body(text, STATE_NEXT_HEADER_RE,
                          (BEHAVIOR_FAIL_HEADER_RE, METRICS_GATE_HEADER_RE))
-    return _simple_pipe_rows(body, STATE_NEXT_ROW_RE, {"state"})
+    rows = []
+    for rm in STATE_NEXT_ROW_RE.finditer(body):
+        cell = rm.group(1).strip()
+        if cell.lower() == "state / next" or _is_separator_cells([cell]):
+            continue
+        if cell:
+            rows.append({"state_next": cell})
+    return rows
 
 
 def _parse_behavior_fail_grid(text):
@@ -1761,8 +1771,8 @@ def _is_separator_cells(cells):
 
 
 def _parse_short_truth_grid(text):
-    body = _section_body(text, TRUTH_PROVEN_HEADER_RE,
-                         (TRUTH_GAP_HEADER_RE, TRUTH_PARTIAL_HEADER_RE))
+    body = _section_body(text, TRUTH_HEADER_RE,
+                         (GAP_HEADER_RE, TRUTH_PARTIAL_HEADER_RE))
     rows = []
     for rm in SHORT_TRUTH_ROW_RE.finditer(body):
         cells = [rm.group(1).strip(), rm.group(2).strip(), rm.group(3).strip()]
@@ -1774,7 +1784,7 @@ def _parse_short_truth_grid(text):
 
 
 def _parse_short_gap_grid(text):
-    body = _section_body(text, TRUTH_GAP_HEADER_RE,
+    body = _section_body(text, GAP_HEADER_RE,
                          (STATE_NEXT_HEADER_RE, BEHAVIOR_FAIL_HEADER_RE, METRICS_GATE_HEADER_RE))
     rows = []
     for rm in SHORT_GAP_ROW_RE.finditer(body):
@@ -1821,15 +1831,8 @@ def _parse_short_behavior_fail_grid(text):
 
 
 def _short_truth_footer_present(text):
-    if not isinstance(text, str):
-        return False
-    return (
-        bool(TRUTH_PROVEN_HEADER_RE.search(text) and _parse_short_truth_grid(text))
-        and bool(TRUTH_GAP_HEADER_RE.search(text) and _parse_short_gap_grid(text))
-        and bool(STATE_NEXT_HEADER_RE.search(text) and _parse_short_state_next_grid(text))
-        and bool(METRICS_GATE_HEADER_RE.search(text) and _parse_short_metrics_gate(text))
-        and bool(BEHAVIOR_FAIL_HEADER_RE.search(text) and _parse_short_behavior_fail_grid(text))
-    )
+    # Retired: Hermes now has one canonical OUTPUT-first grid format only.
+    return False
 
 
 def _calculate_short_metrics_from_grids(text):
@@ -1871,23 +1874,23 @@ def _calculate_short_metrics_from_grids(text):
 
 
 def _calculate_metrics_from_grids(text):
-    """Pack 1J-AM machine calculator. Reads TRUTH_PROVEN/PARTIAL/GAP grids
+    """Pack 1J-AM machine calculator. Reads TRUTH/PARTIAL/GAP grids
     and returns deterministic {GAPS_FILLED, DISCOVERY, BUILD_CONFIDENCE,
     METRICS_GATE} dict + reason list for each cap/fail."""
     proven = _parse_truth_proven_grid(text)
-    partial = _parse_truth_partial_grid(text)
+    partial = []  # TRUTH_PARTIAL retired from Hermes canonical schema.
     gap = _parse_truth_gap_grid(text)
     behavior = _parse_behavior_fail_grid(text)
     reasons = []
 
-    # DISCOVERY: every PROVEN row must have non-empty ledger_anchor + Verified=YES.
+    # DISCOVERY: every TRUTH row must have non-empty Proof + Verified=YES.
     proven_ok = 0
     proven_total = len(proven)
     for p in proven:
-        if p["ledger_anchor"] and p["verified"] == "YES":
+        if p["proof"] and p["verified"] == "YES":
             proven_ok += 1
         else:
-            reasons.append(f"PROVEN {p['id']} missing ledger_anchor or Verified!=YES")
+            reasons.append(f"TRUTH {p['id']} missing proof or Verified!=YES")
     discovery = 100 if proven_total == 0 else int(100 * proven_ok / proven_total)
 
     # GAPS_FILLED: any blocks_pass GAP forces below 100.
@@ -1899,13 +1902,8 @@ def _calculate_metrics_from_grids(text):
     else:
         gaps_filled = 100
 
-    # BUILD_CONFIDENCE: cap at 94 on objective-critical PARTIAL or any blocking issue.
+    # BUILD_CONFIDENCE: cap at 94 on any blocking issue.
     cap = 100
-    critical_partials = [p for p in partial if p["objective_critical"] == "YES"]
-    if critical_partials:
-        for p in critical_partials:
-            reasons.append(f"PARTIAL {p['id']} objective_critical=YES caps BUILD_CONFIDENCE 94")
-        cap = 94
     blocking_behavior = [b for b in behavior if b["blocks_pass"] == "YES"]
     if blocking_behavior:
         for b in blocking_behavior:
@@ -2029,11 +2027,11 @@ def _has_truth_structure_candidate(text):
         return False
     return any(rx.search(text) for rx in (
         FOOTER_HEADER_RE,
-        TRUTH_PROVEN_HEADER_RE,
+        TRUTH_HEADER_RE,
         TRUTH_PARTIAL_HEADER_RE,
-        TRUTH_GAP_HEADER_RE,
+        GAP_HEADER_RE,
         STATE_NEXT_HEADER_RE,
-        CURRENT_STATE_HEADER_RE,
+        STATE_NEXT_HEADER_RE,
         NEXT_HEADER_RE,
         BEHAVIOR_FAIL_HEADER_RE,
         METRICS_GATE_HEADER_RE,
@@ -2046,11 +2044,11 @@ def _canonical_truth_footer_present(text):
     if _short_truth_footer_present(text):
         return True
     return (
-        bool(TRUTH_PROVEN_HEADER_RE.search(text) and _parse_truth_proven_grid(text))
-        and bool(TRUTH_GAP_HEADER_RE.search(text) and _parse_truth_gap_grid(text))
+        bool(TRUTH_HEADER_RE.search(text) and _parse_truth_proven_grid(text))
+        and bool(GAP_HEADER_RE.search(text) and _parse_truth_gap_grid(text))
         and bool(STATE_NEXT_HEADER_RE.search(text) and _parse_state_next_grid(text))
-        and bool(BEHAVIOR_FAIL_HEADER_RE.search(text) and _parse_behavior_fail_grid(text))
         and _has_metrics_gate(text)
+        and bool(BEHAVIOR_FAIL_HEADER_RE.search(text) and _parse_behavior_fail_grid(text))
     )
 
 
@@ -2063,13 +2061,33 @@ def _canonical_behavior_fail_is_last_section(text):
     mg = METRICS_GATE_HEADER_RE.search(text)
     if mg and bf.start() < mg.start():
         return False
-    return True
+    tail = text[bf.end():].strip()
+    return not bool(re.search(r"(?im)^\s*(OUTPUT|TRUTH|GAP|STATE_NEXT|BUILD\s+METRICS\s+GATE|METRICS\s+GATE|BEHAVIOR_FAIL)\s*:?\s*$", tail))
 
 
 def _canonical_schema_violations(text):
     violations = []
     if not _has_truth_structure_candidate(text):
         return violations
+
+    output_count = len(re.findall(r"(?im)^\s*OUTPUT:\s*$", text or ""))
+    if output_count != 1 or not re.match(r"(?is)^\s*OUTPUT:\s*\n", text or ""):
+        violations.append({
+            "rule": "evidence.schema.output-header.required-first",
+            "match": str(output_count),
+            "fix": "Canonical Hermes Truth Gate output must start with OUTPUT: followed by the answer text.",
+        })
+    section_order = []
+    for name, rx in (("TRUTH", TRUTH_HEADER_RE), ("GAP", GAP_HEADER_RE), ("STATE_NEXT", STATE_NEXT_HEADER_RE), ("BUILD METRICS GATE", METRICS_GATE_HEADER_RE), ("BEHAVIOR_FAIL", BEHAVIOR_FAIL_HEADER_RE)):
+        found = list(rx.finditer(text or ""))
+        if len(found) > 1:
+            violations.append({"rule": "evidence.schema.duplicate-section", "match": name, "fix": "Use each canonical Truth Gate section exactly once; do not append a second schema."})
+        if found:
+            section_order.append((found[0].start(), name))
+    observed = [name for _, name in sorted(section_order)]
+    expected = ["TRUTH", "GAP", "STATE_NEXT", "BUILD METRICS GATE", "BEHAVIOR_FAIL"]
+    if observed and observed != [x for x in expected if x in observed]:
+        violations.append({"rule": "evidence.schema.section-order", "match": " > ".join(observed), "fix": "Canonical section order is OUTPUT, TRUTH, GAP, STATE_NEXT, BUILD METRICS GATE, BEHAVIOR_FAIL."})
 
     footer_region = _truth_footer_region(text)
     if _has_blank_separated_pipe_table(footer_region):
@@ -2123,8 +2141,8 @@ def _canonical_schema_violations(text):
         return violations
 
     required_sections = (
-        ("TRUTH", TRUTH_PROVEN_HEADER_RE, _parse_truth_proven_grid),
-        ("GAP", TRUTH_GAP_HEADER_RE, _parse_truth_gap_grid),
+        ("TRUTH", TRUTH_HEADER_RE, _parse_truth_proven_grid),
+        ("GAP", GAP_HEADER_RE, _parse_truth_gap_grid),
         ("STATE_NEXT", STATE_NEXT_HEADER_RE, _parse_state_next_grid),
         ("BEHAVIOR_FAIL", BEHAVIOR_FAIL_HEADER_RE, _parse_behavior_fail_grid),
     )
@@ -2137,8 +2155,8 @@ def _canonical_schema_violations(text):
             })
 
     canonical_headers = (
-        (TRUTH_PROVEN_HEADER_RE, _parse_truth_proven_grid, "TRUTH"),
-        (TRUTH_GAP_HEADER_RE, _parse_truth_gap_grid, "GAP"),
+        (TRUTH_HEADER_RE, _parse_truth_proven_grid, "TRUTH"),
+        (GAP_HEADER_RE, _parse_truth_gap_grid, "GAP"),
         (STATE_NEXT_HEADER_RE, _parse_state_next_grid, "STATE_NEXT"),
         (BEHAVIOR_FAIL_HEADER_RE, _parse_behavior_fail_grid, "BEHAVIOR_FAIL"),
     )
@@ -2225,21 +2243,21 @@ def _canonical_schema_violations(text):
         })
 
     proven_rows = _parse_truth_proven_grid(text)
-    partial_rows = _parse_truth_partial_grid(text)
+    partial_rows = []  # retired TRUTH_PARTIAL rows are not part of the Hermes canonical form.
     gap_rows = _parse_truth_gap_grid(text)
     behavior_rows = _parse_behavior_fail_grid(text)
     for p in proven_rows:
-        if not p["ledger_anchor"]:
+        if not p["proof"]:
             violations.append({
-                "rule": "evidence.proven.missing-ledger-anchor-field",
+                "rule": "evidence.truth.missing-proof-field",
                 "match": p["id"],
-                "fix": f"PROVEN row {p['id']} Ledger anchor cell is empty.",
+                "fix": f"TRUTH row {p['id']} Proof cell is empty.",
             })
         if p["verified"] != "YES":
             violations.append({
-                "rule": "evidence.proven.verified-not-yes",
+                "rule": "evidence.truth.verified-not-yes",
                 "match": p["id"],
-                "fix": f"PROVEN row {p['id']} Verified must be YES.",
+                "fix": f"TRUTH row {p['id']} Verified must be YES.",
             })
     honest_terminal_fail = _honest_terminal_fail_allowed(text, metrics, _calculate_metrics_from_grids(text))
     for g in gap_rows:
@@ -2248,13 +2266,6 @@ def _canonical_schema_violations(text):
                 "rule": "evidence.gap.fillable-blocks-pass-forces-fail",
                 "match": g["id"],
                 "fix": f"GAP row {g['id']} Blocks PASS=YES forces METRICS_GATE FAIL until resolved.",
-            })
-    for p in partial_rows:
-        if p["objective_critical"] == "YES":
-            violations.append({
-                "rule": "evidence.partial.objective-critical-caps-confidence",
-                "match": p["id"],
-                "fix": f"PARTIAL row {p['id']} Objective-critical=YES caps BUILD_CONFIDENCE at 94.",
             })
     for b in behavior_rows:
         if b["blocks_pass"] == "YES" and not honest_terminal_fail:
@@ -2369,10 +2380,10 @@ def evaluate(text, used_tools_current_turn, used_tools_mode, session_id="", rewr
             and used_tools_current_turn
             and has_f
             and session_id):
-        anchors = _ledger_anchors_for_session(session_id)
+        anchors = _proofs_for_session(session_id)
         if anchors:
             proven = _extract_proven_lines(text)
-            if not _has_ledger_anchor(proven, anchors):
+            if not _has_proof(proven, anchors):
                 violations.append({
                     "rule": "evidence.proven.no-ledger-anchor",
                     "fix": "PROVEN line(s) must cite a substring from a recent ledger row (command, file_path, stdout/stderr/error tail, or 'Exit code N')",
@@ -2415,7 +2426,7 @@ def evaluate(text, used_tools_current_turn, used_tools_mode, session_id="", rewr
     # present OR TRUTH_SCHEMA_V2_REQUIRED=1. Preserves backward compat for
     # legacy bare PROVEN/PARTIAL/GAP answers without closure language.
     if has_f and _schema_v2_required(scan_text):
-        for section in ("PARTIAL", "GAP", "CURRENT_STATE", "NEXT", "BEHAVIOR_FAIL"):
+        for section in ("PARTIAL", "GAP", "STATE_NEXT", "NEXT", "BEHAVIOR_FAIL"):
             if not _section_present(text, section):
                 violations.append({
                     "rule": "evidence.schema.section." + section.lower().replace("_", "-") + "-missing",
@@ -3182,7 +3193,7 @@ def main():
     flag_cleared = False
     flag_clear_reason = ""
     if flag is not None:
-        anchors_with_ts = _ledger_anchors_with_ts(session_id)
+        anchors_with_ts = _proofs_with_ts(session_id)
         cleared, reason = _flag_check_clear(flag, session_id, last, anchors_with_ts)
         if cleared:
             _flag_clear()
