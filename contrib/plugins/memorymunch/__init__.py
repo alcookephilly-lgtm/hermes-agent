@@ -70,7 +70,8 @@ MEMORYMUNCH_GATEWAY_BRIEFING_CONTRACT = """MEMORYMUNCH_GATEWAY_BRIEFING_CONTRACT
 - Janitor alone owns mutation_safe decisions; Gateway may display mutation status but must not authorize mutation or convert unknown into yes.
 - active_session_id is mandatory in every briefing header, and each current-session atom must carry source_session_id.
 - Older/non-current atoms must be labeled current_session=no and must yield to current-session/live-user proof.
-- live_db_write=false and live_vault_write=false mean recall-only; do not imply DB or Obsidian persistence.
+- Capture and Janitor are operationally required write lanes; do not physically disable them unless the whole plugin is intentionally disabled by user command.
+- Per-event live_db_write=false/live_vault_write=false on prompt/worker/turn ledger rows means that specific row is non-writing; it is not the system write state. Write truth comes from latest live_capture_completed and janitor_cycle_completed rows plus hardwire telemetry.
 - Normal briefing is token-efficient: compact header + ATOM_MIN packets. Full edge IDs, wiki-links, activation/decay history, and source-document details are audit/debug only unless explicitly requested.
 """
 
