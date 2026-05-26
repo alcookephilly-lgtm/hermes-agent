@@ -173,6 +173,55 @@ def latest_capture_ok(rows):
     return {'ok': bool(live and attempted and not failed), 'state': 'attempted_only', 'telemetry_warning': '', 'latest_event': latest_event}
 
 
+
+
+def plugin_hardwire_state(plugin_path: Path):
+    text = plugin_path.read_text(errors='ignore') if plugin_path.exists() else ''
+    live_writes = 'MEMORYMUNCH_HARDWIRE_LIVE_WRITES = True' in text
+    capture_live = 'MEMORYMUNCH_HARDWIRE_CAPTURE_LIVE = True' in text
+    janitor_live = 'MEMORYMUNCH_HARDWIRE_JANITOR_LIVE = True' in text
+    telemetry_truth = 'live_db_write=true live_vault_write=true capture_live_write=on janitor_live_mutation=on' in text
+    three_lanes = 'telemetry_lanes=prompt:curator+gateway/in_turn,background:capture+janitor/post_turn,status:checker+ledger/proof' in text
+    return {
+        'live_writes_hardwired': live_writes,
+        'capture_live_hardwired': capture_live,
+        'janitor_live_hardwired': janitor_live,
+        'telemetry_truth_string': telemetry_truth,
+        'three_lane_telemetry': three_lanes,
+        'ok': live_writes and capture_live and janitor_live and telemetry_truth and three_lanes,
+    }
+
+
+def memorymunch_lane_status(rows, hardwire):
+    curator_events = [r for r in rows if r.get('event') in {'curator_model_worker_completed', 'curator_model_completed'}]
+    capture_state = latest_capture_ok(rows)
+    janitor_events = [r for r in rows if r.get('event') in {'janitor_model_worker_completed', 'janitor_cycle_completed'}]
+    janitor_latest = janitor_events[-1] if janitor_events else {}
+    janitor_applied = janitor_latest.get('event') == 'janitor_cycle_completed' and janitor_latest.get('status') == 'APPLIED'
+    return {
+        'prompt_lanes': {
+            'curator_in_turn': bool(curator_events),
+            'gateway_prompt_facing': True,
+            'parallel_prefetch_expected': hardwire.get('three_lane_telemetry', False),
+        },
+        'background_write_lanes': {
+            'capture_post_turn': capture_state,
+            'janitor_post_turn': {
+                'ok': bool(janitor_applied),
+                'latest_event': janitor_latest.get('event', ''),
+                'status': janitor_latest.get('status', ''),
+                'live_db_write': bool(janitor_latest.get('live_db_write')),
+                'live_vault_write': bool(janitor_latest.get('live_vault_write')),
+                'vault_archive_status': janitor_latest.get('vault_archive_status', ''),
+            },
+        },
+        'status_reporting': {
+            'turn_completed_is_ledger_only': True,
+            'write_truth_events': ['live_capture_completed', 'janitor_cycle_completed'],
+            'hardwire': hardwire,
+        },
+    }
+
 def main():
     load_env_names_only(HERMES_HOME/'.env')
     now=time.time()
@@ -188,6 +237,8 @@ def main():
     capture_state=latest_capture_ok(rows)
     latest_capture_ok_bool=bool(capture_state.get('ok'))
     plugin_parity_state = plugin_parity(PLUGIN, VENDORED_PLUGIN)
+    hardwire_state = plugin_hardwire_state(PLUGIN)
+    lane_state = memorymunch_lane_status(rows, hardwire_state)
     completed=[r for r in rows if r.get('event')=='turn_completed']
     briefing_state = latest_turn_briefing_state(rows)
     comp=[r for r in all_recent_rows if r.get('event') in {'session_attached','compaction_checkpoint'} or r.get('reason')=='compression']
@@ -198,8 +249,9 @@ def main():
         'HERMES_MEMORYMUNCH_ENABLE','HERMES_MEMORYMUNCH_LIVE_WRITE_ENABLE','HERMES_MEMORYMUNCH_AUTO_CAPTURE_ENABLE','HERMES_MEMORYMUNCH_SCOPE_ENTITY','HERMES_MEMORYMUNCH_DOMAIN']}
     checks={
         'memorymunch_env_enabled': env.get('HERMES_MEMORYMUNCH_ENABLE','').lower() in {'1','true','yes'},
-        'live_write_env_enabled': env.get('HERMES_MEMORYMUNCH_LIVE_WRITE_ENABLE','').lower() in {'1','true','yes'},
-        'auto_capture_env_enabled': env.get('HERMES_MEMORYMUNCH_AUTO_CAPTURE_ENABLE','').lower() in {'1','true','yes'},
+        'live_write_hardwired_or_env_enabled': hardwire_state['live_writes_hardwired'] or env.get('HERMES_MEMORYMUNCH_LIVE_WRITE_ENABLE','').lower() in {'1','true','yes'},
+        'auto_capture_hardwired_or_env_enabled': hardwire_state['capture_live_hardwired'] or env.get('HERMES_MEMORYMUNCH_AUTO_CAPTURE_ENABLE','').lower() in {'1','true','yes'},
+        'three_lane_telemetry_present': hardwire_state['three_lane_telemetry'],
         'plugin_exists': PLUGIN.exists(),
         'runtime_plugin_matches_vendored': plugin_parity_state['ok'],
         'live_briefing_clean': briefing_state['ok'],
@@ -227,6 +279,8 @@ def main():
         'latest_ledger_counts': {'rows':len(rows),'turn_completed':len(completed),'live_capture_attempted':len(attempted),'live_capture_completed':len(live),'live_capture_failed':len(failed),'compression_events':len(comp)},
         'latest_live_exchange_id': live[-1].get('exchange_id','') if live else '',
         'latest_capture_state': capture_state,
+        'memorymunch_lanes': lane_state,
+        'plugin_hardwire_state': hardwire_state,
         'plugin_parity': plugin_parity_state,
         'live_briefing_state': briefing_state,
         'plugin_sha256': sha(PLUGIN),
