@@ -47,6 +47,23 @@ def compile_check(path: Path) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
 
 
+
+def hardwire_state(plugin_path: Path) -> dict[str, bool]:
+    text = plugin_path.read_text(errors='ignore') if plugin_path.exists() else ''
+    live_writes = 'MEMORYMUNCH_HARDWIRE_LIVE_WRITES = True' in text
+    capture_live = 'MEMORYMUNCH_HARDWIRE_CAPTURE_LIVE = True' in text
+    janitor_live = 'MEMORYMUNCH_HARDWIRE_JANITOR_LIVE = True' in text
+    telemetry = 'live_db_write=true live_vault_write=true capture_live_write=on janitor_live_mutation=on' in text
+    three_lanes = 'telemetry_lanes=prompt:curator+gateway/in_turn,background:capture+janitor/post_turn,status:checker+ledger/proof' in text
+    return {
+        'live_writes_hardwired': live_writes,
+        'capture_live_hardwired': capture_live,
+        'janitor_live_hardwired': janitor_live,
+        'telemetry_truth_string': telemetry,
+        'three_lane_telemetry': three_lanes,
+        'ok': live_writes and capture_live and janitor_live and telemetry and three_lanes,
+    }
+
 def inspect(repo_dir: Path, runtime_dir: Path) -> dict[str, Any]:
     files: list[dict[str, Any]] = []
     missing_repo: list[str] = []
@@ -82,6 +99,11 @@ def inspect(repo_dir: Path, runtime_dir: Path) -> dict[str, Any]:
         if row.get("repo_sha256") and row.get("runtime_sha256") and row["repo_sha256"] != row["runtime_sha256"]:
             drift.append(name)
         files.append(row)
+    runtime_hardwire = hardwire_state(runtime_dir / "__init__.py")
+    repo_hardwire = hardwire_state(repo_dir / "__init__.py")
+    hardwire_ok = runtime_hardwire.get("ok") and repo_hardwire.get("ok")
+    if not hardwire_ok:
+        compile_errors.append("hardwire_live_write_or_three_lane_telemetry_missing")
     status = "PASS" if not (missing_repo or missing_runtime or drift or compile_errors) else "FAIL"
     return {
         "status": status,
@@ -92,8 +114,17 @@ def inspect(repo_dir: Path, runtime_dir: Path) -> dict[str, Any]:
         "missing_runtime": missing_runtime,
         "drift": drift,
         "compile_errors": compile_errors,
-        "live_db_write": False,
-        "live_vault_write": False,
+        "runtime_hardwire": runtime_hardwire,
+        "repo_hardwire": repo_hardwire,
+        "telemetry_lanes": {
+            "prompt": "curator+gateway/in_turn",
+            "background": "capture+janitor/post_turn",
+            "status": "checker+ledger/proof",
+        },
+        "live_db_write": bool(runtime_hardwire.get("live_writes_hardwired")),
+        "live_vault_write": bool(runtime_hardwire.get("live_writes_hardwired")),
+        "capture_live_write": "on" if runtime_hardwire.get("capture_live_hardwired") else "off",
+        "janitor_live_mutation": "on" if runtime_hardwire.get("janitor_live_hardwired") else "off",
     }
 
 
