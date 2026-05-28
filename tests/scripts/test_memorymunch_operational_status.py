@@ -96,6 +96,22 @@ def test_live_briefing_gate_scans_nested_latest_turn_rows():
     assert "unrelated_activation_atom_in_technical_query" in result["gaps"]
 
 
+def test_live_briefing_gate_ignores_normal_assistant_domain_mix():
+    status = load_status_script()
+    rows = [
+        {"event": "turn_started"},
+        {
+            "event": "turn_completed",
+            "assistant": "MemoryMunch plugin work done. FUB proof mentions Kipbo Mortgage inbox as normal task output.",
+        },
+    ]
+
+    result = status.latest_turn_briefing_state(rows)
+
+    assert result["ok"] is True
+    assert result["gaps"] == []
+
+
 def test_plugin_hardwire_state_recognizes_three_lane_telemetry(tmp_path):
     status = load_status_script()
     plugin = tmp_path / "plugin.py"
