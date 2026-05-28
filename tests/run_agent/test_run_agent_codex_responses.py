@@ -157,9 +157,10 @@ def _codex_ack_message_response(text: str):
 
 
 class _FakeResponsesStream:
-    def __init__(self, *, final_response=None, final_error=None):
+    def __init__(self, *, final_response=None, final_error=None, iter_error=None):
         self._final_response = final_response
         self._final_error = final_error
+        self._iter_error = iter_error
 
     def __enter__(self):
         return self
@@ -168,6 +169,8 @@ class _FakeResponsesStream:
         return False
 
     def __iter__(self):
+        if self._iter_error is not None:
+            raise self._iter_error
         return iter(())
 
     def get_final_response(self):
@@ -483,6 +486,46 @@ def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):
     assert calls["create"] == 1
     assert create_stream.closed is True
     assert response.output[0].content[0].text == "streamed create ok"
+
+
+def test_run_codex_stream_fallback_handles_sdk_null_output_parse_crash(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+    terminal = SimpleNamespace(
+        output=None,
+        usage=SimpleNamespace(input_tokens=4, output_tokens=2, total_tokens=6),
+        status="completed",
+        model="gpt-5-codex",
+    )
+    create_stream = _FakeCreateStream(
+        [
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.output_text.delta", delta="null-output fallback"),
+            SimpleNamespace(type="response.completed", response=terminal),
+        ]
+    )
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _FakeResponsesStream(iter_error=TypeError("'NoneType' object is not iterable"))
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        assert kwargs.get("stream") is True
+        return create_stream
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+    assert calls["stream"] == 1
+    assert calls["create"] == 1
+    assert create_stream.closed is True
+    assert response.output[0].content[0].text == "null-output fallback"
 
 
 def test_run_conversation_codex_plain_text(monkeypatch):

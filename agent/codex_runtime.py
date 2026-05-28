@@ -263,8 +263,17 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         logger.debug(
                             "Codex stream: synthesized output from %d text deltas (%d chars)",
                             len(agent._codex_streamed_text_parts), len(assembled),
-                        )
+                    )
                 return final_response
+        except TypeError as exc:
+            if "'NoneType' object is not iterable" in str(exc):
+                logger.debug(
+                    "Responses stream parser saw null output; falling back to create(stream=True). %s error=%s",
+                    agent._client_log_context(),
+                    exc,
+                )
+                return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+            raise
         except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
             if attempt < max_stream_retries:
                 logger.debug(
@@ -408,6 +417,9 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
             if terminal_response is not None:
                 # Backfill empty output from collected stream events
                 _out = getattr(terminal_response, "output", None)
+                if _out is None:
+                    terminal_response.output = []
+                    _out = terminal_response.output
                 if isinstance(_out, list) and not _out:
                     if collected_output_items:
                         terminal_response.output = list(collected_output_items)

@@ -7,6 +7,7 @@ Covers the threading behavior control for multi-chunk replies:
 
 Also covers reply_to_text extraction from incoming messages.
 """
+import importlib
 import os
 import sys
 from datetime import datetime, timezone
@@ -310,8 +311,26 @@ class FakeDMChannel(_DMChannelBase):
 
 
 def _make_message(*, content: str = "hi", reference=None):
-    """Build a mock Discord message for _handle_message tests."""
+    """Build a mock Discord message for _handle_message tests.
+
+    Use the *currently bound* production discord.DMChannel for the mock's
+    runtime class. Full-suite import-safety tests can reload
+    gateway.platforms.discord, so a module-import-time FakeDMChannel base may
+    become stale and fail the adapter's isinstance(..., discord.DMChannel)
+    DM check, causing mention-gated drops before handle_message is called.
+    """
+    discord_platform = importlib.import_module("gateway.platforms.discord")
+
     author = SimpleNamespace(id=42, display_name="TestUser", name="TestUser")
+    dm_base = getattr(discord_platform.discord, "DMChannel", FakeDMChannel)
+    if not isinstance(dm_base, type):
+        dm_base = FakeDMChannel
+
+    CurrentFakeDMChannel = type("CurrentFakeDMChannel", (dm_base,), {})
+    channel = CurrentFakeDMChannel()
+    channel.id = 100
+    channel.name = "dm"
+
     return SimpleNamespace(
         id=999,
         content=content,
@@ -319,7 +338,7 @@ def _make_message(*, content: str = "hi", reference=None):
         attachments=[],
         reference=reference,
         created_at=datetime.now(timezone.utc),
-        channel=FakeDMChannel(),
+        channel=channel,
         author=author,
     )
 
@@ -327,6 +346,13 @@ def _make_message(*, content: str = "hi", reference=None):
 @pytest.fixture
 def reply_text_adapter(monkeypatch):
     """DiscordAdapter wired for _handle_message → handle_message capture."""
+    discord_platform = importlib.import_module("gateway.platforms.discord")
+
+    # Pin this module's DM stand-in onto the already-imported adapter module.
+    # Full-suite import-order tests can leave gateway.platforms.discord bound
+    # to a different mock than sys.modules['discord']; _handle_message uses
+    # the module global, so the message factory and adapter must agree.
+    monkeypatch.setattr(discord_platform.discord, "DMChannel", FakeDMChannel, raising=False)
     config = PlatformConfig(enabled=True, token="fake-token")
     adapter = DiscordAdapter(config)
     adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
