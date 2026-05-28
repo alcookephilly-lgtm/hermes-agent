@@ -75,8 +75,22 @@ def _ensure_discord_mock():
 
     # Whether we just installed the mock OR the mock was already installed
     # by another test's _ensure_discord_mock, force the AllowedMentions
-    # stand-in onto it — _build_allowed_mentions() reads this attribute.
-    sys.modules["discord"].AllowedMentions = _FakeAllowedMentions
+    # stand-in onto it.
+    discord_mod = sys.modules["discord"]
+    setattr(discord_mod, "AllowedMentions", _FakeAllowedMentions)
+
+    # Full-suite order matters: other gateway tests may import
+    # gateway.platforms.discord before this file runs, binding that module's
+    # global ``discord`` to an earlier MagicMock.  Patching sys.modules alone
+    # then leaves _build_allowed_mentions() reading the stale global and
+    # returning MagicMock attributes instead of booleans.  Preserve that
+    # module object because later tests may rely on its other fake attrs.
+    gateway_discord = sys.modules.get("gateway.platforms.discord")
+    if gateway_discord is not None:
+        bound_discord = getattr(gateway_discord, "discord", None)
+        if bound_discord is not None:
+            setattr(bound_discord, "AllowedMentions", _FakeAllowedMentions)
+        setattr(gateway_discord, "DISCORD_AVAILABLE", True)
 
 
 _ensure_discord_mock()
