@@ -2989,6 +2989,62 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert fake_client.responses.kwargs["stream"] is True
         assert response.choices[0].message.content == "summary"
 
+    def test_falls_back_when_sdk_stream_parser_sees_null_output(self):
+        class BrokenStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                raise TypeError("'NoneType' object is not iterable")
+
+            def get_final_response(self):  # pragma: no cover
+                return SimpleNamespace(output=None, usage=None)
+
+        class CreateStream:
+            closed = False
+
+            def __iter__(self):
+                return iter([
+                    SimpleNamespace(type="response.created"),
+                    SimpleNamespace(type="response.output_text.delta", delta="vision fallback"),
+                    SimpleNamespace(
+                        type="response.completed",
+                        response=SimpleNamespace(output=None, usage=None),
+                    ),
+                ])
+
+            def close(self):
+                self.closed = True
+
+        class FakeResponses:
+            def __init__(self):
+                self.create_stream = CreateStream()
+                self.stream_calls = 0
+                self.create_calls = 0
+
+            def stream(self, **kwargs):
+                self.stream_calls += 1
+                return BrokenStream()
+
+            def create(self, **kwargs):
+                self.create_calls += 1
+                assert kwargs.get("stream") is True
+                return self.create_stream
+
+        responses = FakeResponses()
+        fake_client = SimpleNamespace(responses=responses)
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+
+        response = adapter.create(messages=[{"role": "user", "content": "summarize this"}])
+
+        assert responses.stream_calls == 1
+        assert responses.create_calls == 1
+        assert responses.create_stream.closed is True
+        assert response.choices[0].message.content == "vision fallback"
+
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
         class _SlowAliveCreateStream:
             def __iter__(self):

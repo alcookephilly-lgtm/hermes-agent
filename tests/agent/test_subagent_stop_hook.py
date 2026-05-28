@@ -67,6 +67,10 @@ def _stub_child_builder(monkeypatch):
     monkeypatch.setattr(
         "tools.delegate_tool._build_child_agent", _fake_build_child,
     )
+    # These hook tests are about delegate_task's subagent_stop event, not
+    # runtime delegation credential resolution. Keep them isolated from any
+    # CLI_CONFIG loaded at collection time by unrelated CLI tests.
+    monkeypatch.setattr("tools.delegate_tool._load_config", lambda: {})
 
 
 def _register_capturing_hook():

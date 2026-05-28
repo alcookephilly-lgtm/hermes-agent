@@ -989,7 +989,6 @@ def load_gateway_config() -> GatewayConfig:
                 plat_data, extra = _ensure_platform_extra_dict(platforms_data, plat.value)
                 if enabled_was_explicit:
                     plat_data["enabled"] = platform_cfg["enabled"]
-                if plat == Platform.SLACK and enabled_was_explicit:
                     extra["_enabled_explicit"] = True
                 extra.update(bridged)
 
@@ -1648,9 +1647,12 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     if api_server_enabled or api_server_key:
         if Platform.API_SERVER not in config.platforms:
             config.platforms[Platform.API_SERVER] = PlatformConfig()
-        config.platforms[Platform.API_SERVER].enabled = True
+        api_cfg = config.platforms[Platform.API_SERVER]
+        api_enabled_explicit = bool(api_cfg.extra.pop("_enabled_explicit", False))
+        if not (api_enabled_explicit and api_cfg.enabled is False):
+            api_cfg.enabled = True
         if api_server_key:
-            config.platforms[Platform.API_SERVER].extra["key"] = api_server_key
+            api_cfg.extra["key"] = api_server_key
         if api_server_cors_origins:
             origins = [origin.strip() for origin in api_server_cors_origins.split(",") if origin.strip()]
             if origins:

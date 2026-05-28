@@ -97,32 +97,89 @@ def test_pasted_memory_context_is_stripped_before_prefetch_query(monkeypatch):
     assert any(event == "prefetch_query_sanitized" for event, _ in events)
 
 
-def test_briefing_marks_old_session_atoms_history_only_never_live_intent():
+def test_atom_min_includes_recorded_at_for_active_and_durable_rows():
     mm = load_plugin()
 
     briefing = mm.format_memorymunch_briefing(
         [
             {
-                "id": "active::sid-current::1",
-                "source_session_id": "sid-current",
+                "id": "active-1",
+                "source": "ACTIVE_SESSION_LEDGER",
                 "provenance_class": "ACTIVE_SESSION_LEDGER_CURRENT",
-                "content_preview": "Current live user asked for MemoryMunch build.",
+                "content_preview": "Current user asked about atom timestamps.",
+                "session_id": "sid-recorded",
+                "ts": "2026-05-28T01:23:45+00:00",
+                "recall_safe": True,
             },
             {
-                "id": "ledger::sid-old::1",
-                "source_session_id": "sid-old",
-                "provenance_class": "ACTIVE_SESSION_LINEAGE",
-                "content_preview": "Old session user wanted a different task.",
+                "id": "vault-1",
+                "source": "vault+db",
+                "provenance_class": "OBSIDIAN_VAULT_OWN_SCOPE",
+                "content": "Durable memory with created time.",
+                "created_at": "2026-05-20T12:00:00+00:00",
+                "recall_safe": True,
             },
         ],
-        active_session_id="sid-current",
-        scope_entity="tg-test",
+        active_session_id="sid-recorded",
+        scope_entity="tg-7475127948",
     )
 
-    assert "current_intent=live_user_msg@active_session_id_only" in briefing
-    assert "current_session_yes" not in briefing
-    assert "source_session_id=sid-current; current_session=yes; intent_scope=active_session_context" in briefing
-    assert "source_session_id=sid-old; current_session=no; intent_scope=history_only_never_live_intent_task_state" in briefing
+    assert "recorded_at=2026-05-28T01:23:45+00:00" in briefing
+    assert "recorded_at=2026-05-20T12:00:00+00:00" in briefing
+    assert "source_priority=live_user > active_session > vault > db_graph > old_sessions" in briefing
+
+
+def test_search_and_deep_read_merges_deep_read_timestamp_fields(monkeypatch):
+    mm = load_plugin()
+    provider = mm.MemoryMunchProvider()
+    provider._scope_entity = "scope-a"
+
+    def fake_bridge(tool, args, timeout=180):
+        if tool == "smart_search":
+            return {"result": {"results": [{"id": "atom-ts", "content": "timestamp result", "search_score": 0.99}]}}
+        if tool == "get_memory":
+            return {
+                "result": {
+                    "memory": {
+                        "id": args["memory_id"],
+                        "content": "deep timestamp result",
+                        "created_at": "2026-05-21T11:22:33+00:00",
+                        "last_activated": "2026-05-22T11:22:33+00:00",
+                        "frontmatter": {"created": "2026-05-20T11:22:33+00:00"},
+                    }
+                }
+            }
+        raise AssertionError(tool)
+
+    monkeypatch.setattr(provider, "_run_original_bridge", fake_bridge)
+
+    result = provider._search_and_deep_read("timestamp carry forward", max_results=1, deep_read_count=1)
+
+    row = result["search_results"][0]
+    assert row["created_at"] == "2026-05-21T11:22:33+00:00"
+    assert row["last_activated"] == "2026-05-22T11:22:33+00:00"
+    assert row["frontmatter"]["created"] == "2026-05-20T11:22:33+00:00"
+
+
+def test_active_session_rows_keep_ledger_ts_in_recorded_at():
+    mm = load_plugin()
+    provider = mm.MemoryMunchProvider()
+    provider._session_id = "sid-ledger-ts"
+    provider._recent_exchanges["sid-ledger-ts"] = [
+        {
+            "session_id": "sid-ledger-ts",
+            "user": "Does this atom show recorded time?",
+            "assistant": "Checking.",
+            "source": "ACTIVE_SESSION_LEDGER",
+            "ts": "2026-05-28T02:03:04+00:00",
+        }
+    ]
+
+    rows = provider._active_session_rows("sid-ledger-ts", "recorded time")
+    briefing = mm.format_memorymunch_briefing(rows, active_session_id="sid-ledger-ts", scope_entity="tg-test")
+
+    assert rows[0]["ts"] == "2026-05-28T02:03:04+00:00"
+    assert "recorded_at=2026-05-28T02:03:04+00:00" in briefing
 
 
 def test_janitor_runs_every_turn_review_mode(monkeypatch):

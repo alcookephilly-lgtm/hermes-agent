@@ -3,7 +3,7 @@
 Read-only except optional JSON report output path. Does not read secrets.
 """
 from __future__ import annotations
-import json, os, time, hashlib
+import json, os, re, time, hashlib
 from pathlib import Path
 
 
@@ -18,7 +18,7 @@ def load_env_names_only(env_path: Path) -> None:
         'HERMES_MEMORYMUNCH_SCOPE_ENTITY',
         'HERMES_MEMORYMUNCH_DOMAIN',
     }
-    for line in env_path.read_text(errors='ignore').splitlines():
+    for line in env_path.read_text(encoding='utf-8', errors='ignore').splitlines():
         line = line.strip()
         if not line or line.startswith('#') or '=' not in line:
             continue
@@ -70,6 +70,19 @@ def detect_live_briefing_contradictions(text: str):
     return {'ok': not gaps, 'gaps': gaps}
 
 
+def extract_memorymunch_briefing_text(text: str) -> str:
+    """Return only MemoryMunch briefing/context blocks from ledger text."""
+    text = text or ''
+    patterns = [
+        r'<memorymunch-briefing[\s\S]*?</memorymunch-briefing>',
+        r'<memory-context[\s\S]*?</memory-context>',
+    ]
+    blocks = []
+    for pattern in patterns:
+        blocks.extend(re.findall(pattern, text, flags=re.IGNORECASE))
+    return '\n'.join(blocks)
+
+
 def iter_strings(value):
     if isinstance(value, str):
         yield value
@@ -102,7 +115,10 @@ def latest_turn_briefing_state(rows):
         row for row in window
         if isinstance(row, dict) and row.get('event') in inspectable_events
     ]
-    return detect_live_briefing_contradictions(rows_text(inspectable_rows))
+    briefing_text = extract_memorymunch_briefing_text(rows_text(inspectable_rows))
+    if not briefing_text:
+        return {'ok': True, 'gaps': []}
+    return detect_live_briefing_contradictions(briefing_text)
 
 def latest_session():
     files = sorted(MM_SESS.glob('*.jsonl'), key=lambda p:p.stat().st_mtime, reverse=True) if MM_SESS.exists() else []
@@ -128,7 +144,7 @@ def recent_rows(limit: int = 25):
 def read_rows(p: Path):
     rows=[]
     if not p or not p.exists(): return rows
-    for line in p.read_text(errors='replace').splitlines():
+    for line in p.read_text(encoding='utf-8', errors='replace').splitlines():
         if not line.strip(): continue
         try: rows.append(json.loads(line))
         except Exception as e: rows.append({'event':'parse_error','error':str(e)})
@@ -136,7 +152,7 @@ def read_rows(p: Path):
 
 def settings_has_gate(p: Path):
     if not p.exists(): return False
-    txt=p.read_text(errors='ignore')
+    txt=p.read_text(encoding='utf-8', errors='ignore')
     return 'graphify-gate.py' in txt and 'graphify-marker-writer.py' in txt and 'graphify-write-tracker.py' in txt
 
 
@@ -176,7 +192,7 @@ def latest_capture_ok(rows):
 
 
 def plugin_hardwire_state(plugin_path: Path):
-    text = plugin_path.read_text(errors='ignore') if plugin_path.exists() else ''
+    text = plugin_path.read_text(encoding='utf-8', errors='ignore') if plugin_path.exists() else ''
     live_writes = 'MEMORYMUNCH_HARDWIRE_LIVE_WRITES = True' in text
     capture_live = 'MEMORYMUNCH_HARDWIRE_CAPTURE_LIVE = True' in text
     janitor_live = 'MEMORYMUNCH_HARDWIRE_JANITOR_LIVE = True' in text
@@ -244,7 +260,10 @@ def main():
     comp=[r for r in all_recent_rows if r.get('event') in {'session_attached','compaction_checkpoint'} or r.get('reason')=='compression']
     gj=GRAPH_OUT/'graph.json'; gr=GRAPH_OUT/'GRAPH_REPORT.md'; gh=GRAPH_OUT/'graph.html'
     verdict=GRAPH_DIR/'verdict.jsonl'
-    verdict_tail=verdict.read_text(errors='ignore').splitlines()[-5:] if verdict.exists() else []
+    verdict_tail=verdict.read_text(encoding='utf-8', errors='ignore').splitlines()[-5:] if verdict.exists() else []
+    compression_core_text = Path('/home/alcoo/.hermes/hermes-agent/agent/conversation_compression.py').read_text(
+        encoding='utf-8', errors='ignore'
+    )
     env={k:os.environ.get(k,'') for k in [
         'HERMES_MEMORYMUNCH_ENABLE','HERMES_MEMORYMUNCH_LIVE_WRITE_ENABLE','HERMES_MEMORYMUNCH_AUTO_CAPTURE_ENABLE','HERMES_MEMORYMUNCH_SCOPE_ENTITY','HERMES_MEMORYMUNCH_DOMAIN']}
     checks={
@@ -259,8 +278,8 @@ def main():
         'visible_turn_ledgering': len(completed)>0,
         'live_capture_firing': latest_capture_ok_bool,
         'compaction_lineage_present': len(comp)>0,
-        'compression_core_injects_provider_context': 'memory_compression_context' in Path('/home/alcoo/.hermes/hermes-agent/agent/conversation_compression.py').read_text(errors='ignore'),
-        'compression_core_injects_exact_user_query': 'Exact pre-compression user message' in Path('/home/alcoo/.hermes/hermes-agent/agent/conversation_compression.py').read_text(errors='ignore'),
+        'compression_core_injects_provider_context': 'memory_compression_context' in compression_core_text,
+        'compression_core_injects_exact_user_query': 'Exact pre-compression user message' in compression_core_text,
         'graphify_data_fresh': gj.exists() and gr.exists() and (now-gj.stat().st_mtime)<24*3600 and (now-gr.stat().st_mtime)<24*3600,
         'graphify_runtime_hooks_wired': settings_has_gate(CC_SETTINGS),
         'graphify_variant_hooks_wired': settings_has_gate(OC_SETTINGS),
