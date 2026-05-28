@@ -70,7 +70,7 @@ MEMORYMUNCH_GATEWAY_BRIEFING_CONTRACT = """MEMORYMUNCH_GATEWAY_BRIEFING_CONTRACT
 - Gateway normal mode receives only recall_safe=true atoms. Recall-unsafe atoms are suppressed before briefing assembly.
 - Janitor alone owns mutation_safe decisions; Gateway may display mutation status but must not authorize mutation or convert unknown into yes.
 - active_session_id is mandatory in every briefing header, and each current-session atom must carry source_session_id.
-- current_session=yes|no; current_intent only from live_user_msg in active_session_id; no=history_only, never live intent/task/state.
+- Older/non-current atoms must be labeled current_session=no and must yield to current-session/live-user proof.
 - Capture and Janitor are operationally required write lanes; do not physically disable them unless the whole plugin is intentionally disabled by user command.
 - Per-event live_db_write=false/live_vault_write=false on prompt/worker/turn ledger rows means that specific row is non-writing; it is not the system write state. Write truth comes from latest live_capture_completed and janitor_cycle_completed rows plus hardwire telemetry.
 - Normal briefing is token-efficient: compact header + ATOM_MIN packets. Full edge IDs, wiki-links, activation/decay history, and source-document details are audit/debug only unless explicitly requested.
@@ -108,6 +108,29 @@ def _row_source_session_id(row: dict[str, Any], atom_id: str) -> str:
         or _brief_session_from_atom(atom_id)
         or ""
     )
+
+
+def _row_recorded_at(row: dict[str, Any]) -> str:
+    frontmatter = row.get("frontmatter") or row.get("yaml_frontmatter") or {}
+    if isinstance(frontmatter, str):
+        try:
+            frontmatter = json.loads(frontmatter)
+        except Exception:
+            frontmatter = {}
+    candidates = (
+        row.get("recorded_at"),
+        row.get("created_at"),
+        row.get("created"),
+        row.get("ts"),
+        row.get("timestamp"),
+        row.get("last_activated"),
+        frontmatter.get("created") if isinstance(frontmatter, dict) else None,
+        frontmatter.get("created_at") if isinstance(frontmatter, dict) else None,
+    )
+    for value in candidates:
+        if value:
+            return str(value)
+    return "unknown"
 
 
 def _row_recall_safe(row: dict[str, Any], label: str) -> bool:
@@ -1021,7 +1044,7 @@ def format_memorymunch_briefing(
         f"presented_atoms={len(prepared)}",
         f"suppressed_atoms={suppressed}",
         "contract=gateway_5ws_v1; hard_gates=recall_safe_filter,on; mutation_safe_owner=janitor; 5ws=edge_enrichment; full_metrics=audit_only",
-        "truth_policy=memory_is_background_evidence; current_intent=live_user_msg@active_session_id_only; current_session_no=history_only_never_intent_task_state",
+        "truth_policy=memory_is_background_evidence; current_session_beats_old_memory; missing_fields_are_gaps",
     ]
     grouped: Dict[str, list[dict[str, Any]]] = {}
     for label, row in prepared:
@@ -1060,6 +1083,7 @@ def format_memorymunch_briefing(
             edge_count, key_edges = _row_edge_summary(row)
             mutation_safe_raw = row.get("mutation_safe")
             mutation_safe = "janitor_yes" if mutation_safe_raw is True else "janitor_no" if mutation_safe_raw is False else "unknown"
+            recorded_at = _compact_snippet(_row_recorded_at(row), 64)
             source_document = _compact_snippet(row.get("source_document") or row.get("document") or row.get("path") or "", 100) or "unavailable"
             five_w = _row_five_w_compact(
                 row,
@@ -1071,8 +1095,8 @@ def format_memorymunch_briefing(
             )
             packet = (
                 f"- ATOM_MIN atom_id={atom}; source={source}; source_session_id={source_session_id or 'unknown'}; "
-                f"current_session={'yes' if current_session else 'no'}; intent_scope={'active_session_context' if current_session else 'history_only_never_live_intent_task_state'}; "
-                f"source_document={source_document}; recall_safe=true; mutation_safe={mutation_safe}; 5w={five_w}; "
+                f"current_session={'yes' if current_session else 'no'}; recorded_at={recorded_at}; source_document={source_document}; "
+                f"recall_safe=true; mutation_safe={mutation_safe}; 5w={five_w}; "
                 f"edges={edge_count}; key_edges={key_edges}; audit_ref={atom}"
             )
             if label == "GRAPH_LINKED_OUTWARD":
@@ -1927,6 +1951,25 @@ class MemoryMunchProvider(MemoryProvider):
             with ThreadPoolExecutor(max_workers=min(3, len(deep_read_atoms))) as pool:
                 futures = [pool.submit(_deep_read, atom_id) for atom_id in deep_read_atoms]
                 deep_reads = [future.result() for future in futures]
+        deep_by_id: dict[str, dict[str, Any]] = {}
+        for deep in deep_reads:
+            if not isinstance(deep, dict):
+                continue
+            memory = deep.get("memory") if isinstance(deep.get("memory"), dict) else deep
+            if not isinstance(memory, dict):
+                continue
+            atom_id = str(memory.get("id") or memory.get("atom_id") or "")
+            if atom_id:
+                deep_by_id[atom_id] = memory
+        for row in results:
+            if not isinstance(row, dict):
+                continue
+            atom_id = str(row.get("id") or row.get("atom_id") or "")
+            memory = deep_by_id.get(atom_id) or {}
+            row["created_at"] = row.get("created_at") or memory.get("created_at")
+            row["last_activated"] = row.get("last_activated") or memory.get("last_activated")
+            row["frontmatter"] = row.get("frontmatter") or memory.get("frontmatter") or memory.get("yaml_frontmatter")
+            row["recorded_at"] = row.get("recorded_at") or row.get("created_at") or _row_recorded_at(row)
         meta = dict(search_result.get("_meta") or {}) if isinstance(search_result, dict) else {}
         meta.update({"deep_read_mode": "parallel", "deep_read_count": len(deep_reads)})
         return {"search_results": results, "deep_reads": deep_reads, "_meta": meta}
@@ -2101,7 +2144,7 @@ class MemoryMunchProvider(MemoryProvider):
             + MEMORYMUNCH_GATEWAY_BRIEFING_CONTRACT +
             "\nReturn a compact Gateway briefing. Include MEMORY_HEADER with active_session_id, scope_entity, "
             "live_db_write, live_vault_write, capture_mode, janitor_mode, recalled_atoms, presented_atoms, and suppressed_atoms. "
-            "Include only recall_safe=true ATOM_MIN packets in normal output. Label source_session_id, current_session, and intent_scope per atom. current_session=no is history_only, never live intent/task/state. "
+            "Include only recall_safe=true ATOM_MIN packets in normal output. Label current_session and source_session_id per atom. "
             "Do not dump full internals unless audit/debug is explicitly requested."
         )
         user_prompt = "\n".join([

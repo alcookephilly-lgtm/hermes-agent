@@ -10,6 +10,7 @@ These tests pin the security-correct behavior so the bypass cannot regress.
 """
 
 import asyncio
+import importlib
 import logging
 import sys
 from types import SimpleNamespace
@@ -107,12 +108,14 @@ def _stub_discord_permissions(monkeypatch):
     bitfield value regardless of whether real discord.py or a sibling test
     module's MagicMock is loaded."""
     import discord
+    discord_platform = importlib.import_module("gateway.platforms.discord")
 
     class _Perm:
         def __init__(self, value=0, **_):
             self.value = value
 
     monkeypatch.setattr(discord, "Permissions", _Perm)
+    monkeypatch.setattr(discord_platform.discord, "Permissions", _Perm, raising=False)
 
 
 @pytest.fixture
@@ -121,6 +124,19 @@ def adapter():
     a = DiscordAdapter(config)
     a._client = SimpleNamespace(user=SimpleNamespace(id=99999, name="HermesBot"), guilds=[])
     return a
+
+
+def _discord_channel_cls(name: str):
+    """Return a Discord channel fake shared by sys.modules and adapter module."""
+    import discord
+
+    discord_platform = importlib.import_module("gateway.platforms.discord")
+    cls = getattr(discord, name, None)
+    if cls is None or not isinstance(cls, type):
+        cls = type(name, (), {})
+        setattr(discord, name, cls)
+    setattr(discord_platform.discord, name, cls)
+    return cls
 
 
 _SENTINEL = object()
@@ -141,11 +157,11 @@ def _make_interaction(
     response = SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock())
 
     if in_dm:
-        channel = discord.DMChannel()
+        channel = _discord_channel_cls("DMChannel")()
     elif in_thread:
-        channel = discord.Thread()
-        channel.id = channel_id
-        channel.parent_id = parent_channel_id
+        channel = _discord_channel_cls("Thread")()
+        setattr(channel, "id", channel_id)
+        setattr(channel, "parent_id", parent_channel_id)
     elif channel_id is None:
         channel = None
     else:
@@ -573,6 +589,7 @@ def _capture_skill_registration(adapter, monkeypatch, entries):
     callback through it is the direct route in tests.
     """
     import discord
+    discord_platform = importlib.import_module("gateway.platforms.discord")
 
     captured: dict = {}
 
@@ -595,8 +612,30 @@ def _capture_skill_registration(adapter, monkeypatch, entries):
 
         return _passthrough
 
+    app_commands = discord_platform.discord.app_commands
+    if not hasattr(app_commands, "Command"):
+        class _FakeCommand:
+            def __init__(self, *, name, description, callback, parent=None, **_):
+                self.name = name
+                self.description = description
+                self.callback = callback
+                self.parent = parent
+                self.default_permissions = None
+        monkeypatch.setattr(app_commands, "Command", _FakeCommand, raising=False)
+    if not hasattr(app_commands, "Choice"):
+        monkeypatch.setattr(
+            app_commands,
+            "Choice",
+            lambda **kwargs: SimpleNamespace(**kwargs),
+            raising=False,
+        )
+
     monkeypatch.setattr(
         discord.app_commands, "autocomplete", capture_autocomplete,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        discord_platform.discord.app_commands, "autocomplete", capture_autocomplete,
         raising=False,
     )
 
