@@ -1928,6 +1928,16 @@ def terminal_tool(
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
+        try:
+            from tools.file_tools import observe_robot_hand_terminal_command
+            observe_robot_hand_terminal_command(
+                command,
+                task_id=effective_task_id,
+                cwd=workdir or cwd,
+            )
+        except Exception:
+            logger.debug("robot-hand terminal observation failed", exc_info=True)
+
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
         if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:

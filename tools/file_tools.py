@@ -5,6 +5,7 @@ import errno
 import json
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 
@@ -76,6 +77,189 @@ _BLOCKED_DEVICE_PATHS = frozenset({
     # fd aliases
     "/dev/fd/0", "/dev/fd/1", "/dev/fd/2",
 })
+
+
+# ---------------------------------------------------------------------------
+# Robot-hand read/discovery enforcement.
+#
+# Native read/search tools are the fallback lane.  They are allowed only after
+# a robot-hand tool (jcode/jdoc/smart-read/graphify lane) has created session
+# proof for the exact file or scope, or when an explicit fallback is recorded.
+# ---------------------------------------------------------------------------
+_ROBOT_HAND_ENFORCEMENT_ENABLED = os.getenv(
+    "HERMES_ROBOT_HAND_READ_GATE", "1"
+).lower() not in {"0", "false", "no", "off"}
+_ROBOT_HAND_SECRET_RE = re.compile(
+    r"(^|[/\\])(?:\.env|credential|credentials|secret|secrets|token|tokens)(?:$|[/\\._-])",
+    re.IGNORECASE,
+)
+_ROBOT_HAND_TOOLS = frozenset({
+    "jcode", "jcodemunch",
+    "jdoc", "jdocmunch",
+    "smart-read", "smart_read", "sc_read", "sc-read",
+    "graphify",
+})
+
+
+def set_robot_hand_enforcement_for_tests(enabled: bool) -> None:
+    """Test seam for robot-hand enforcement; production default is enabled."""
+    global _ROBOT_HAND_ENFORCEMENT_ENABLED
+    _ROBOT_HAND_ENFORCEMENT_ENABLED = bool(enabled)
+
+
+def _robot_hand_state(task_id: str) -> dict:
+    task_key = task_id or "default"
+    task_data = _read_tracker.setdefault(task_key, {
+        "last_key": None, "consecutive": 0,
+        "read_history": set(), "dedup": {},
+        "dedup_hits": {}, "read_timestamps": {},
+    })
+    return task_data.setdefault("robot_hand", {
+        "paths": set(),
+        "scopes": set(),
+        "fallbacks": {},
+        "events": [],
+    })
+
+
+def _normalize_robot_hand_path(path: str, task_id: str = "default") -> str:
+    return str(_resolve_path_for_task(path, task_id))
+
+
+def record_robot_hand_proof(
+    *,
+    tool_name: str,
+    task_id: str = "default",
+    path: str | None = None,
+    scope: str | None = None,
+    fallback_reason: str | None = None,
+) -> None:
+    """Record robot-hand proof for later native read/search fallback."""
+    canonical_tool = (tool_name or "").strip().lower()
+    if canonical_tool not in _ROBOT_HAND_TOOLS:
+        return
+    task_key = task_id or "default"
+    with _read_tracker_lock:
+        state = _robot_hand_state(task_key)
+        if path:
+            state["paths"].add(_normalize_robot_hand_path(path, task_key))
+        if scope:
+            state["scopes"].add(_normalize_robot_hand_path(scope, task_key))
+        if fallback_reason:
+            state["fallbacks"][canonical_tool] = fallback_reason
+        state["events"].append({
+            "tool": canonical_tool,
+            "path": path,
+            "scope": scope,
+            "fallback_reason": fallback_reason,
+        })
+
+
+def _robot_hand_gate_error(
+    *,
+    native_tool: str,
+    path: str,
+    task_id: str = "default",
+    exact_file_required: bool,
+) -> str | None:
+    """Return a block error when native fallback lacks robot-hand proof."""
+    if not _ROBOT_HAND_ENFORCEMENT_ENABLED:
+        return None
+
+    task_key = task_id or "default"
+    resolved = _normalize_robot_hand_path(path, task_key)
+    if _ROBOT_HAND_SECRET_RE.search(resolved):
+        return (
+            f"ROBOT_HAND_GATE: blocked {native_tool} for sensitive path '{path}'. "
+            "Robot-hand tools may not index/read secret, token, credential, or .env paths "
+            "unless the task explicitly names and scopes that path."
+        )
+
+    with _read_tracker_lock:
+        state = _robot_hand_state(task_key)
+        paths = set(state.get("paths", set()))
+        scopes = set(state.get("scopes", set()))
+        fallbacks = dict(state.get("fallbacks", {}))
+
+    if resolved in paths:
+        return None
+    if not exact_file_required:
+        for scope in scopes:
+            try:
+                if Path(resolved).is_relative_to(Path(scope)):
+                    return None
+            except Exception:
+                if resolved.startswith(scope.rstrip(os.sep) + os.sep):
+                    return None
+    if fallbacks:
+        return None
+
+    return (
+        f"ROBOT_HAND_GATE: blocked native {native_tool} for '{path}'. "
+        "Use jcode/jcodemunch, jdoc/jdocmunch, graphify, or smart-read/sc_read first; "
+        "then retry native fallback only after session proof exists for this exact file/scope "
+        "or a fallback reason is recorded."
+    )
+
+
+def observe_robot_hand_terminal_command(command: str, *, task_id: str = "default", cwd: str | None = None) -> None:
+    """Notice mcp2cli/graphify robot-hand commands and ledger their target."""
+    if not isinstance(command, str):
+        return
+    task_key = task_id or "default"
+    try:
+        import shlex
+        parts = shlex.split(command)
+    except Exception:
+        parts = command.split()
+    lowered = [p.lower() for p in parts]
+    joined = " ".join(lowered)
+    base = cwd or os.getcwd()
+    if len(parts) >= 3 and lowered[0] == "cd" and parts[2] in {"&&", ";"}:
+        cd_target = parts[1]
+        if not os.path.isabs(cd_target):
+            cd_target = os.path.join(base, cd_target)
+        base = cd_target
+
+    def _arg_after(*names: str) -> str | None:
+        for name in names:
+            if name in parts:
+                idx = parts.index(name)
+                if idx + 1 < len(parts):
+                    return parts[idx + 1]
+        return None
+
+    if "@smart-read" in lowered or "smart-read" in joined or "sc-read" in lowered or "sc_read" in lowered:
+        target = _arg_after("--file-path", "--path")
+        if target is None:
+            for idx, token in enumerate(lowered):
+                if token in {"sc-read", "sc_read", "read"} and idx + 1 < len(parts):
+                    candidate = parts[idx + 1]
+                    if not candidate.startswith("-"):
+                        target = candidate
+                        break
+        if target:
+            if not os.path.isabs(target):
+                target = os.path.join(base, target)
+            record_robot_hand_proof(tool_name="smart-read", task_id=task_key, path=target)
+        return
+
+    if "@jcodemunch" in lowered or "jcodemunch" in joined or "jcode" in joined:
+        target = _arg_after("--file", "--file-path")
+        if target:
+            if not os.path.isabs(target):
+                target = os.path.join(base, target)
+            record_robot_hand_proof(tool_name="jcodemunch", task_id=task_key, path=target)
+        else:
+            record_robot_hand_proof(tool_name="jcodemunch", task_id=task_key, scope=base)
+        return
+
+    if "@jdocmunch" in lowered or "jdocmunch" in joined or "jdoc" in joined:
+        record_robot_hand_proof(tool_name="jdocmunch", task_id=task_key, scope=base)
+        return
+
+    if parts and os.path.basename(parts[0]).lower() == "graphify":
+        record_robot_hand_proof(tool_name="graphify", task_id=task_key, scope=base)
 
 
 def _resolve_path(filepath: str, task_id: str = "default") -> Path:
@@ -799,6 +983,15 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         _resolved = _resolve_path_for_task(path, task_id)
 
+        robot_hand_error = _robot_hand_gate_error(
+            native_tool="read_file",
+            path=path,
+            task_id=task_id,
+            exact_file_required=True,
+        )
+        if robot_hand_error:
+            return json.dumps({"error": robot_hand_error}, ensure_ascii=False)
+
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
         # Malformed documents fall through to the normal path/binary guard.
@@ -1434,6 +1627,15 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
     """Search for content or files."""
     try:
         offset, limit = normalize_search_pagination(offset, limit)
+
+        robot_hand_error = _robot_hand_gate_error(
+            native_tool="search_files",
+            path=path,
+            task_id=task_id,
+            exact_file_required=False,
+        )
+        if robot_hand_error:
+            return json.dumps({"error": robot_hand_error}, ensure_ascii=False)
 
         # Track searches to detect *consecutive* repeated search loops.
         # Include pagination args so users can page through truncated
