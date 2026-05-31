@@ -8,9 +8,109 @@ import json
 import logging
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tools.file_tools import (
     PATCH_SCHEMA,
 )
+
+
+@pytest.fixture(autouse=True)
+def _disable_robot_hand_gate_for_legacy_file_tool_tests():
+    from tools.file_tools import set_robot_hand_enforcement_for_tests
+
+    set_robot_hand_enforcement_for_tests(False)
+    yield
+    set_robot_hand_enforcement_for_tests(True)
+
+
+class TestRobotHandGate:
+    def test_blocks_native_read_until_exact_robot_hand_proof(self, tmp_path):
+        from tools.file_tools import (
+            read_file_tool,
+            record_robot_hand_proof,
+            set_robot_hand_enforcement_for_tests,
+        )
+
+        target = tmp_path / "note.txt"
+        target.write_text("hello\n", encoding="utf-8")
+        task_id = "robot-hand-read-proof"
+        set_robot_hand_enforcement_for_tests(True)
+
+        blocked = json.loads(read_file_tool(str(target), task_id=task_id))
+        assert "ROBOT_HAND_GATE: blocked native read_file" in blocked["error"]
+
+        record_robot_hand_proof(
+            tool_name="smart-read",
+            task_id=task_id,
+            path=str(target),
+        )
+        allowed = json.loads(read_file_tool(str(target), task_id=task_id))
+        assert "hello" in allowed["content"]
+
+    def test_blocks_native_search_until_scope_robot_hand_proof(self, tmp_path):
+        from tools.file_tools import (
+            search_tool,
+            record_robot_hand_proof,
+            set_robot_hand_enforcement_for_tests,
+        )
+
+        target = tmp_path / "note.txt"
+        target.write_text("needle\n", encoding="utf-8")
+        task_id = "robot-hand-search-proof"
+        set_robot_hand_enforcement_for_tests(True)
+
+        blocked = json.loads(search_tool("needle", path=str(tmp_path), task_id=task_id))
+        assert "ROBOT_HAND_GATE: blocked native search_files" in blocked["error"]
+
+        record_robot_hand_proof(
+            tool_name="graphify",
+            task_id=task_id,
+            scope=str(tmp_path),
+        )
+        allowed = json.loads(search_tool("needle", path=str(tmp_path), task_id=task_id))
+        assert "error" not in allowed
+
+    def test_terminal_observer_records_cd_and_positional_smart_read_file(self, tmp_path):
+        from tools.file_tools import (
+            observe_robot_hand_terminal_command,
+            read_file_tool,
+            set_robot_hand_enforcement_for_tests,
+        )
+
+        target = tmp_path / "note.txt"
+        target.write_text("hello\n", encoding="utf-8")
+        task_id = "robot-hand-terminal-observer"
+        set_robot_hand_enforcement_for_tests(True)
+
+        observe_robot_hand_terminal_command(
+            f"cd {tmp_path} && cli-anything-smart-read-mcp sc-read note.txt",
+            task_id=task_id,
+            cwd="/",
+        )
+
+        allowed = json.loads(read_file_tool(str(target), task_id=task_id))
+        assert "hello" in allowed["content"]
+
+    def test_sensitive_paths_block_even_after_robot_hand_proof(self, tmp_path):
+        from tools.file_tools import (
+            read_file_tool,
+            record_robot_hand_proof,
+            set_robot_hand_enforcement_for_tests,
+        )
+
+        target = tmp_path / ".env.test"
+        target.write_text("TOKEN=redacted\n", encoding="utf-8")
+        task_id = "robot-hand-sensitive"
+        set_robot_hand_enforcement_for_tests(True)
+        record_robot_hand_proof(
+            tool_name="smart-read",
+            task_id=task_id,
+            path=str(target),
+        )
+
+        blocked = json.loads(read_file_tool(str(target), task_id=task_id))
+        assert "sensitive path" in blocked["error"]
 
 
 class TestReadFileHandler:
