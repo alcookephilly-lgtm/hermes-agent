@@ -5,7 +5,7 @@ import pytest
 from rich.console import Console
 
 from cli import ChatConsole
-from hermes_cli.skills_hub import do_check, do_install, do_list, do_update, handle_skills_slash
+from hermes_cli.skills_hub import do_check, do_install, do_list, do_update, handle_skills_slash, inspect_skill
 
 
 class _DummyLockFile:
@@ -128,6 +128,36 @@ def test_do_list_distinguishes_hub_builtin_and_local(three_source_env):
     assert "builtin-skill" in output
     assert "local-skill" in output
     assert "1 hub-installed, 1 builtin, 1 local" in output
+
+
+def test_inspect_skill_falls_back_to_local_installed_skill(monkeypatch):
+    import json
+    import tools.skills_hub as hub
+    import tools.skills_tool as skills_tool
+
+    def fake_skill_view(name, preprocess=False):
+        if name != "local-warroom":
+            return json.dumps({"success": False})
+        return json.dumps({
+            "success": True,
+            "name": "local-warroom",
+            "description": "Local installed skill",
+            "path": "autonomous-ai-agents/local-warroom/SKILL.md",
+            "skill_dir": "/home/alcoo/.hermes/skills/autonomous-ai-agents/local-warroom",
+            "content": "---\nname: local-warroom\n---\n# Local Warroom\nbody",
+        })
+
+    monkeypatch.setattr(skills_tool, "skill_view", fake_skill_view)
+    monkeypatch.setattr(hub, "GitHubAuth", lambda: object())
+    monkeypatch.setattr(hub, "create_source_router", lambda _auth: [])
+    monkeypatch.setattr(hub, "unified_search", lambda *_args, **_kwargs: [])
+
+    result = inspect_skill("local-warroom")
+
+    assert result["source"] == "local"
+    assert result["name"] == "local-warroom"
+    assert "Local Warroom" in result["skill_md_preview"]
+    assert inspect_skill("missing-warroom") is None
 
 
 def test_do_list_filter_local(three_source_env):
