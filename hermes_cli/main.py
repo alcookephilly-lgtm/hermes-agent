@@ -6324,6 +6324,73 @@ def _count_commits_between(git_cmd: list[str], cwd: Path, base: str, head: str) 
     return -1
 
 
+_NATIVE_UPDATE_PRESERVE_PROOF_ENV = "HERMES_NATIVE_UPDATE_PRESERVE_PROOF"
+_NATIVE_UPDATE_PRESERVE_PROOF_MAX_AGE_SECONDS = 60 * 60
+
+
+def _validate_native_update_preserve_proof(
+    proof_path: Optional[str],
+    *,
+    branch: str,
+    head_sha: str,
+    local_count: int,
+) -> tuple[bool, str]:
+    """Validate a fresh preserve proof before allowing a diverged update reset."""
+    if not proof_path:
+        return False, f"{_NATIVE_UPDATE_PRESERVE_PROOF_ENV} is not set"
+
+    path = Path(proof_path).expanduser()
+    if not path.is_file():
+        return False, f"proof file missing: {path}"
+
+    try:
+        proof_age = _time.time() - path.stat().st_mtime
+    except OSError as exc:
+        return False, f"proof file stat failed: {exc}"
+
+    if proof_age > _NATIVE_UPDATE_PRESERVE_PROOF_MAX_AGE_SECONDS:
+        return False, "proof file is older than 1 hour"
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return False, f"proof file read failed: {exc}"
+
+    required_lines = [
+        "VERDICT: PASS",
+        f"- head: {head_sha}",
+        f"- base ref: origin/{branch}",
+        f"- local commit count: {local_count}",
+        f"- patch count: {local_count}",
+        "- auto restore clean on current origin/main: True",
+        "- branch: alcookephilly-lgtm/",
+        "points to head: True",
+        "- tag: alcookephilly-lgtm/",
+    ]
+    missing = [line for line in required_lines if line not in text]
+    if missing:
+        return False, "proof file missing: " + "; ".join(missing)
+
+    return True, f"proof accepted: {path}"
+
+
+def _print_diverged_update_refusal(
+    *,
+    branch: str,
+    local_count: int,
+    remote_count: int,
+    proof_reason: str,
+) -> None:
+    print()
+    print("✗ Refusing native update: local committed history and remote updates both exist.")
+    print(f"  local commits ahead of origin/{branch}: {local_count}")
+    print(f"  remote commits behind origin/{branch}: {remote_count}")
+    print(f"  proof check: {proof_reason}")
+    print()
+    print("  Run preserve/rebase proof first, then retry with:")
+    print(f"  {_NATIVE_UPDATE_PRESERVE_PROOF_ENV}=<PRECHECK.md> hermes update")
+
+
 def _should_skip_upstream_prompt() -> bool:
     """Check if user previously declined to add upstream."""
     from hermes_constants import get_hermes_home
@@ -8646,6 +8713,44 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         commit_count = int(result.stdout.strip())
+
+        local_commit_count = _count_commits_between(
+            git_cmd, PROJECT_ROOT, f"origin/{branch}", "HEAD"
+        )
+        if commit_count > 0 and local_commit_count > 0:
+            head_sha = _capture_head_sha(git_cmd, PROJECT_ROOT) or ""
+            proof_ok, proof_reason = _validate_native_update_preserve_proof(
+                os.environ.get(_NATIVE_UPDATE_PRESERVE_PROOF_ENV),
+                branch=branch,
+                head_sha=head_sha,
+                local_count=local_commit_count,
+            )
+            if proof_ok:
+                print(f"  ✓ Native update preserve proof accepted: {proof_reason}")
+            else:
+                if auto_stash_ref is not None:
+                    _restore_stashed_changes(
+                        git_cmd,
+                        PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=False,
+                        input_fn=gw_input_fn,
+                    )
+                if current_branch not in {branch, "HEAD"}:
+                    subprocess.run(
+                        git_cmd + ["checkout", current_branch],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                _print_diverged_update_refusal(
+                    branch=branch,
+                    local_count=local_commit_count,
+                    remote_count=commit_count,
+                    proof_reason=proof_reason,
+                )
+                sys.exit(2)
 
         if commit_count == 0:
             _invalidate_update_cache()
