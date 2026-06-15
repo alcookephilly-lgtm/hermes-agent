@@ -7,6 +7,7 @@ finished automatically on the next launch instead of leaving a half-built venv.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import hermes_cli.main as m
@@ -216,3 +217,91 @@ def test_recovery_output_goes_to_stderr(tmp_path, monkeypatch, capfd):
     assert "interrupted mid-install" not in out
     assert "interrupted mid-install" in err
     assert "recovered" in err
+
+
+def _write_preserve_proof(
+    tmp_path: Path,
+    *,
+    head: str = "abc123",
+    local_count: int = 34,
+    verdict: str = "PASS",
+) -> Path:
+    proof = tmp_path / "PRECHECK.md"
+    proof.write_text(
+        "\n".join(
+            [
+                f"VERDICT: {verdict}",
+                f"- head: {head}",
+                "- base ref: origin/main",
+                f"- local commit count: {local_count}",
+                f"- patch count: {local_count}",
+                "- auto restore clean on current origin/main: True",
+                "- branch: alcookephilly-lgtm/preserve/hermes-native-update-safety-rebased-20260616 points to head: True",
+                "- tag: alcookephilly-lgtm/golden-20260616-hermes-native-update-safety-rebased points to head: True",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return proof
+
+
+def test_native_update_preserve_proof_accepts_current_pass(tmp_path):
+    proof = _write_preserve_proof(tmp_path)
+
+    ok, reason = m._validate_native_update_preserve_proof(
+        str(proof),
+        branch="main",
+        head_sha="abc123",
+        local_count=34,
+    )
+
+    assert ok is True
+    assert "proof accepted" in reason
+
+
+def test_native_update_preserve_proof_rejects_head_mismatch(tmp_path):
+    proof = _write_preserve_proof(tmp_path, head="oldhead")
+
+    ok, reason = m._validate_native_update_preserve_proof(
+        str(proof),
+        branch="main",
+        head_sha="newhead",
+        local_count=34,
+    )
+
+    assert ok is False
+    assert "- head: newhead" in reason
+
+
+def test_native_update_preserve_proof_rejects_stale_file(tmp_path):
+    proof = _write_preserve_proof(tmp_path)
+    stale_time = m._time.time() - (
+        m._NATIVE_UPDATE_PRESERVE_PROOF_MAX_AGE_SECONDS + 1
+    )
+    os.utime(proof, (stale_time, stale_time))
+
+    ok, reason = m._validate_native_update_preserve_proof(
+        str(proof),
+        branch="main",
+        head_sha="abc123",
+        local_count=34,
+    )
+
+    assert ok is False
+    assert "older than 1 hour" in reason
+
+
+def test_diverged_update_refusal_names_counts_and_proof_gap(capsys):
+    m._print_diverged_update_refusal(
+        branch="main",
+        local_count=34,
+        remote_count=34,
+        proof_reason=f"{m._NATIVE_UPDATE_PRESERVE_PROOF_ENV} is not set",
+    )
+
+    out = capsys.readouterr().out
+    assert "Refusing native update" in out
+    assert "local commits ahead of origin/main: 34" in out
+    assert "remote commits behind origin/main: 34" in out
+    assert m._NATIVE_UPDATE_PRESERVE_PROOF_ENV in out
