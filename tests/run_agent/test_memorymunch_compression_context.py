@@ -70,6 +70,7 @@ class FakeAgent:
     session_log_file = None
     _last_compression_summary_warning = None
     _last_aux_fallback_warning_key = None
+    _compression_feasibility_checked = True
     _session_db_created = True
     _session_init_model_config = {}
     _todo_store = FakeTodo()
