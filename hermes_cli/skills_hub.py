@@ -81,6 +81,56 @@ def _resolve_short_name(name: str, sources, console: Console) -> str:
     return ""
 
 
+def _local_installed_skill_preview(identifier: str) -> Optional[dict]:
+    """Return installed local skill metadata when skill_view can load it."""
+    try:
+        from tools.skills_tool import skill_view
+
+        data = json.loads(skill_view(identifier, preprocess=False))
+    except Exception:
+        return None
+
+    if not data.get("success"):
+        return None
+
+    content = str(data.get("content") or "")
+    return {
+        "name": data.get("name") or identifier,
+        "description": data.get("description") or "",
+        "source": "local",
+        "identifier": data.get("path") or identifier,
+        "path": data.get("path") or "",
+        "skill_dir": data.get("skill_dir") or "",
+        "skill_md_preview": "\n".join(content.split("\n")[:50]),
+    }
+
+
+def _print_local_installed_skill_preview(identifier: str, console: Console) -> bool:
+    info = _local_installed_skill_preview(identifier)
+    if not info:
+        return False
+
+    info_lines = [
+        f"[bold]Name:[/] {info['name']}",
+        f"[bold]Description:[/] {info['description']}",
+        "[bold]Source:[/] local installed skill",
+        f"[bold]Identifier:[/] {info['identifier']}",
+    ]
+    if info.get("skill_dir"):
+        info_lines.append(f"[bold]Path:[/] {info['skill_dir']}")
+
+    console.print(Panel("\n".join(info_lines), title=f"Skill: {info['name']}"))
+    console.print(
+        Panel(
+            info["skill_md_preview"],
+            title="SKILL.md Preview",
+            subtitle="installed local skill",
+        )
+    )
+    console.print()
+    return True
+
+
 def _format_extra_metadata_lines(extra: Dict[str, Any]) -> list[str]:
     lines: list[str] = []
     if not extra:
@@ -749,10 +799,13 @@ def do_inspect(identifier: str, console: Optional[Console] = None) -> None:
     from tools.skills_hub import GitHubAuth, create_source_router
 
     c = console or _console
+    original_identifier = identifier
     auth = GitHubAuth()
     sources = create_source_router(auth)
 
     if "/" not in identifier:
+        if _print_local_installed_skill_preview(original_identifier, c):
+            return
         identifier = _resolve_short_name(identifier, sources, c)
         if not identifier:
             return
@@ -760,6 +813,8 @@ def do_inspect(identifier: str, console: Optional[Console] = None) -> None:
     meta, bundle, _matched_source = _resolve_source_meta_and_bundle(identifier, sources)
 
     if not meta:
+        if _print_local_installed_skill_preview(original_identifier, c):
+            return
         c.print(f"[bold red]Error:[/] Could not find '{identifier}' in any source.\n")
         return
 
@@ -852,16 +907,20 @@ def inspect_skill(identifier: str) -> Optional[dict]:
             pass
 
     c = _Q()
+    original_identifier = identifier
     auth = GitHubAuth()
     sources = create_source_router(auth)
     ident = identifier
     if "/" not in ident:
+        local_info = _local_installed_skill_preview(original_identifier)
+        if local_info:
+            return local_info
         ident = _resolve_short_name(ident, sources, c)
         if not ident:
-            return None
+            return _local_installed_skill_preview(original_identifier)
     meta, bundle, _ = _resolve_source_meta_and_bundle(ident, sources)
     if not meta:
-        return None
+        return _local_installed_skill_preview(original_identifier)
     out: dict = {
         "name": meta.name,
         "description": meta.description,
