@@ -233,6 +233,12 @@ class CLICommandsMixin:
         """
         from tools.process_registry import process_registry
 
+        try:
+            from hermes_cli.warroom_goal import halt_warroom_goal
+            warroom_state = halt_warroom_goal(getattr(self, "session_id", "") or "", reason="/stop")
+        except Exception:
+            warroom_state = None
+
         processes = process_registry.list_sessions()
         running = [p for p in processes if p.get("status") == "running"]
 
@@ -246,7 +252,10 @@ class CLICommandsMixin:
             interrupt_all = None
 
         if not running and not n_async:
-            print("  No running background processes.")
+            if warroom_state is not None:
+                print(f"  ✅ {warroom_state.status_line()}")
+            else:
+                print("  No running background processes.")
             return
 
         if running:

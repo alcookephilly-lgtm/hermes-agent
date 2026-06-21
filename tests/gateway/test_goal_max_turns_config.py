@@ -59,10 +59,12 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
     response = await GatewayRunner._handle_goal_command(runner, event)
 
     try:
-        assert "⊙ Goal set (7-turn budget): ship the benchmark" in response
-        state = goals.GoalManager("sid-gateway-goal-config").state
+        assert "WARROOM V3 global_plan_adversary" in response
+        from hermes_cli.warroom_goal import load_warroom_goal
+        state = load_warroom_goal("sid-gateway-goal-config")
         assert state is not None
-        assert state.max_turns == 7
+        assert state.workflow == "global_plan_adversary"
+        assert goals.GoalManager("sid-gateway-goal-config").state is None
     finally:
         goals._DB_CACHE.clear()
 
@@ -99,10 +101,12 @@ async def test_gateway_goal_leading_number_overrides_config_budget(tmp_path, mon
     response = await GatewayRunner._handle_goal_command(runner, event)
 
     try:
-        assert "⊙ Goal set (50-turn budget): ship the benchmark" in response
-        state = goals.GoalManager("sid-gateway-goal-config").state
+        assert "WARROOM V3 global_plan_adversary" in response
+        from hermes_cli.warroom_goal import load_warroom_goal
+        state = load_warroom_goal("sid-gateway-goal-config")
         assert state is not None
-        assert state.max_turns == 50
+        assert state.original_goal == "50 ship the benchmark"
+        assert goals.GoalManager("sid-gateway-goal-config").state is None
     finally:
         goals._DB_CACHE.clear()
 
@@ -155,12 +159,14 @@ async def test_gateway_goal_resume_enqueues_immediate_continuation(tmp_path, mon
     response = await GatewayRunner._handle_goal_command(runner, resume_event)
 
     try:
-        assert "Goal resumed" in response
+        assert "WARROOM V3 global_plan_adversary" in response
         pending = runner.adapters[Platform.DISCORD]._pending_messages
         queued = pending["agent:main:discord:channel:goal-config"]
-        assert "Continuing toward your standing goal" in queued.text
-        state = goals.GoalManager("sid-gateway-goal-config").state
+        assert "WARROOM V3 CONTROLLER" in queued.text
+        from hermes_cli.warroom_goal import load_warroom_goal
+        state = load_warroom_goal("sid-gateway-goal-config")
         assert state is not None
         assert state.status == "active"
+        assert goals.GoalManager("sid-gateway-goal-config").state is None
     finally:
         goals._DB_CACHE.clear()

@@ -497,6 +497,45 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    # Global /goal hardwire: any literal /goal message that reaches the core
+    # agent loop is intercepted before the model. This closes API/ACP/direct
+    # chat ingress where no surface-specific slash dispatcher ran.
+    try:
+        from hermes_cli.warroom_goal import handle_global_goal_slash
+        _goal_handled = handle_global_goal_slash(
+            agent.session_id or "",
+            original_user_message if isinstance(original_user_message, str) else user_message,
+            allowed_mutation_root=os.getenv("TERMINAL_CWD") or os.getcwd(),
+        )
+    except Exception as _goal_exc:
+        _goal_handled = {
+            "handled": True,
+            "response": f"WARROOM V3 GAP: /goal hardwire failed before model fallback: {_goal_exc}",
+            "kickoff": None,
+        }
+    if _goal_handled is not None:
+        final_response = str(_goal_handled.get("response") or "WARROOM V3 /goal handled.")
+        messages.append({"role": "assistant", "content": final_response})
+        from agent.turn_finalizer import finalize_turn
+        _goal_result = finalize_turn(
+            agent,
+            final_response=final_response,
+            api_call_count=0,
+            interrupted=False,
+            failed=False,
+            messages=messages,
+            conversation_history=conversation_history,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            _should_review_memory=_should_review_memory,
+            _turn_exit_reason="warroom_goal_hardwire_pre_model",
+        )
+        if _goal_handled.get("kickoff"):
+            _goal_result["warroom_kickoff_prompt"] = str(_goal_handled.get("kickoff"))
+        return _goal_result
+
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None

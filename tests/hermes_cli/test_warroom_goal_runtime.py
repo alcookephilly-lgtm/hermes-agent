@@ -1,0 +1,549 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture()
+def hermes_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import goals
+    try:
+        from hermes_cli import warroom_goal
+        warroom_goal._DB_CACHE.clear()
+    except Exception:
+        pass
+    goals._DB_CACHE.clear()
+    yield home
+    goals._DB_CACHE.clear()
+    try:
+        warroom_goal._DB_CACHE.clear()
+    except Exception:
+        pass
+
+
+def test_detect_warroom_goal_triggers_and_global_fallback():
+    from hermes_cli.warroom_goal import detect_warroom_goal
+
+    fast = detect_warroom_goal("Use adversary skill for: ship runtime enforcement")
+    assert fast is not None
+    assert fast.workflow == "fast_adversary"
+    assert fast.body == "ship runtime enforcement"
+
+    strict = detect_warroom_goal("Use plan adversary skill for: ship runtime enforcement")
+    assert strict is not None
+    assert strict.workflow == "strict_plan_adversary"
+
+    generic = detect_warroom_goal("I might use adversary skill for: nope")
+    assert generic is not None
+    assert generic.workflow == "global_plan_adversary"
+    assert generic.body == "I might use adversary skill for: nope"
+
+    quoted = detect_warroom_goal('Example: "/goal Use adversary skill for: nope"')
+    assert quoted is not None
+    assert quoted.workflow == "global_plan_adversary"
+
+    typo = detect_warroom_goal("Use adversary-skill for: nope")
+    assert typo is not None
+    assert typo.workflow == "global_plan_adversary"
+
+
+def test_global_goal_creates_plan_roles_without_budget_or_fallback(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, handle_global_goal_slash, load_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-global",
+        "ship universal slash goal hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    assert state.workflow == "global_plan_adversary"
+    assert state.required_roles == ["controller", "plan_builder", "plan_adversary", "plan_reviewer"]
+    assert state.gates["role_spawn"] == "pass"
+    assert state.required_action is None
+    assert "50" not in state.gates
+
+    handled = handle_global_goal_slash(
+        "sid-global-api",
+        "/goal ship from API ingress",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    assert handled is not None
+    assert "WARROOM V3 global_plan_adversary" in handled["response"]
+    assert load_warroom_goal("sid-global-api").workflow == "global_plan_adversary"
+
+
+def test_create_fast_state_persists_roles_and_gates(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, load_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-fast",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    assert state.workflow == "fast_adversary"
+    assert state.controller_active is True
+    assert state.required_roles == ["controller", "builder", "adversary", "reviewer", "guardian"]
+    assert state.gates["controller_active"] == "pass"
+    assert state.gates["tracking"] == "pass"
+
+    reloaded = load_warroom_goal("sid-fast")
+    assert reloaded is not None
+    assert reloaded.workflow == "fast_adversary"
+
+
+def test_strict_state_requires_plan_before_mutation(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy
+
+    state = create_warroom_goal(
+        "sid-strict",
+        "Use plan adversary skill for: build hardwire\n\nAcceptance:\n- proof\n\nConstraints:\n- worktree only\n\nVerify with:\npytest",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    from hermes_cli.warroom_goal import save_warroom_goal
+    state.current_role = "builder"
+    save_warroom_goal("sid-strict", state)
+    msg = enforce_tool_policy("sid-strict", "write_file", {"path": str(tmp_path / "x.py")})
+    assert msg is not None
+    assert "plan gate" in msg.lower()
+
+
+def test_tool_policy_blocks_reviewer_and_skill_dir_mutation(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-policy",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.current_role = "reviewer"
+    save_warroom_goal("sid-policy", state)
+    assert "reviewer" in enforce_tool_policy("sid-policy", "write_file", {"path": str(tmp_path / "x.py")}).lower()
+
+    state.current_role = "builder"
+    state.gates["tracking"] = "pass"
+    state.gates["plan"] = "pass"
+    save_warroom_goal("sid-policy", state)
+    assert enforce_tool_policy("sid-policy", "write_file", {"path": str(tmp_path / "x.py")}) is None
+
+    denied = enforce_tool_policy("sid-policy", "write_file", {"path": "/home/alcoo/.hermes/skills/nope/SKILL.md"})
+    assert denied is not None
+    assert "denied" in denied.lower()
+
+
+def test_final_guard_blocks_done_without_proof_and_health_only(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, guard_final_response, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-final",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    blocked = guard_final_response("sid-final", "DONE. Health check passed.")
+    assert "blocked" in blocked.lower()
+    assert "proof packet" in blocked.lower()
+
+    state.proof_packet_path = str(tmp_path / "proof-packet.md")
+    Path(state.proof_packet_path).write_text("Status: PASS\nGuardian verdict: PASS\n", encoding="utf-8")
+    state.final_claim_allowed = True
+    save_warroom_goal("sid-final", state)
+    blocked = guard_final_response("sid-final", "DONE. Health check passed.")
+    assert "health check" in blocked.lower()
+
+    ok = guard_final_response("sid-final", "DONE. pytest E2E passed and proof packet written.")
+    assert ok.startswith("DONE")
+
+
+def test_copy_and_halt_state_on_session_boundary(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, copy_warroom_goal, halt_warroom_goal, load_warroom_goal
+
+    create_warroom_goal(
+        "sid-parent",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    child = copy_warroom_goal("sid-parent", "sid-child", reason="compression")
+    assert child is not None
+    assert child.parent_session_id == "sid-parent"
+    assert load_warroom_goal("sid-child") is not None
+
+    halted = halt_warroom_goal("sid-child", reason="/stop")
+    assert halted is not None
+    assert halted.status == "halted"
+    assert halted.halt_reason == "/stop"
+
+
+
+def test_final_guard_allows_negated_or_progress_language(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, guard_final_response
+
+    create_warroom_goal(
+        "sid-final-negated",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    assert guard_final_response("sid-final-negated", "I am still working on it; no fix yet.").startswith("I am still")
+    assert guard_final_response("sid-final-negated", "Here is a complete log of what failed; not fixed.").startswith("Here is")
+    assert guard_final_response("sid-final-negated", "The working directory is /tmp and the issue remains open.").startswith("The working")
+
+
+def test_copy_does_not_overwrite_newer_child_state(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, copy_warroom_goal, load_warroom_goal, save_warroom_goal
+
+    parent = create_warroom_goal(
+        "sid-parent-newer-check",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    child = create_warroom_goal(
+        "sid-child-newer-check",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    child.status = "gap"
+    child.last_gap = "child-only update after compression"
+    child.updated_at = parent.updated_at + 10
+    save_warroom_goal("sid-child-newer-check", child)
+
+    copied = copy_warroom_goal("sid-parent-newer-check", "sid-child-newer-check", reason="compression")
+    assert copied.status == "gap"
+    assert load_warroom_goal("sid-child-newer-check").last_gap == "child-only update after compression"
+
+
+def test_tracking_gate_blocks_builder_mutation(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, save_warroom_goal
+
+    missing_tracking = tmp_path / "missing-tracking"
+    state = create_warroom_goal(
+        "sid-tracking-block",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(missing_tracking),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.current_role = "builder"
+    save_warroom_goal("sid-tracking-block", state)
+    msg = enforce_tool_policy("sid-tracking-block", "write_file", {"path": str(tmp_path / "x.py")})
+    assert msg is not None
+    assert "tracking gate" in msg.lower()
+
+
+
+def test_role_spawn_success_persists_ids_hashes_and_evidence(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-spawn-success",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+
+    assert state.gates["role_spawn"] == "pass"
+    assert state.required_action is None
+    assert set(state.role_records) == {"controller", "builder", "adversary", "reviewer", "guardian"}
+    for role, record in state.role_records.items():
+        assert record["role_card_sha256"]
+        assert record["runtime_id"]
+        assert Path(record["evidence_path"]).exists()
+        assert role == "controller" or record["runtime_id"].startswith("pid:")
+    assert Path(state.role_spawn_evidence_path).exists()
+
+
+def test_missing_role_card_blocks_spawn_with_explicit_gap(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, save_warroom_goal, start_warroom_roles
+
+    state = create_warroom_goal(
+        "sid-missing-card",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.role_cards["reviewer"] = str(tmp_path / "missing-reviewer-card.md")
+    state.required_action = "spawn_roles"
+    state.roles_started["reviewer"] = False
+    save_warroom_goal("sid-missing-card", state)
+
+    blocked = start_warroom_roles("sid-missing-card", ["reviewer"])
+    assert blocked.status == "gap"
+    assert blocked.gates["role_spawn"] == "gap"
+    assert "missing role card" in blocked.last_gap
+    assert blocked.role_records["reviewer"]["runtime_id"] == "missing-role-card"
+
+
+def test_strict_plan_starts_plan_roles_then_build_roles_after_gates(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, save_warroom_goal, start_plan_build_roles_if_ready
+
+    state = create_warroom_goal(
+        "sid-plan-sequence",
+        "Use plan adversary skill for: build hardwire\n\nAcceptance:\n- proof\n\nConstraints:\n- worktree only\n\nVerify with:\npytest",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    assert set(state.role_records) == {"controller", "plan_builder", "plan_adversary", "plan_reviewer"}
+    assert "builder" not in state.role_records
+
+    state.gates["plan"] = "pass"
+    state.gates["tracking"] = "pass"
+    save_warroom_goal("sid-plan-sequence", state)
+    advanced = start_plan_build_roles_if_ready("sid-plan-sequence")
+    assert {"builder", "adversary", "reviewer", "guardian"}.issubset(set(advanced.role_records))
+    assert advanced.gates["build_role_spawn"] == "pass"
+
+
+def test_builder_self_report_cannot_unlock_guardian_final_gate(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, guard_final_response, record_role_output, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-guardian-unlock",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    proof = tmp_path / "proof-packet.md"
+    proof.write_text("tests passed\n", encoding="utf-8")
+    state.proof_packet_path = str(proof)
+    save_warroom_goal("sid-guardian-unlock", state)
+
+    record_role_output("sid-guardian-unlock", "builder", evidence_path=str(tmp_path / "builder.txt"), verdict="PASS")
+    assert "FINAL BLOCKED" in guard_final_response("sid-guardian-unlock", "DONE. pytest E2E passed.")
+
+    guardian = tmp_path / "guardian.txt"
+    guardian.write_text("Guardian verdict: PASS\n", encoding="utf-8")
+    unlocked = record_role_output("sid-guardian-unlock", "guardian", evidence_path=str(guardian), verdict="PASS")
+    assert unlocked.guardian_pass is True
+    assert unlocked.final_claim_allowed is True
+    assert guard_final_response("sid-guardian-unlock", "DONE. pytest E2E passed and proof packet written.").startswith("DONE")
+
+
+def test_normal_chat_fallback_blocked_while_spawn_pending(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, guard_final_response, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-spawn-pending",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.required_action = "spawn_roles"
+    save_warroom_goal("sid-spawn-pending", state)
+    assert "normal chat fallback denied" in guard_final_response("sid-spawn-pending", "Working on it.")
+
+
+def test_noncritical_halts_auto_continue_and_mission_critical_halts(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import apply_halt_policy, create_warroom_goal, load_warroom_goal
+
+    create_warroom_goal(
+        "sid-halt-policy",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    for reason in ["approval_phase", "live_promotion_phrase", "internal_reviewer_handoff", "guardian_handoff", "normal_milestone_boundary"]:
+        state = apply_halt_policy("sid-halt-policy", reason=reason)
+        assert state.status == "active"
+        assert state.noncritical_pause_attempts[-1]["decision"] == "auto_continued"
+
+    halted = apply_halt_policy("sid-halt-policy", reason="credentials_or_physical_access")
+    assert halted.status == "halted"
+    assert halted.halt_reason == "credentials_or_physical_access"
+
+    create_warroom_goal(
+        "sid-stop-policy",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    stopped = apply_halt_policy("sid-stop-policy", reason="/stop")
+    assert stopped.status == "halted"
+    assert stopped.halt_reason == "explicit_user_stop"
+
+
+
+def test_terminal_and_execute_code_fail_closed_for_non_builder_and_builder_scope(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-terminal-policy",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.current_role = "reviewer"
+    save_warroom_goal("sid-terminal-policy", state)
+    assert "reviewer" in enforce_tool_policy("sid-terminal-policy", "terminal", {"command": "touch x"}).lower()
+    assert "reviewer" in enforce_tool_policy("sid-terminal-policy", "execute_code", {"code": "open('x','w').write('x')"}).lower()
+
+    state.current_role = "builder"
+    state.gates["tracking"] = "pass"
+    state.gates["plan"] = "pass"
+    save_warroom_goal("sid-terminal-policy", state)
+    assert enforce_tool_policy("sid-terminal-policy", "terminal", {"command": "pytest", "workdir": str(tmp_path)}) is None
+    outside = enforce_tool_policy("sid-terminal-policy", "terminal", {"command": "pytest", "workdir": "/tmp"})
+    assert outside is not None and "outside allowed worktree" in outside
+    assert "execute_code is not allowed" in enforce_tool_policy("sid-terminal-policy", "execute_code", {"code": "Path('x').write_text('x')"})
+
+
+def test_guardian_unlock_requires_existing_guardian_pass_evidence(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, guard_final_response, record_role_output, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-guardian-evidence",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    proof = tmp_path / "proof-packet.md"
+    proof.write_text("proof\n", encoding="utf-8")
+    state.proof_packet_path = str(proof)
+    save_warroom_goal("sid-guardian-evidence", state)
+
+    missing = record_role_output("sid-guardian-evidence", "guardian", evidence_path=str(tmp_path / "missing.txt"), verdict="PASS")
+    assert missing.guardian_pass is False
+    assert "FINAL BLOCKED" in guard_final_response("sid-guardian-evidence", "DONE. pytest E2E passed and proof packet written.")
+
+    weak = tmp_path / "weak.txt"
+    weak.write_text("PASS\n", encoding="utf-8")
+    weak_state = record_role_output("sid-guardian-evidence", "guardian", evidence_path=str(weak), verdict="PASS")
+    assert weak_state.guardian_pass is False
+
+    good = tmp_path / "guardian.txt"
+    good.write_text("Guardian verdict: PASS\n", encoding="utf-8")
+    good_state = record_role_output("sid-guardian-evidence", "guardian", evidence_path=str(good), verdict="PASS")
+    assert good_state.guardian_pass is True
+    assert good_state.final_claim_allowed is True
+
+
+
+def test_core_conversation_loop_intercepts_slash_goal_before_model(hermes_home, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from agent import conversation_loop
+    from hermes_cli.warroom_goal import load_warroom_goal
+
+    monkeypatch.chdir(tmp_path)
+
+    def fake_context(agent, user_message, system_message, conversation_history, task_id, stream_callback, persist_user_message, **kwargs):
+        return SimpleNamespace(
+            user_message=user_message,
+            original_user_message=user_message,
+            messages=[{"role": "user", "content": user_message}],
+            conversation_history=[],
+            active_system_prompt="",
+            effective_task_id="task-core",
+            turn_id="turn-core",
+            current_turn_user_idx=0,
+            should_review_memory=False,
+            plugin_user_context="",
+            ext_prefetch_cache=None,
+        )
+
+    def fake_finalize(agent, **kwargs):
+        return kwargs
+
+    monkeypatch.setattr(conversation_loop, "build_turn_context", fake_context)
+    import agent.turn_finalizer as turn_finalizer
+    monkeypatch.setattr(turn_finalizer, "finalize_turn", fake_finalize)
+
+    agent = SimpleNamespace(session_id="sid-core-global-goal")
+    result = conversation_loop.run_conversation(agent, "/goal core API ingress hardwire")
+
+    assert result["api_call_count"] == 0
+    assert result["_turn_exit_reason"] == "warroom_goal_hardwire_pre_model"
+    assert "WARROOM V3 global_plan_adversary" in result["final_response"]
+    assert "WARROOM V3 CONTROLLER" in result["warroom_kickoff_prompt"]
+    state = load_warroom_goal("sid-core-global-goal")
+    assert state is not None
+    assert state.workflow == "global_plan_adversary"
+    assert state.gates["role_spawn"] == "pass"
+
+
+def test_acp_goal_command_uses_global_hardwire_without_goalmanager(hermes_home, tmp_path):
+    pytest.importorskip("acp")
+    from types import SimpleNamespace
+    from acp_adapter.server import HermesACPAgent
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.warroom_goal import load_warroom_goal
+
+    server = object.__new__(HermesACPAgent)
+    server.session_manager = SimpleNamespace(save_session=lambda session_id: None)
+    state = SimpleNamespace(session_id="sid-acp-global-goal", cwd=tmp_path, queued_prompts=[])
+
+    response = HermesACPAgent._cmd_goal(server, "ACP ingress hardwire", state)
+
+    assert "WARROOM V3 global_plan_adversary" in response
+    assert state.queued_prompts
+    assert "WARROOM V3 CONTROLLER" in state.queued_prompts[0]
+    assert GoalManager("sid-acp-global-goal").state is None
+    assert load_warroom_goal("sid-acp-global-goal").workflow == "global_plan_adversary"
+
+
+
+def test_warroom_goal_clears_legacy_goalmanager_state(hermes_home, tmp_path):
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.warroom_goal import create_warroom_goal
+
+    mgr = GoalManager("sid-clear-legacy")
+    mgr.set("old budget loop", max_turns=3)
+    assert mgr.has_goal()
+
+    create_warroom_goal(
+        "sid-clear-legacy",
+        "global hardwire replaces old goal loop",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+
+    cleared = GoalManager("sid-clear-legacy")
+    assert cleared.state is not None
+    assert cleared.state.status == "cleared"
+    assert not cleared.has_goal()
+    assert not cleared.is_active()
+
+
+def test_plan_build_roles_auto_start_when_builder_mutation_reaches_policy(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, load_warroom_goal, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-auto-build-roles",
+        "ship plan then build",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    assert set(state.role_records) == {"controller", "plan_builder", "plan_adversary", "plan_reviewer"}
+    state.gates["plan"] = "pass"
+    state.gates["tracking"] = "pass"
+    state.current_role = "builder"
+    save_warroom_goal("sid-auto-build-roles", state)
+
+    assert enforce_tool_policy("sid-auto-build-roles", "write_file", {"path": str(tmp_path / "x.py")}) is None
+    updated = load_warroom_goal("sid-auto-build-roles")
+    assert {"builder", "adversary", "reviewer", "guardian"}.issubset(updated.role_records)
+    assert updated.gates["build_role_spawn"] == "pass"
+
+
+def test_noncritical_stop_phrase_is_auto_continued_in_final_guard(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, guard_final_response, load_warroom_goal
+
+    create_warroom_goal(
+        "sid-noncritical-text",
+        "ship without approval tennis",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    response = guard_final_response("sid-noncritical-text", "Phase complete. Waiting for approval before live promotion.")
+    assert "auto_continued" in response
+    state = load_warroom_goal("sid-noncritical-text")
+    assert state.status == "active"
+    assert state.noncritical_pause_attempts[-1]["decision"] == "auto_continued"

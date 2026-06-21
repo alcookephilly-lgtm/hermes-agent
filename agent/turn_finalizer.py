@@ -260,6 +260,16 @@ def finalize_turn(
         except Exception as _exp_err:
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
+    # Warroom /goal final-response guard is core-level, not TUI-only. This
+    # prevents any surface from claiming done/hardwired/complete until Guardian
+    # PASS and proof-packet gates unlock the claim.
+    if final_response and not interrupted:
+        try:
+            from hermes_cli.warroom_goal import guard_final_response
+            final_response = guard_final_response(agent.session_id or "", final_response)
+        except Exception as _warroom_guard_err:
+            logger.debug("warroom final-response guard failed: %s", _warroom_guard_err)
+
     _response_transformed = False
 
     # Plugin hook: transform_llm_output

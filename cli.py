@@ -7900,14 +7900,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         lower = arg.lower()
 
-        # Bare /goal or /goal status → show current state
+        # Bare /goal or /goal status → show current state, including enforced Warroom state.
         if not arg or lower == "status":
-            _cprint(f"  {mgr.status_line()}")
+            try:
+                from hermes_cli.warroom_goal import status_line_for_session
+                warroom_status = status_line_for_session(getattr(self, "session_id", "") or "")
+            except Exception:
+                warroom_status = None
+            _cprint(f"  {warroom_status or mgr.status_line()}")
             return
 
         if lower == "pause":
+            try:
+                from hermes_cli.warroom_goal import halt_warroom_goal
+                warroom_state = halt_warroom_goal(getattr(self, "session_id", "") or "", reason="user-paused")
+            except Exception:
+                warroom_state = None
             state = mgr.pause(reason="user-paused")
-            if state is None:
+            if warroom_state is not None:
+                self._clear_goal_pending_continuations()
+                _cprint(f"  ⏸ {warroom_state.status_line()}")
+            elif state is None:
                 _cprint(f"  {_DIM}No goal set.{_RST}")
             else:
                 self._clear_goal_pending_continuations()
@@ -7915,8 +7928,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return
 
         if lower == "resume":
+            try:
+                from hermes_cli.warroom_goal import resume_warroom_goal, controller_kickoff_prompt
+                warroom_state = resume_warroom_goal(getattr(self, "session_id", "") or "")
+            except Exception:
+                warroom_state = None
             state = mgr.resume()
-            if state is None:
+            if warroom_state is not None:
+                self._clear_goal_pending_continuations()
+                kicked = self._enqueue_goal_followup(controller_kickoff_prompt(warroom_state))
+                _cprint(f"  ▶ {warroom_state.status_line()}")
+                if kicked:
+                    _cprint(f"  {_DIM}Queued the next Warroom controller turn now.{_RST}")
+            elif state is None:
                 _cprint(f"  {_DIM}No goal to resume.{_RST}")
             else:
                 self._clear_goal_pending_continuations()
@@ -7933,13 +7957,46 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return
 
         if lower in {"clear", "stop", "done"}:
+            try:
+                from hermes_cli.warroom_goal import halt_warroom_goal
+                warroom_state = halt_warroom_goal(getattr(self, "session_id", "") or "", reason=f"/goal {lower}")
+            except Exception:
+                warroom_state = None
             had = mgr.has_goal()
             mgr.clear()
             self._clear_goal_pending_continuations()
-            if had:
+            if warroom_state is not None:
+                _cprint(f"  ✓ {warroom_state.status_line()}")
+            elif had:
                 _cprint("  ✓ Goal cleared.")
             else:
                 _cprint(f"  {_DIM}No active goal.{_RST}")
+            return
+
+        # V3 Warroom hardwire: exact trigger phrases become runtime state, not normal chat.
+        try:
+            from hermes_cli.warroom_goal import (
+                controller_kickoff_prompt,
+                create_warroom_goal,
+                detect_warroom_goal,
+                notice_for_state,
+            )
+            if detect_warroom_goal(arg) is not None:
+                state = create_warroom_goal(
+                    getattr(self, "session_id", "") or "",
+                    arg,
+                    allowed_mutation_root=os.getenv("TERMINAL_CWD", os.getcwd()),
+                )
+                mgr.clear()
+                self._clear_goal_pending_continuations()
+                self._enqueue_goal_followup(controller_kickoff_prompt(state))
+                _cprint(f"  {notice_for_state(state)}")
+                return
+        except ValueError as exc:
+            _cprint(f"  WARROOM V3 blocked: {exc}")
+            return
+        except Exception as exc:
+            _cprint(f"  WARROOM V3 unavailable: {exc}")
             return
 
         # Optional leading budget: /goal 50 <text> sets a 50-turn goal;
@@ -10666,12 +10723,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 and getattr(self.agent, "session_id", None)
                 and self.agent.session_id != self.session_id
             ):
+                _old_session_id = self.session_id
                 self._transfer_session_yolo(self.session_id, self.agent.session_id)
                 self.session_id = self.agent.session_id
+                try:
+                    from hermes_cli.warroom_goal import copy_warroom_goal
+                    copy_warroom_goal(_old_session_id, self.session_id, reason="cli-compression")
+                except Exception:
+                    pass
                 self._pending_title = None
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
+            try:
+                from hermes_cli.warroom_goal import guard_final_response
+                response = guard_final_response(getattr(self, "session_id", "") or "", response)
+            except Exception:
+                pass
 
             # Auto-generate session title after first exchange (non-blocking)
             if response and result and not result.get("failed") and not result.get("partial"):

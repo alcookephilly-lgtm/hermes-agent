@@ -357,6 +357,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception:
                 block_message = None
 
+            try:
+                from hermes_cli.warroom_goal import enforce_tool_policy
+                warroom_block = enforce_tool_policy(
+                    getattr(agent, "session_id", "") or "",
+                    function_name,
+                    function_args,
+                )
+            except Exception:
+                warroom_block = None
+            if warroom_block is not None:
+                block_message = warroom_block
+
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
                 _emit_terminal_post_tool_call(
@@ -845,6 +857,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                     middleware_trace=list(middleware_trace),
                 )
+            except Exception:
+                pass
+
+        if _block_msg is None:
+            try:
+                from hermes_cli.warroom_goal import enforce_tool_policy
+                _block_msg = enforce_tool_policy(
+                    getattr(agent, "session_id", "") or "",
+                    function_name,
+                    function_args,
+                )
+                if _block_msg is not None:
+                    _block_error_type = "warroom_policy_block"
             except Exception:
                 pass
 

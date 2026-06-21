@@ -7092,6 +7092,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # _interrupt_requested.  Force-clean _running_agents so the session
             # is unlocked and subsequent messages are processed normally.
             if _cmd_def_inner and _cmd_def_inner.name == "stop":
+                try:
+                    session_entry = self.session_store.get_or_create_session(source)
+                    from hermes_cli.warroom_goal import halt_warroom_goal
+                    halt_warroom_goal(getattr(session_entry, "session_id", "") or "", reason="/stop")
+                except Exception:
+                    pass
                 await self._interrupt_and_clear_session(
                     _quick_key,
                     source,
@@ -10181,10 +10187,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return t("gateway.goal.unavailable")
 
         if not args or lower == "status":
-            return mgr.status_line()
+            try:
+                from hermes_cli.warroom_goal import status_line_for_session
+                warroom_status = status_line_for_session(getattr(session_entry, "session_id", "") or "")
+            except Exception:
+                warroom_status = None
+            return warroom_status or mgr.status_line()
 
         if lower == "pause":
+            try:
+                from hermes_cli.warroom_goal import halt_warroom_goal
+                warroom_state = halt_warroom_goal(getattr(session_entry, "session_id", "") or "", reason="user-paused")
+            except Exception:
+                warroom_state = None
             state = mgr.pause(reason="user-paused")
+            if warroom_state is not None:
+                try:
+                    adapter = self.adapters.get(event.source.platform) if event.source else None
+                    _quick_key = self._session_key_for_source(event.source) if event.source else None
+                    if adapter and _quick_key:
+                        self._clear_goal_pending_continuations(_quick_key, adapter)
+                except Exception as exc:
+                    logger.debug("warroom goal pause: pending continuation cleanup failed: %s", exc)
+                return warroom_state.status_line()
             if state is None:
                 return t("gateway.goal.no_goal_set")
             try:
@@ -10197,7 +10222,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return t("gateway.goal.paused", goal=state.goal)
 
         if lower == "resume":
+            try:
+                from hermes_cli.warroom_goal import resume_warroom_goal, controller_kickoff_prompt
+                warroom_state = resume_warroom_goal(getattr(session_entry, "session_id", "") or "")
+            except Exception:
+                warroom_state = None
             state = mgr.resume()
+            if warroom_state is not None:
+                adapter = self.adapters.get(event.source.platform) if event.source else None
+                _quick_key = self._session_key_for_source(event.source) if event.source else None
+                if adapter and _quick_key:
+                    try:
+                        self._clear_goal_pending_continuations(_quick_key, adapter)
+                        kickoff_event = MessageEvent(
+                            text=controller_kickoff_prompt(warroom_state),
+                            message_type=MessageType.TEXT,
+                            source=event.source,
+                            message_id=event.message_id,
+                            channel_prompt=event.channel_prompt,
+                            raw_message={"goal_synthetic": True, "goal_origin": "warroom-resume", "warroom": True},
+                            internal=True,
+                        )
+                        self._enqueue_fifo(_quick_key, kickoff_event, adapter)
+                    except Exception as exc:
+                        logger.debug("warroom goal resume enqueue failed: %s", exc)
+                return warroom_state.status_line()
             if state is None:
                 return t("gateway.goal.no_resume")
             adapter = self.adapters.get(event.source.platform) if event.source else None
@@ -10221,6 +10270,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return t("gateway.goal.resumed", goal=state.goal)
 
         if lower in {"clear", "stop", "done"}:
+            try:
+                from hermes_cli.warroom_goal import halt_warroom_goal
+                warroom_state = halt_warroom_goal(getattr(session_entry, "session_id", "") or "", reason=f"/goal {lower}")
+            except Exception:
+                warroom_state = None
             had = mgr.has_goal()
             mgr.clear()
             try:
@@ -10230,7 +10284,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._clear_goal_pending_continuations(_quick_key, adapter)
             except Exception as exc:
                 logger.debug("goal clear: pending continuation cleanup failed: %s", exc)
+            if warroom_state is not None:
+                return warroom_state.status_line()
             return t("gateway.goal_cleared") if had else t("gateway.no_active_goal")
+
+        # V3 Warroom hardwire: exact trigger phrases become runtime state, not normal chat.
+        try:
+            from hermes_cli.warroom_goal import (
+                controller_kickoff_prompt,
+                create_warroom_goal,
+                detect_warroom_goal,
+                notice_for_state,
+            )
+            if detect_warroom_goal(args) is not None:
+                state = create_warroom_goal(
+                    getattr(session_entry, "session_id", "") or "",
+                    args,
+                    allowed_mutation_root=os.getenv("TERMINAL_CWD", os.getcwd()),
+                )
+                mgr.clear()
+                adapter = self.adapters.get(event.source.platform) if event.source else None
+                _quick_key = self._session_key_for_source(event.source) if event.source else None
+                if adapter and _quick_key:
+                    kickoff_event = MessageEvent(
+                        text=controller_kickoff_prompt(state),
+                        message_type=MessageType.TEXT,
+                        source=event.source,
+                        message_id=event.message_id,
+                        channel_prompt=event.channel_prompt,
+                        raw_message={"goal_synthetic": True, "goal_origin": "warroom-set", "warroom": True},
+                        internal=True,
+                    )
+                    self._enqueue_fifo(_quick_key, kickoff_event, adapter)
+                return notice_for_state(state)
+        except ValueError as exc:
+            return f"WARROOM V3 blocked: {exc}"
+        except Exception as exc:
+            return f"WARROOM V3 unavailable: {exc}"
 
         # Optional leading budget: /goal 50 <text> sets a 50-turn goal;
         # /goal 50 updates the active goal's budget in-place.
@@ -15620,6 +15710,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
+            try:
+                from hermes_cli.warroom_goal import guard_final_response
+                final_response = guard_final_response(session_id, final_response or "")
+            except Exception:
+                pass
 
             # Extract actual token counts from the agent instance used for this run
             _last_prompt_toks = 0
@@ -15681,6 +15776,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Failed to restore thread_id from binding after session split",
                             exc_info=True,
                         )
+                try:
+                    from hermes_cli.warroom_goal import copy_warroom_goal
+                    copy_warroom_goal(session_id, agent_session_id, reason="gateway-compression")
+                except Exception:
+                    pass
                 if entry:
                     self._sync_telegram_topic_binding(
                         source, entry, reason="agent-run-compression",

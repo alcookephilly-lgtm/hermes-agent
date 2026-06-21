@@ -2228,6 +2228,11 @@ def _sync_session_key_after_compress(
             pass
         session["session_key"] = new_session_id
         try:
+            from hermes_cli.warroom_goal import copy_warroom_goal
+            copy_warroom_goal(old_key, new_session_id, reason="tui-compression")
+        except Exception:
+            pass
+        try:
             yolo_was_on = is_session_yolo_enabled(old_key)
         except Exception:
             yolo_was_on = False
@@ -5198,6 +5203,11 @@ def _(rid, params: dict) -> dict:
         return err
     if hasattr(session["agent"], "interrupt"):
         session["agent"].interrupt()
+    try:
+        from hermes_cli.warroom_goal import halt_warroom_goal
+        halt_warroom_goal(session.get("session_key", "") or "", reason="/stop")
+    except Exception:
+        pass
     # Scope the pending-prompt release to THIS session.  A global
     # _clear_pending() would collaterally cancel clarify/sudo/secret
     # prompts on unrelated sessions sharing the same tui_gateway
@@ -5976,6 +5986,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 )
 
                 raw = result.get("final_response", "")
+                try:
+                    from hermes_cli.warroom_goal import guard_final_response
+                    raw = guard_final_response(session.get("session_key") or "", raw)
+                except Exception:
+                    pass
                 status = (
                     "interrupted"
                     if result.get("interrupted")
@@ -8280,13 +8295,34 @@ def _(rid, params: dict) -> dict:
 
         lower = arg.strip().lower()
         if not arg.strip() or lower == "status":
-            return _ok(rid, {"type": "exec", "output": mgr.status_line()})
+            try:
+                from hermes_cli.warroom_goal import status_line_for_session
+                warroom_status = status_line_for_session(sid_key)
+            except Exception:
+                warroom_status = None
+            return _ok(rid, {"type": "exec", "output": warroom_status or mgr.status_line()})
         if lower == "pause":
+            try:
+                from hermes_cli.warroom_goal import halt_warroom_goal
+                warroom_state = halt_warroom_goal(sid_key, reason="user-paused")
+            except Exception:
+                warroom_state = None
             state = mgr.pause(reason="user-paused")
-            out = "No goal set." if state is None else f"⏸ Goal paused: {state.goal}"
+            if warroom_state is not None:
+                out = f"⏸ {warroom_state.status_line()}"
+            else:
+                out = "No goal set." if state is None else f"⏸ Goal paused: {state.goal}"
             return _ok(rid, {"type": "exec", "output": out})
         if lower == "resume":
+            try:
+                from hermes_cli.warroom_goal import resume_warroom_goal, controller_kickoff_prompt
+                warroom_state = resume_warroom_goal(sid_key)
+            except Exception:
+                warroom_state = None
             state = mgr.resume()
+            if warroom_state is not None:
+                notice = f"▶ {warroom_state.status_line()}\nQueued the next Warroom controller turn now."
+                return _ok(rid, {"type": "send", "notice": notice, "message": controller_kickoff_prompt(warroom_state), "warroom": True})
             if state is None:
                 return _ok(rid, {"type": "exec", "output": "No goal to resume."})
             prompt = mgr.next_continuation_prompt() or state.goal
@@ -8296,15 +8332,47 @@ def _(rid, params: dict) -> dict:
             )
             return _ok(rid, {"type": "send", "notice": notice, "message": prompt})
         if lower in {"clear", "stop", "done"}:
+            try:
+                from hermes_cli.warroom_goal import halt_warroom_goal
+                warroom_state = halt_warroom_goal(sid_key, reason=f"/goal {lower}")
+            except Exception:
+                warroom_state = None
             had = mgr.has_goal()
             mgr.clear()
-            return _ok(
-                rid,
-                {
-                    "type": "exec",
-                    "output": "✓ Goal cleared." if had else "No active goal.",
-                },
+            if warroom_state is not None:
+                output = f"✓ {warroom_state.status_line()}"
+            else:
+                output = "✓ Goal cleared." if had else "No active goal."
+            return _ok(rid, {"type": "exec", "output": output})
+
+        # V3 Warroom hardwire: exact trigger phrases become runtime state, not normal chat.
+        try:
+            from hermes_cli.warroom_goal import (
+                controller_kickoff_prompt,
+                create_warroom_goal,
+                detect_warroom_goal,
+                notice_for_state,
             )
+            if detect_warroom_goal(arg) is not None:
+                state = create_warroom_goal(
+                    sid_key,
+                    arg,
+                    allowed_mutation_root=_session_cwd(session),
+                )
+                mgr.clear()
+                return _ok(
+                    rid,
+                    {
+                        "type": "send",
+                        "notice": notice_for_state(state),
+                        "message": controller_kickoff_prompt(state),
+                        "warroom": True,
+                    },
+                )
+        except ValueError as exc:
+            return _err(rid, 4004, f"WARROOM V3 blocked: {exc}")
+        except Exception as exc:
+            return _err(rid, 5030, f"WARROOM V3 unavailable: {exc}")
 
         # Otherwise — treat the remaining text as the new goal, with an
         # optional leading turn budget: /goal 50 <text>. If only /goal 50 is

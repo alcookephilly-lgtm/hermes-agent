@@ -456,6 +456,7 @@ class HermesACPAgent(acp.Agent):
         "steer": "Inject guidance into the currently running agent turn",
         "queue": "Queue a prompt to run after the current turn finishes",
         "version": "Show Hermes version",
+        "goal": "Start Warroom /goal hardwire (global, pre-model)",
     }
 
     _ADVERTISED_COMMANDS = (
@@ -497,6 +498,11 @@ class HermesACPAgent(acp.Agent):
         {
             "name": "version",
             "description": "Show Hermes version",
+        },
+        {
+            "name": "goal",
+            "description": "Start Warroom /goal hardwire without model fallback",
+            "input_hint": "goal text",
         },
     )
 
@@ -1738,6 +1744,7 @@ class HermesACPAgent(acp.Agent):
             "steer": self._cmd_steer,
             "queue": self._cmd_queue,
             "version": self._cmd_version,
+            "goal": self._cmd_goal,
         }.get(cmd)
 
         if handler is None:
@@ -1748,6 +1755,22 @@ class HermesACPAgent(acp.Agent):
         except Exception as e:
             logger.error("Slash command /%s error: %s", cmd, e, exc_info=True)
             return f"Error executing /{cmd}: {e}"
+
+    def _cmd_goal(self, args: str, state: SessionState) -> str:
+        from hermes_cli.warroom_goal import handle_global_goal_slash
+
+        result = handle_global_goal_slash(
+            state.session_id,
+            f"/goal {args}".strip(),
+            allowed_mutation_root=str(state.cwd or Path.cwd()),
+        )
+        if result is None:
+            return "WARROOM V3 GAP: /goal hardwire did not handle command."
+        kickoff = result.get("kickoff")
+        if kickoff:
+            state.queued_prompts.append(str(kickoff))
+            self.session_manager.save_session(state.session_id)
+        return str(result.get("response") or "WARROOM V3 /goal handled.")
 
     def _cmd_help(self, args: str, state: SessionState) -> str:
         lines = ["Available commands:", ""]

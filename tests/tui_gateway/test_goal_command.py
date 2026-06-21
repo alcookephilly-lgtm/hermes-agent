@@ -108,18 +108,19 @@ def test_goal_set_returns_send_with_notice(server, session):
     r = _call(server, "command.dispatch", name="goal", arg="build a rocket", session_id=sid)
     result = r["result"]
     assert result["type"] == "send"
-    assert result["message"] == "build a rocket"
-    assert "notice" in result
-    assert "Goal set" in result["notice"]
-    assert "20-turn budget" in result["notice"]
+    assert result.get("warroom") is True
+    assert "WARROOM V3 CONTROLLER" in result["message"]
+    assert "global_plan_adversary" in result["notice"]
+    assert "Goal:\nbuild a rocket" in result["message"]
 
-    # Persisted in SessionDB
     from hermes_cli.goals import GoalManager
+    from hermes_cli.warroom_goal import load_warroom_goal
 
-    mgr = GoalManager(session_key)
-    assert mgr.state is not None
-    assert mgr.state.goal == "build a rocket"
-    assert mgr.state.status == "active"
+    assert GoalManager(session_key).state is None
+    state = load_warroom_goal(session_key)
+    assert state is not None
+    assert state.workflow == "global_plan_adversary"
+    assert state.status == "active"
 
 
 def test_goal_set_accepts_leading_budget(server, session):
@@ -127,29 +128,32 @@ def test_goal_set_accepts_leading_budget(server, session):
     r = _call(server, "command.dispatch", name="goal", arg="50 build a rocket", session_id=sid)
     result = r["result"]
     assert result["type"] == "send"
-    assert result["message"] == "build a rocket"
-    assert "50-turn budget" in result["notice"]
+    assert result.get("warroom") is True
+    assert "WARROOM V3 CONTROLLER" in result["message"]
+    assert "50 build a rocket" in result["message"]
 
     from hermes_cli.goals import GoalManager
+    from hermes_cli.warroom_goal import load_warroom_goal
 
-    mgr = GoalManager(session_key)
-    assert mgr.state is not None
-    assert mgr.state.goal == "build a rocket"
-    assert mgr.state.max_turns == 50
+    assert GoalManager(session_key).state is None
+    state = load_warroom_goal(session_key)
+    assert state is not None
+    assert state.original_goal == "50 build a rocket"
 
 
-def test_goal_number_updates_active_budget(server, session):
+def test_goal_number_starts_new_global_goal_not_budget_update(server, session):
     sid, session_key, _ = session
     _call(server, "command.dispatch", name="goal", arg="build a rocket", session_id=sid)
     r = _call(server, "command.dispatch", name="goal", arg="50", session_id=sid)
-    assert r["result"]["type"] == "exec"
-    assert "budget set to 50 turns" in r["result"]["output"]
+    assert r["result"]["type"] == "send"
+    assert r["result"].get("warroom") is True
+    assert "Goal:\n50" in r["result"]["message"]
 
     from hermes_cli.goals import GoalManager
+    from hermes_cli.warroom_goal import load_warroom_goal
 
-    mgr = GoalManager(session_key)
-    assert mgr.state is not None
-    assert mgr.state.max_turns == 50
+    assert GoalManager(session_key).state is None
+    assert load_warroom_goal(session_key).original_goal == "50"
 
 
 def test_goal_pause_after_set(server, session):
@@ -157,11 +161,14 @@ def test_goal_pause_after_set(server, session):
     _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)
     r = _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
     assert r["result"]["type"] == "exec"
-    assert "paused" in r["result"]["output"].lower()
+    assert "warroom v3" in r["result"]["output"].lower()
+    assert "halted" in r["result"]["output"].lower()
 
     from hermes_cli.goals import GoalManager
+    from hermes_cli.warroom_goal import load_warroom_goal
 
-    assert GoalManager(session_key).state.status == "paused"
+    assert GoalManager(session_key).state is None
+    assert load_warroom_goal(session_key).status == "halted"
 
 
 def test_goal_resume_reactivates_and_kicks_off(server, session):
@@ -170,13 +177,16 @@ def test_goal_resume_reactivates_and_kicks_off(server, session):
     _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
     r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
     assert r["result"]["type"] == "send"
-    assert "resumed" in r["result"]["notice"].lower()
-    assert "Queued the next continuation turn now" in r["result"]["notice"]
-    assert "Continuing toward your standing goal" in r["result"]["message"]
+    assert "warroom v3" in r["result"]["notice"].lower()
+    assert "active" in r["result"]["notice"].lower()
+    assert "Queued the next Warroom controller turn now" in r["result"]["notice"]
+    assert "WARROOM V3 CONTROLLER" in r["result"]["message"]
 
     from hermes_cli.goals import GoalManager
+    from hermes_cli.warroom_goal import load_warroom_goal
 
-    assert GoalManager(session_key).state.status == "active"
+    assert GoalManager(session_key).state is None
+    assert load_warroom_goal(session_key).status == "active"
 
 
 def test_goal_clear_removes_active_goal(server, session):
@@ -184,29 +194,27 @@ def test_goal_clear_removes_active_goal(server, session):
     _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)
     r = _call(server, "command.dispatch", name="goal", arg="clear", session_id=sid)
     assert r["result"]["type"] == "exec"
-    assert "cleared" in r["result"]["output"].lower()
+    assert "warroom v3" in r["result"]["output"].lower()
+    assert "halted" in r["result"]["output"].lower()
 
     from hermes_cli.goals import GoalManager
+    from hermes_cli.warroom_goal import load_warroom_goal
 
-    # After clear the row is marked status=cleared (kept for audit);
-    # ``has_goal()`` / ``is_active()`` return False so the goal loop
-    # stays off and ``status`` reports "No active goal".
-    mgr = GoalManager(session_key)
-    assert not mgr.has_goal()
-    assert not mgr.is_active()
-    assert "No active goal" in mgr.status_line()
+    assert GoalManager(session_key).state is None
+    assert load_warroom_goal(session_key).status == "halted"
 
 
 def test_goal_stop_and_done_are_clear_aliases(server, session):
     sid, _, _ = session
     _call(server, "command.dispatch", name="goal", arg="first goal", session_id=sid)
     r = _call(server, "command.dispatch", name="goal", arg="stop", session_id=sid)
-    assert "cleared" in r["result"]["output"].lower()
+    assert "warroom v3" in r["result"]["output"].lower()
+    assert "halted" in r["result"]["output"].lower()
 
     _call(server, "command.dispatch", name="goal", arg="second goal", session_id=sid)
     r = _call(server, "command.dispatch", name="goal", arg="done", session_id=sid)
-    assert "cleared" in r["result"]["output"].lower()
-
+    assert "warroom v3" in r["result"]["output"].lower()
+    assert "halted" in r["result"]["output"].lower()
 
 def test_goal_requires_session(server):
     r = _call(server, "command.dispatch", name="goal", arg="nope", session_id="unknown")

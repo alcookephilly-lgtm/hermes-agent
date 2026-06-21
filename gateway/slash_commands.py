@@ -704,6 +704,11 @@ class GatewaySlashCommandsMixin:
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        try:
+            from hermes_cli.warroom_goal import halt_warroom_goal
+            halt_warroom_goal(getattr(session_entry, "session_id", "") or "", reason="/stop")
+        except Exception:
+            pass
 
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:
