@@ -889,6 +889,30 @@ def _has_final_completion_claim(response: str) -> bool:
     return False
 
 
+def goal_completion_output(state: WarroomGoalState, response: str) -> str:
+    """Canonical user-facing completion output for an unlocked Warroom /goal.
+
+    This is the output-wire hardwire: after proof packet + Guardian PASS unlock
+    final claims, every surface gets an explicit GOAL COMPLETED line instead of
+    an ambiguous model/handler response.
+    """
+    role_evidence = state.role_spawn_evidence_path or "GAP: missing role evidence path"
+    guardian = state.role_records.get("guardian", {}) if state.role_records else {}
+    guardian_evidence = guardian.get("evidence_path") or "GAP: missing Guardian evidence path"
+    return (
+        "GOAL COMPLETED\n"
+        f"Workflow: {state.workflow}\n"
+        f"Status: done\n"
+        f"Proof packet: {state.proof_packet_path}\n"
+        f"Role spawn evidence: {role_evidence}\n"
+        f"Guardian verdict: PASS\n"
+        f"Guardian evidence: {guardian_evidence}\n"
+        "Normal chat fallback: NO\n"
+        "Original final response:\n"
+        f"{response}"
+    )
+
+
 def guard_final_response(session_id: str, response: str) -> str:
     state = load_warroom_goal(session_id)
     if state is None or not response:
@@ -911,6 +935,12 @@ def guard_final_response(session_id: str, response: str) -> str:
             )
         if E2E_CLAIM_RE.search(response) and HEALTH_ONLY_RE.search(response) and not E2E_EVIDENCE_RE.search(response):
             return "WARROOM V3 FINAL BLOCKED: health checks alone do not prove E2E."
+        state.status = "done"
+        state.gates["e2e_claim"] = "pass"
+        state.gates["proof_packet"] = "pass"
+        state.gate_evidence.setdefault("completion_output", []).append("GOAL COMPLETED emitted")
+        save_warroom_goal(session_id, state)
+        return goal_completion_output(state, response)
     return response
 
 

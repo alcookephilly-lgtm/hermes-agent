@@ -160,7 +160,9 @@ def test_final_guard_blocks_done_without_proof_and_health_only(hermes_home, tmp_
     assert "health check" in blocked.lower()
 
     ok = guard_final_response("sid-final", "DONE. pytest E2E passed and proof packet written.")
-    assert ok.startswith("DONE")
+    assert ok.startswith("GOAL COMPLETED")
+    assert "Proof packet:" in ok
+    assert "Guardian verdict: PASS" in ok
 
 
 def test_copy_and_halt_state_on_session_boundary(hermes_home, tmp_path):
@@ -325,7 +327,16 @@ def test_builder_self_report_cannot_unlock_guardian_final_gate(hermes_home, tmp_
     unlocked = record_role_output("sid-guardian-unlock", "guardian", evidence_path=str(guardian), verdict="PASS")
     assert unlocked.guardian_pass is True
     assert unlocked.final_claim_allowed is True
-    assert guard_final_response("sid-guardian-unlock", "DONE. pytest E2E passed and proof packet written.").startswith("DONE")
+    completed = guard_final_response("sid-guardian-unlock", "DONE. pytest E2E passed and proof packet written.")
+    assert completed.startswith("GOAL COMPLETED")
+    assert "Role spawn evidence:" in completed
+    assert "Normal chat fallback: NO" in completed
+    from hermes_cli.warroom_goal import load_warroom_goal
+    completed_state = load_warroom_goal("sid-guardian-unlock")
+    assert completed_state.status == "done"
+    assert completed_state.gates["proof_packet"] == "pass"
+    assert completed_state.gates["e2e_claim"] == "pass"
+    assert "GOAL COMPLETED emitted" in completed_state.gate_evidence["completion_output"]
 
 
 def test_normal_chat_fallback_blocked_while_spawn_pending(hermes_home, tmp_path):
@@ -547,3 +558,38 @@ def test_noncritical_stop_phrase_is_auto_continued_in_final_guard(hermes_home, t
     state = load_warroom_goal("sid-noncritical-text")
     assert state.status == "active"
     assert state.noncritical_pause_attempts[-1]["decision"] == "auto_continued"
+
+
+
+def test_goal_completion_output_hardwire_emits_goal_completed(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, guard_final_response, load_warroom_goal, record_role_output, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-completion-output",
+        "Use plan adversary skill for:\n\nGoal:\nwire completion output\n\nAcceptance:\n- goal completed line\n\nConstraints:\n- worktree only\n\nVerify with:\npytest",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.gates["plan"] = "pass"
+    state.gates["tracking"] = "pass"
+    proof = tmp_path / "proof-packet.md"
+    proof.write_text("PROOF PACKET\nTests: PASS\nRole evidence: PASS\n", encoding="utf-8")
+    state.proof_packet_path = str(proof)
+    save_warroom_goal("sid-completion-output", state)
+    guardian = tmp_path / "guardian.txt"
+    guardian.write_text("Guardian verdict: PASS\n", encoding="utf-8")
+    record_role_output("sid-completion-output", "guardian", evidence_path=str(guardian), verdict="PASS")
+
+    output = guard_final_response("sid-completion-output", "DONE. pytest E2E passed and proof packet written.")
+
+    assert output.startswith("GOAL COMPLETED")
+    assert "Workflow: strict_plan_adversary" in output
+    assert f"Proof packet: {proof}" in output
+    assert "Guardian verdict: PASS" in output
+    assert "Normal chat fallback: NO" in output
+    assert "Original final response:" in output
+    state = load_warroom_goal("sid-completion-output")
+    assert state.status == "done"
+    assert state.gates["proof_packet"] == "pass"
+    assert state.gates["e2e_claim"] == "pass"
+    assert "GOAL COMPLETED emitted" in state.gate_evidence["completion_output"]
