@@ -50,7 +50,7 @@ E2E_CLAIM_RE = re.compile(r"\be2e\b|end[- ]to[- ]end", re.I)
 HEALTH_ONLY_RE = re.compile(r"health check|/health|status endpoint", re.I)
 E2E_EVIDENCE_RE = re.compile(r"pytest|playwright|browser|selenium|end[- ]to[- ]end test|e2e test", re.I)
 DESTRUCTIVE_TERMINAL_RE = re.compile(
-    r"\b(rm\s+-|mv\s+|cp\s+|chmod\s+|chown\s+|git\s+(?:reset|clean|checkout)\b|python\b.*\bwrite\(|tee\s+|>\s*\S)",
+    r"\b(rm\s+-|mv\s+|cp\s+|touch\s+|mkdir\s+|chmod\s+|chown\s+|sed\s+-i|git\s+(?:reset|clean|checkout|restore)\b|python\b.*\b(write|write_text|write_bytes|unlink|remove|rmtree)\b|tee\s+|>>\s*\S|>\s*\S)",
     re.I,
 )
 EXECUTE_CODE_WRITE_RE = re.compile(r"\b(open\(.+['\"]w|write_text\(|write_bytes\(|shutil\.rmtree|os\.remove|Path\(.+\)\.unlink)", re.I)
@@ -281,6 +281,16 @@ def save_warroom_goal(session_id: str, state: WarroomGoalState) -> None:
         pass
 
 
+def mark_controller_kickoff_consumed(session_id: str, mechanism: str) -> Optional[WarroomGoalState]:
+    state = load_warroom_goal(session_id)
+    if state is None:
+        return None
+    state.gates["controller_kickoff"] = "pass"
+    state.gate_evidence.setdefault("controller_kickoff", []).append(mechanism)
+    save_warroom_goal(session_id, state)
+    return state
+
+
 def _default_tracking_dir() -> str:
     return str(Path.cwd() / ".warroom")
 
@@ -505,8 +515,16 @@ def _start_roles_for_state(
     else:
         state.gates["role_cards"] = "pass"
         state.gates["role_spawn"] = "pass"
-        state.gates["delegate_runtime"] = "pass"
-        state.delegate_runtime_available = True
+        adapters = {str(r.get("adapter") or "") for r in state.role_records.values()}
+        if adapters and adapters <= {"controller_state", "local_process"}:
+            state.gates["delegate_runtime"] = "stub_only"
+            state.delegate_runtime_available = False
+            state.gate_evidence.setdefault("delegate_runtime", []).append(
+                "local_process role receipts prove spawn only; real delegated work still requires Controller/model loop"
+            )
+        else:
+            state.gates["delegate_runtime"] = "pass"
+            state.delegate_runtime_available = True
         state.role_spawn_adapter = "mixed" if len({r.get("adapter") for r in state.role_records.values()}) > 1 else next(iter(state.role_records.values())).get("adapter")
         state.required_action = None
         state.role_spawn_gap = None
@@ -779,7 +797,7 @@ def _path_arg(tool_name: str, args: Dict[str, Any]) -> Optional[str]:
 
 def _terminal_mutates(args: Dict[str, Any]) -> bool:
     cmd = str(args.get("command") or "")
-    return bool(DESTRUCTIVE_TERMINAL_RE.search(cmd))
+    return bool(DESTRUCTIVE_TERMINAL_RE.search(cmd) or ">>" in cmd)
 
 
 def _execute_code_mutates(args: Dict[str, Any]) -> bool:
@@ -824,10 +842,12 @@ def enforce_tool_policy(session_id: str, tool_name: str, args: Dict[str, Any]) -
         return "WARROOM V3 blocked: required role spawn action is pending; normal chat/tool fallback denied."
 
     mutating = tool_name in MUTATING_TOOLS
-    # Terminal and execute_code are arbitrary-code surfaces. Treat them as
-    # mutation-capable and fail closed for non-Builder roles instead of trying
-    # to prove a shell/Python snippet is read-only with regexes.
-    if tool_name in {"terminal", "execute_code"}:
+    # Terminal can be read-only proof work for Controller. Only mutating shell
+    # commands are builder-only; execute_code remains mutation-capable because
+    # arbitrary Python is too broad for role-policy proof.
+    if tool_name == "terminal":
+        mutating = _terminal_mutates(args)
+    elif tool_name == "execute_code":
         mutating = True
     elif tool_name == "delegate_task":
         if state.current_role not in {"controller", None}:

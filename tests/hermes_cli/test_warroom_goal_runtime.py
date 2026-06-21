@@ -64,6 +64,8 @@ def test_global_goal_creates_plan_roles_without_budget_or_fallback(hermes_home, 
     assert state.workflow == "global_plan_adversary"
     assert state.required_roles == ["controller", "plan_builder", "plan_adversary", "plan_reviewer"]
     assert state.gates["role_spawn"] == "pass"
+    assert state.gates["delegate_runtime"] == "stub_only"
+    assert state.delegate_runtime_available is False
     assert state.required_action is None
     assert "50" not in state.gates
 
@@ -254,6 +256,8 @@ def test_role_spawn_success_persists_ids_hashes_and_evidence(hermes_home, tmp_pa
     )
 
     assert state.gates["role_spawn"] == "pass"
+    assert state.gates["delegate_runtime"] == "stub_only"
+    assert state.delegate_runtime_available is False
     assert state.required_action is None
     assert set(state.role_records) == {"controller", "builder", "adversary", "reviewer", "guardian"}
     for role, record in state.role_records.items():
@@ -395,6 +399,15 @@ def test_terminal_and_execute_code_fail_closed_for_non_builder_and_builder_scope
     state.current_role = "reviewer"
     save_warroom_goal("sid-terminal-policy", state)
     assert "reviewer" in enforce_tool_policy("sid-terminal-policy", "terminal", {"command": "touch x"}).lower()
+    assert enforce_tool_policy("sid-terminal-policy", "terminal", {"command": "git status --short", "workdir": str(tmp_path)}) is None
+    for mutating_cmd in [
+        "python -c \"from pathlib import Path; Path('x').write_text('x')\"",
+        "sed -i '1s/a/b/' file.txt",
+        "git restore --source=HEAD --staged --worktree .",
+        "printf hi >> note.txt",
+    ]:
+        blocked = enforce_tool_policy("sid-terminal-policy", "terminal", {"command": mutating_cmd, "workdir": str(tmp_path)})
+        assert blocked is not None and "reviewer" in blocked.lower()
     assert "reviewer" in enforce_tool_policy("sid-terminal-policy", "execute_code", {"code": "open('x','w').write('x')"}).lower()
 
     state.current_role = "builder"
@@ -402,8 +415,8 @@ def test_terminal_and_execute_code_fail_closed_for_non_builder_and_builder_scope
     state.gates["plan"] = "pass"
     save_warroom_goal("sid-terminal-policy", state)
     assert enforce_tool_policy("sid-terminal-policy", "terminal", {"command": "pytest", "workdir": str(tmp_path)}) is None
-    outside = enforce_tool_policy("sid-terminal-policy", "terminal", {"command": "pytest", "workdir": "/tmp"})
-    assert outside is not None and "outside allowed worktree" in outside
+    mutating_outside = enforce_tool_policy("sid-terminal-policy", "terminal", {"command": "touch x", "workdir": "/tmp"})
+    assert mutating_outside is not None and "outside allowed worktree" in mutating_outside
     assert "execute_code is not allowed" in enforce_tool_policy("sid-terminal-policy", "execute_code", {"code": "Path('x').write_text('x')"})
 
 
@@ -438,12 +451,35 @@ def test_guardian_unlock_requires_existing_guardian_pass_evidence(hermes_home, t
 
 
 
-def test_core_conversation_loop_intercepts_slash_goal_before_model(hermes_home, tmp_path, monkeypatch):
+def test_core_conversation_loop_builds_slash_goal_kickoff_context_without_transcript_mutation(hermes_home, tmp_path, monkeypatch):
+    from agent.conversation_loop import _build_warroom_autocontinue_context
+    from hermes_cli.warroom_goal import create_warroom_goal, controller_kickoff_prompt, notice_for_state
+
+    monkeypatch.chdir(tmp_path)
+    state = create_warroom_goal(
+        "sid-core-global-goal",
+        "core API ingress hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    original = "/goal core API ingress hardwire"
+    merged = _build_warroom_autocontinue_context(
+        user_message=original,
+        notice=notice_for_state(state),
+        kickoff=controller_kickoff_prompt(state),
+    )
+    assert original == "/goal core API ingress hardwire"
+    assert "WARROOM V3 CONTROLLER" in merged
+    assert "Do not wait for another user message" in merged
+
+
+def test_core_run_conversation_slash_goal_reaches_runtime_without_user_nudge(hermes_home, tmp_path, monkeypatch):
     from types import SimpleNamespace
     from agent import conversation_loop
     from hermes_cli.warroom_goal import load_warroom_goal
 
     monkeypatch.chdir(tmp_path)
+    captured = {}
 
     def fake_context(agent, user_message, system_message, conversation_history, task_id, stream_callback, persist_user_message, **kwargs):
         return SimpleNamespace(
@@ -460,24 +496,26 @@ def test_core_conversation_loop_intercepts_slash_goal_before_model(hermes_home, 
             ext_prefetch_cache=None,
         )
 
-    def fake_finalize(agent, **kwargs):
-        return kwargs
+    def fake_codex_turn(**kwargs):
+        captured.update(kwargs)
+        return {"final_response": "controller drove", "messages": kwargs["messages"], "api_call_count": 1}
 
     monkeypatch.setattr(conversation_loop, "build_turn_context", fake_context)
-    import agent.turn_finalizer as turn_finalizer
-    monkeypatch.setattr(turn_finalizer, "finalize_turn", fake_finalize)
+    agent = SimpleNamespace(
+        session_id="sid-core-global-goal",
+        api_mode="codex_app_server",
+        _run_codex_app_server_turn=fake_codex_turn,
+    )
 
-    agent = SimpleNamespace(session_id="sid-core-global-goal")
     result = conversation_loop.run_conversation(agent, "/goal core API ingress hardwire")
 
-    assert result["api_call_count"] == 0
-    assert result["_turn_exit_reason"] == "warroom_goal_hardwire_pre_model"
-    assert "WARROOM V3 global_plan_adversary" in result["final_response"]
-    assert "WARROOM V3 CONTROLLER" in result["warroom_kickoff_prompt"]
+    assert result["final_response"] == "controller drove"
+    assert captured["user_message"].startswith("/goal core API ingress hardwire")
+    assert "WARROOM V3 CONTROLLER" in captured["user_message"]
+    assert captured["messages"][0]["content"] == "/goal core API ingress hardwire"
     state = load_warroom_goal("sid-core-global-goal")
-    assert state is not None
-    assert state.workflow == "global_plan_adversary"
-    assert state.gates["role_spawn"] == "pass"
+    assert state.gates["controller_kickoff"] == "pass"
+    assert "same_turn_model_context_injected" in state.gate_evidence["controller_kickoff"]
 
 
 def test_acp_goal_command_uses_global_hardwire_without_goalmanager(hermes_home, tmp_path):

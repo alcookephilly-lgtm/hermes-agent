@@ -1366,6 +1366,24 @@ class HermesACPAgent(acp.Agent):
                     update = acp.update_agent_message_text(response_text)
                     await self._conn.session_update(session_id, update)
                     await self._send_usage_update(state)
+                # /goal queues the Controller kickoff. Drain only /goal-created
+                # kickoff prompts now; other slash commands such as /queue must
+                # keep their deferred semantics.
+                if user_text.strip().lower().startswith("/goal"):
+                    while True:
+                        with state.runtime_lock:
+                            if not state.queued_prompts:
+                                break
+                            next_prompt = state.queued_prompts.pop(0)
+                        if self._conn:
+                            await self._conn.session_update(
+                                session_id,
+                                acp.update_user_message_text(next_prompt),
+                            )
+                        await self.prompt(
+                            prompt=[TextContentBlock(type="text", text=next_prompt)],
+                            session_id=session_id,
+                        )
                 return PromptResponse(stop_reason="end_turn")
 
         # If Zed sends another regular prompt while the same ACP session is

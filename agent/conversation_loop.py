@@ -366,6 +366,25 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             )
 
 
+def _build_warroom_autocontinue_context(*, user_message: str, notice: str, kickoff: str) -> str:
+    """Build the same-turn Warroom Controller kickoff context.
+
+    The /goal hardwire must continue inside the same model turn instead of
+    returning a status receipt and waiting for a second user message. This
+    returns API/runtime context without mutating the persisted transcript.
+    """
+    return (
+        str(user_message or "").rstrip()
+        + "\n\n"
+        + str(notice).strip()
+        + "\n\n"
+        + str(kickoff).strip()
+        + "\n\n"
+        + "[System: Continue this Warroom /goal now. Do not wait for another user message. "
+        + "Create the plan/tracking/proof path and keep working until a real GAP or completion proof.]"
+    )
+
+
 def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List[str]] = None) -> str:
     if is_partial_stub and dropped_tools:
         tool_list = ", ".join(dropped_tools[:3])
@@ -515,26 +534,48 @@ def run_conversation(
         }
     if _goal_handled is not None:
         final_response = str(_goal_handled.get("response") or "WARROOM V3 /goal handled.")
-        messages.append({"role": "assistant", "content": final_response})
-        from agent.turn_finalizer import finalize_turn
-        _goal_result = finalize_turn(
-            agent,
-            final_response=final_response,
-            api_call_count=0,
-            interrupted=False,
-            failed=False,
-            messages=messages,
-            conversation_history=conversation_history,
-            effective_task_id=effective_task_id,
-            turn_id=turn_id,
-            user_message=user_message,
-            original_user_message=original_user_message,
-            _should_review_memory=_should_review_memory,
-            _turn_exit_reason="warroom_goal_hardwire_pre_model",
-        )
-        if _goal_handled.get("kickoff"):
-            _goal_result["warroom_kickoff_prompt"] = str(_goal_handled.get("kickoff"))
-        return _goal_result
+        kickoff = str(_goal_handled.get("kickoff") or "")
+        if kickoff:
+            warroom_autocontinue = _build_warroom_autocontinue_context(
+                user_message=user_message,
+                notice=final_response,
+                kickoff=kickoff,
+            )
+            user_message = warroom_autocontinue
+            if _plugin_user_context:
+                _plugin_user_context = _plugin_user_context + "\n\n" + warroom_autocontinue
+            else:
+                _plugin_user_context = warroom_autocontinue
+            try:
+                from hermes_cli.warroom_goal import mark_controller_kickoff_consumed
+
+                mark_controller_kickoff_consumed(agent.session_id or "", "same_turn_model_context_injected")
+            except Exception:
+                pass
+            # Fall through into the normal model/tool loop. This is the starter
+            # motor: /goal state creation is not the final response when a
+            # Controller kickoff exists.
+        else:
+            messages.append({"role": "assistant", "content": final_response})
+            from agent.turn_finalizer import finalize_turn
+            _goal_result = finalize_turn(
+                agent,
+                final_response=final_response,
+                api_call_count=0,
+                interrupted=False,
+                failed=False,
+                messages=messages,
+                conversation_history=conversation_history,
+                effective_task_id=effective_task_id,
+                turn_id=turn_id,
+                user_message=user_message,
+                original_user_message=original_user_message,
+                _should_review_memory=_should_review_memory,
+                _turn_exit_reason="warroom_goal_hardwire_pre_model",
+            )
+            if kickoff:
+                _goal_result["warroom_kickoff_prompt"] = kickoff
+            return _goal_result
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
