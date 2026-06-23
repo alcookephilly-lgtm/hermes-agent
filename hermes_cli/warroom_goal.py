@@ -44,7 +44,8 @@ ALL_ROLES = [
     "guardian",
 ]
 
-REQUIRED_SECTIONS = ("Acceptance:", "Constraints:", "Verify with:")
+REQUIRED_SECTION_INTENTS = ("Acceptance", "Constraints", "Verify with")
+HEADING_PREFIX_RE = re.compile(r"^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)")
 MUTATING_TOOLS = {"write_file", "patch", "skill_manage"}
 FINAL_CLAIM_RE = re.compile(r"\b(done|fixed|complete|completed|shipped|hardwired)\b", re.I)
 NEGATED_CLAIM_RE = re.compile(r"\b(not|no|isn[’\']t|is not|still|remain(?:s|ing)?|open|failed|blocked|gap)\b", re.I)
@@ -214,6 +215,45 @@ def refresh_role_runtime_status(state: WarroomGoalState, *, now: Optional[float]
 _DB_CACHE: Dict[str, Any] = {}
 
 
+def _normalize_heading(line: str) -> str:
+    text = (line or "").strip()
+    while True:
+        updated = re.sub(r"^\s*(?:#{1,6}\s*|[-*+]\s*|\d+[.)]\s*)", "", text)
+        if updated == text:
+            break
+        text = updated
+    text = text.casefold()
+    text = re.sub(r"[\W_]+", " ", text)
+    return " ".join(text.split())
+
+
+def _classify_heading_intent(line: str) -> Optional[str]:
+    stripped = (line or "").strip()
+    if not stripped or (":" not in stripped and not HEADING_PREFIX_RE.match(line or "")):
+        return None
+    normalized = _normalize_heading(line)
+    if not normalized:
+        return None
+    if normalized.startswith("verify with"):
+        return "Verify with"
+    if normalized.startswith("test with") or normalized in {"verification", "commands to run", "proof commands"}:
+        return "Verify with"
+    if normalized in {"acceptance", "acceptance criteria", "accepted when", "done when"}:
+        return "Acceptance"
+    if normalized in {"constraints", "constraint", "boundaries", "limitations", "requirements"}:
+        return "Constraints"
+    return None
+
+
+def _missing_required_heading_intents(body: str) -> List[str]:
+    present = {
+        intent
+        for intent in (_classify_heading_intent(line) for line in (body or "").splitlines())
+        if intent
+    }
+    return [intent for intent in REQUIRED_SECTION_INTENTS if intent not in present]
+
+
 def _meta_key(session_id: str) -> str:
     return f"warroom_goal:{session_id}"
 
@@ -252,7 +292,7 @@ def detect_warroom_goal(arg: str) -> Optional[WarroomDetection]:
         return WarroomDetection("fast_adversary", FAST_TRIGGER, body, [])
     if raw.startswith(STRICT_TRIGGER):
         body = raw[len(STRICT_TRIGGER):].strip()
-        missing = [section.rstrip(":") for section in REQUIRED_SECTIONS if section not in body]
+        missing = _missing_required_heading_intents(body)
         if not body:
             missing.insert(0, "Goal body")
         return WarroomDetection("strict_plan_adversary", STRICT_TRIGGER, body, missing)
@@ -899,10 +939,13 @@ def create_warroom_goal(
     }
     status = "active"
     last_gap = None
+    required_action = "spawn_roles"
     if detection.missing_sections:
         status = "blocked"
         gates["plan"] = "blocked"
+        gates["role_spawn"] = "blocked"
         last_gap = "Missing required strict sections: " + ", ".join(detection.missing_sections)
+        required_action = None
     elif not role_cards_ok:
         status = "blocked"
         last_gap = "Missing required role card(s)"
@@ -917,6 +960,7 @@ def create_warroom_goal(
         controller_active=True,
         current_role="controller",
         required_roles=roles,
+        required_action=required_action,
         roles_started={role: role == "controller" for role in roles},
         role_cards={role: cards[role] for role in roles},
         gates=gates,
@@ -952,6 +996,12 @@ def controller_kickoff_prompt(state: WarroomGoalState) -> str:
 
 
 def notice_for_state(state: WarroomGoalState) -> str:
+    if state.status == "blocked" and state.last_gap:
+        return (
+            f"WARROOM V3 {state.workflow} enforced state created.\n"
+            f"Status: {state.status}. Controller active.\n"
+            f"GAP: {state.last_gap}"
+        )
     return (
         f"WARROOM V3 {state.workflow} enforced state created.\n"
         f"Status: {state.status}. Controller active.\n"
@@ -1024,6 +1074,12 @@ def _path_arg(tool_name: str, args: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _parser_block_reason(state: WarroomGoalState) -> Optional[str]:
+    if state.status == "blocked" and state.last_gap and state.last_gap.startswith("Missing required strict sections: "):
+        return state.last_gap
+    return None
+
+
 def _terminal_mutates(args: Dict[str, Any]) -> bool:
     cmd = str(args.get("command") or "")
     return bool(DESTRUCTIVE_TERMINAL_RE.search(cmd) or ">>" in cmd)
@@ -1066,6 +1122,18 @@ def enforce_tool_policy(session_id: str, tool_name: str, args: Dict[str, Any]) -
         return None
     if state.status in {"halted", "gap"}:
         return f"WARROOM V3 blocked: workflow is {state.status} ({state.halt_reason or state.last_gap or 'no reason recorded'})."
+    parser_block_reason = _parser_block_reason(state)
+    if parser_block_reason:
+        if tool_name == "delegate_task":
+            return f"WARROOM V3 blocked: {parser_block_reason}"
+        mutating = tool_name in MUTATING_TOOLS
+        if tool_name == "terminal":
+            mutating = _terminal_mutates(args)
+        elif tool_name == "execute_code":
+            mutating = True
+        if mutating:
+            return f"WARROOM V3 blocked: {parser_block_reason}"
+        return None
     state = _auto_start_build_roles_if_ready(session_id, state)
     if state.required_action == "spawn_roles":
         return "WARROOM V3 blocked: required role spawn action is pending; normal chat/tool fallback denied."

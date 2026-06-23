@@ -26,6 +26,23 @@ def hermes_home(tmp_path, monkeypatch):
         pass
 
 
+def _strict_goal(
+    *,
+    acceptance_heading: str = "Acceptance:",
+    constraints_heading: str = "Constraints:",
+    verify_heading: str = "Verify with:",
+) -> str:
+    return (
+        "Use plan adversary skill for: build hardwire\n\n"
+        f"{acceptance_heading}\n"
+        "- proof\n\n"
+        f"{constraints_heading}\n"
+        "- worktree only\n\n"
+        f"{verify_heading}\n"
+        "pytest -q"
+    )
+
+
 def test_detect_warroom_goal_triggers_and_global_fallback():
     from hermes_cli.warroom_goal import detect_warroom_goal
 
@@ -50,6 +67,53 @@ def test_detect_warroom_goal_triggers_and_global_fallback():
     typo = detect_warroom_goal("Use adversary-skill for: nope")
     assert typo is not None
     assert typo.workflow == "global_plan_adversary"
+
+
+@pytest.mark.parametrize(
+    "verify_heading",
+    [
+        "Verify with these read-only commands:",
+        "Verification:",
+        "Test with:",
+        "Commands to run:",
+        "Proof commands:",
+    ],
+)
+def test_detect_warroom_goal_accepts_verify_heading_variants(verify_heading):
+    from hermes_cli.warroom_goal import detect_warroom_goal
+
+    strict = detect_warroom_goal(
+        _strict_goal(
+            acceptance_heading="Acceptance criteria:",
+            constraints_heading="Boundaries:",
+            verify_heading=verify_heading,
+        )
+    )
+    assert strict is not None
+    assert strict.workflow == "strict_plan_adversary"
+    assert strict.missing_sections == []
+
+
+@pytest.mark.parametrize(
+    ("acceptance_heading", "constraints_heading"),
+    [
+        ("Acceptance criteria:", "Constraint:"),
+        ("Done when:", "Boundaries:"),
+        ("Accepted when:", "Limitations:"),
+    ],
+)
+def test_detect_warroom_goal_accepts_acceptance_and_constraints_variants(acceptance_heading, constraints_heading):
+    from hermes_cli.warroom_goal import detect_warroom_goal
+
+    strict = detect_warroom_goal(
+        _strict_goal(
+            acceptance_heading=acceptance_heading,
+            constraints_heading=constraints_heading,
+            verify_heading="Verification:",
+        )
+    )
+    assert strict is not None
+    assert strict.missing_sections == []
 
 
 def test_global_goal_creates_plan_roles_without_budget_or_fallback(hermes_home, tmp_path):
@@ -153,6 +217,40 @@ def test_strict_state_requires_plan_before_mutation(hermes_home, tmp_path):
     msg = enforce_tool_policy("sid-strict", "write_file", {"path": str(tmp_path / "x.py")})
     assert msg is not None
     assert "plan gate" in msg.lower()
+
+
+def test_strict_parser_block_reports_missing_sections_and_allows_read_only_terminal(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, notice_for_state
+
+    state = create_warroom_goal(
+        "sid-strict-missing-verify",
+        "Use plan adversary skill for: build hardwire\n\nAcceptance criteria:\n- proof\n\nBoundaries:\n- worktree only",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    assert state.status == "blocked"
+    assert state.last_gap == "Missing required strict sections: Verify with"
+    assert state.gates["plan"] == "blocked"
+    assert state.gates["role_spawn"] == "blocked"
+    assert state.required_action is None
+
+    notice = notice_for_state(state)
+    assert "GAP: Missing required strict sections: Verify with" in notice
+    assert "required role spawn action is pending" not in notice
+    assert "spawned with persisted evidence" not in notice
+
+    assert enforce_tool_policy(
+        "sid-strict-missing-verify",
+        "terminal",
+        {"command": "git status --short", "workdir": str(tmp_path)},
+    ) is None
+    blocked = enforce_tool_policy(
+        "sid-strict-missing-verify",
+        "write_file",
+        {"path": str(tmp_path / "x.py")},
+    )
+    assert blocked == "WARROOM V3 blocked: Missing required strict sections: Verify with"
+    assert "spawn" not in blocked.lower()
 
 
 def test_tool_policy_blocks_reviewer_and_skill_dir_mutation(hermes_home, tmp_path):
