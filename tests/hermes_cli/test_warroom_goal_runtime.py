@@ -100,6 +100,44 @@ def test_create_fast_state_persists_roles_and_gates(hermes_home, tmp_path):
     assert reloaded.workflow == "fast_adversary"
 
 
+def test_role_records_expose_shared_context_pack_and_profiles(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, load_warroom_goal
+
+    shared = tmp_path / "shared-context-pack.md"
+    shared.write_text("shared\n", encoding="utf-8")
+
+    state = create_warroom_goal(
+        "sid-role-profiles",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+
+    controller = state.role_records["controller"]
+    builder = state.role_records["builder"]
+    reviewer = state.role_records["reviewer"]
+    guardian = state.role_records["guardian"]
+
+    assert controller["shared_context_pack_path"] == str(shared)
+    assert controller["toolset_profile"] == "docs-only"
+    assert controller["mutation_profile"] == "tracking-docs-only"
+    assert controller["source_mutation_allowed"] is False
+
+    assert builder["shared_context_pack_path"] == str(shared)
+    assert builder["toolset_profile"] == "edit/test"
+    assert builder["mutation_profile"] == "source-mutation-allowed"
+    assert builder["source_mutation_allowed"] is True
+
+    assert reviewer["toolset_profile"] == "read/test/review"
+    assert reviewer["mutation_profile"] == "read-only"
+    assert reviewer["source_mutation_allowed"] is False
+    assert guardian["toolset_profile"] == "read/test/review"
+
+    reloaded = load_warroom_goal("sid-role-profiles")
+    assert reloaded is not None
+    assert reloaded.role_records["builder"]["shared_context_pack_path"] == str(shared)
+
+
 def test_strict_state_requires_plan_before_mutation(hermes_home, tmp_path):
     from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy
 
@@ -197,9 +235,9 @@ def test_final_guard_allows_negated_or_progress_language(hermes_home, tmp_path):
         tracking_dir=str(tmp_path),
         allowed_mutation_root=str(tmp_path),
     )
-    assert guard_final_response("sid-final-negated", "I am still working on it; no fix yet.").startswith("I am still")
-    assert guard_final_response("sid-final-negated", "Here is a complete log of what failed; not fixed.").startswith("Here is")
-    assert guard_final_response("sid-final-negated", "The working directory is /tmp and the issue remains open.").startswith("The working")
+    assert guard_final_response("sid-final-negated", "I am still working on it; no fix yet.", closure=True).startswith("I am still")
+    assert guard_final_response("sid-final-negated", "Here is a complete log of what failed; not fixed.", closure=True).startswith("Here is")
+    assert guard_final_response("sid-final-negated", "The working directory is /tmp and the issue remains open.", closure=True).startswith("The working")
 
 
 def test_copy_does_not_overwrite_newer_child_state(hermes_home, tmp_path):
@@ -264,7 +302,8 @@ def test_role_spawn_success_persists_ids_hashes_and_evidence(hermes_home, tmp_pa
         assert record["role_card_sha256"]
         assert record["runtime_id"]
         assert Path(record["evidence_path"]).exists()
-        assert role == "controller" or record["runtime_id"].startswith("pid:")
+        assert role == "controller" or record["runtime_kind"] == "spawn_receipt"
+        assert role == "controller" or record["spawn_receipt_only"] is True
     assert Path(state.role_spawn_evidence_path).exists()
 
 
@@ -324,14 +363,14 @@ def test_builder_self_report_cannot_unlock_guardian_final_gate(hermes_home, tmp_
     save_warroom_goal("sid-guardian-unlock", state)
 
     record_role_output("sid-guardian-unlock", "builder", evidence_path=str(tmp_path / "builder.txt"), verdict="PASS")
-    assert "FINAL BLOCKED" in guard_final_response("sid-guardian-unlock", "DONE. pytest E2E passed.")
+    assert "FINAL BLOCKED" in guard_final_response("sid-guardian-unlock", "DONE. pytest E2E passed.", closure=True)
 
     guardian = tmp_path / "guardian.txt"
     guardian.write_text("Guardian verdict: PASS\n", encoding="utf-8")
     unlocked = record_role_output("sid-guardian-unlock", "guardian", evidence_path=str(guardian), verdict="PASS")
     assert unlocked.guardian_pass is True
     assert unlocked.final_claim_allowed is True
-    completed = guard_final_response("sid-guardian-unlock", "DONE. pytest E2E passed and proof packet written.")
+    completed = guard_final_response("sid-guardian-unlock", "DONE. pytest E2E passed and proof packet written.", closure=True)
     assert completed.startswith("GOAL COMPLETED")
     assert "Role spawn evidence:" in completed
     assert "Normal chat fallback: NO" in completed
@@ -343,7 +382,7 @@ def test_builder_self_report_cannot_unlock_guardian_final_gate(hermes_home, tmp_
     assert "GOAL COMPLETED emitted" in completed_state.gate_evidence["completion_output"]
 
 
-def test_normal_chat_fallback_blocked_while_spawn_pending(hermes_home, tmp_path):
+def test_normal_chat_does_not_run_final_guard_while_spawn_pending(hermes_home, tmp_path):
     from hermes_cli.warroom_goal import create_warroom_goal, guard_final_response, save_warroom_goal
 
     state = create_warroom_goal(
@@ -354,7 +393,110 @@ def test_normal_chat_fallback_blocked_while_spawn_pending(hermes_home, tmp_path)
     )
     state.required_action = "spawn_roles"
     save_warroom_goal("sid-spawn-pending", state)
-    assert "normal chat fallback denied" in guard_final_response("sid-spawn-pending", "Working on it.")
+    assert guard_final_response("sid-spawn-pending", "Working on it.") == "Working on it."
+    assert guard_final_response("sid-spawn-pending", "Working on it.", closure=True) == "Working on it."
+    blocked = guard_final_response("sid-spawn-pending", "DONE. pytest E2E passed.")
+    assert "FINAL BLOCKED" in blocked
+    assert "required role spawn action is pending" in blocked
+
+
+def test_role_ledger_distinguishes_real_child_session_stale_pid_and_status_line(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import (
+        create_warroom_goal,
+        record_child_progress,
+        refresh_role_runtime_status,
+        save_warroom_goal,
+        start_warroom_roles,
+    )
+
+    state = create_warroom_goal(
+        "sid-real-child",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+
+    def adapter(**kwargs):
+        return {
+            "adapter": "native_delegate",
+            "child_session_id": "child-session-1",
+            "delegation_id": "delegation-1",
+            "stdout": "spawned",
+            "json_payload": {"ok": True},
+            "current_phase": "running-tools",
+        }
+
+    updated = start_warroom_roles("sid-real-child", ["reviewer"], adapter=adapter, use_local_process=False)
+    assert updated is not None
+    record = updated.role_records["reviewer"]
+    assert record["runtime_kind"] == "real_child_session"
+    assert record["spawn_receipt_only"] is False
+    assert record["child_session_id"] == "child-session-1"
+    assert record["delegation_id"] == "delegation-1"
+    assert record["status"] == "active_child_work"
+
+    record["last_seen_epoch"] = 1
+    refresh_role_runtime_status(updated, now=1_000)
+    assert record["stale"] is True
+    assert record["stale_reason"] == "child session heartbeat stale"
+    save_warroom_goal("sid-real-child", updated)
+
+    refreshed = record_child_progress("sid-real-child", child_session_id="child-session-1", phase="delegate heartbeat")
+    assert refreshed is not None
+    fresh_record = refreshed.role_records["reviewer"]
+    assert fresh_record["stale"] is False
+    assert fresh_record["stale_reason"] is None
+    assert fresh_record["current_phase"] == "delegate heartbeat"
+    assert fresh_record["last_seen_epoch"] > 1
+
+    pid_record = next(r for role, r in refreshed.role_records.items() if role != "controller" and str(r.get("runtime_id", "")).startswith("pid:"))
+    pid_record["runtime_id"] = "pid:999999999"
+    pid_record["status"] = "spawn_receipt_only"
+    refresh_role_runtime_status(refreshed)
+    assert pid_record["spawn_receipt_only"] is True
+    assert pid_record["status"] == "stale_dead_pid"
+    line = refreshed.status_line()
+    assert "child-session-1" in line
+    assert "phase=delegate heartbeat" in line
+    assert "stale" in line
+
+
+def test_controller_can_write_tracking_docs_but_not_source(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-controller-tracking",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path / ".warroom"),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.current_role = "controller"
+    save_warroom_goal("sid-controller-tracking", state)
+
+    assert enforce_tool_policy("sid-controller-tracking", "write_file", {"path": str(tmp_path / ".warroom" / "proof.md")}) is None
+    blocked = enforce_tool_policy("sid-controller-tracking", "write_file", {"path": str(tmp_path / "source.py")})
+    assert blocked is not None
+    assert "Builder is the only mutation role" in blocked
+
+
+def test_rc0_empty_transport_is_incomplete_not_success(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, start_warroom_roles
+
+    create_warroom_goal(
+        "sid-incomplete-transport",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+
+    def empty_transport(**kwargs):
+        return {"adapter": "native_delegate", "exit_code": 0, "stdout": ""}
+
+    blocked = start_warroom_roles("sid-incomplete-transport", ["reviewer"], adapter=empty_transport, use_local_process=False)
+    assert blocked is not None
+    assert blocked.status == "gap"
+    assert blocked.gates["role_spawn"] == "gap"
+    assert "INCOMPLETE_TRANSPORT" in blocked.role_records["reviewer"]["error"]
 
 
 def test_noncritical_halts_auto_continue_and_mission_critical_halts(hermes_home, tmp_path):
@@ -436,7 +578,7 @@ def test_guardian_unlock_requires_existing_guardian_pass_evidence(hermes_home, t
 
     missing = record_role_output("sid-guardian-evidence", "guardian", evidence_path=str(tmp_path / "missing.txt"), verdict="PASS")
     assert missing.guardian_pass is False
-    assert "FINAL BLOCKED" in guard_final_response("sid-guardian-evidence", "DONE. pytest E2E passed and proof packet written.")
+    assert "FINAL BLOCKED" in guard_final_response("sid-guardian-evidence", "DONE. pytest E2E passed and proof packet written.", closure=True)
 
     weak = tmp_path / "weak.txt"
     weak.write_text("PASS\n", encoding="utf-8")
@@ -591,7 +733,7 @@ def test_noncritical_stop_phrase_is_auto_continued_in_final_guard(hermes_home, t
         tracking_dir=str(tmp_path),
         allowed_mutation_root=str(tmp_path),
     )
-    response = guard_final_response("sid-noncritical-text", "Phase complete. Waiting for approval before live promotion.")
+    response = guard_final_response("sid-noncritical-text", "Phase complete. Waiting for approval before live promotion.", closure=True)
     assert "auto_continued" in response
     state = load_warroom_goal("sid-noncritical-text")
     assert state.status == "active"
@@ -618,7 +760,7 @@ def test_goal_completion_output_hardwire_emits_goal_completed(hermes_home, tmp_p
     guardian.write_text("Guardian verdict: PASS\n", encoding="utf-8")
     record_role_output("sid-completion-output", "guardian", evidence_path=str(guardian), verdict="PASS")
 
-    output = guard_final_response("sid-completion-output", "DONE. pytest E2E passed and proof packet written.")
+    output = guard_final_response("sid-completion-output", "DONE. pytest E2E passed and proof packet written.", closure=True)
 
     assert output.startswith("GOAL COMPLETED")
     assert "Workflow: strict_plan_adversary" in output

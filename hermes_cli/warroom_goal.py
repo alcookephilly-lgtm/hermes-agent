@@ -25,6 +25,8 @@ STRICT_TRIGGER = "Use plan adversary skill for:"
 GLOBAL_TRIGGER = "Global slash /goal:"
 STATE_VERSION = 3
 WARROOM_PLAN_WORKFLOWS = {"strict_plan_adversary", "global_plan_adversary"}
+ROLE_STALE_AFTER_SECONDS = 300.0
+TRACKING_DOC_SUFFIXES = {"", ".md", ".txt", ".json", ".jsonl", ".yaml", ".yml", ".log"}
 
 FAST_ROLES = ["controller", "builder", "adversary", "reviewer", "guardian"]
 PLAN_ROLES = ["controller", "plan_builder", "plan_adversary", "plan_reviewer"]
@@ -139,7 +141,74 @@ class WarroomGoalState:
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
     def status_line(self) -> str:
-        return f"WARROOM V3 {self.workflow}: {self.status} (role={self.current_role or 'none'})"
+        refresh_role_runtime_status(self)
+        active_bits = []
+        for role, record in sorted(self.role_records.items()):
+            status = record.get("status") or "unknown"
+            child_session = record.get("child_session_id") or record.get("delegation_id") or record.get("runtime_id") or "none"
+            last_seen = record.get("last_seen_at") or "unknown"
+            phase = record.get("current_phase") or status
+            stale = "stale" if record.get("stale") else "not-stale"
+            active_bits.append(f"{role}:{status}:{child_session}:last_seen={last_seen}:phase={phase}:{stale}")
+        progress = "; ".join(active_bits) if active_bits else "no role records"
+        return f"WARROOM V3 {self.workflow}: {self.status} (role={self.current_role or 'none'}) progress=[{progress}]"
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def refresh_role_runtime_status(state: WarroomGoalState, *, now: Optional[float] = None) -> WarroomGoalState:
+    """Annotate role records with live/stale runtime state.
+
+    ``pid:*`` records are spawn receipts only. They become ``stale_dead_pid``
+    when the process is gone. Real delegated work must carry a
+    ``child_session_id`` or ``delegation_id`` and is marked stale when its
+    heartbeat ages out.
+    """
+    current = time.time() if now is None else now
+    for role, record in (state.role_records or {}).items():
+        runtime_id = str(record.get("runtime_id") or "")
+        record.setdefault("current_phase", record.get("status") or "unknown")
+        if runtime_id.startswith("pid:"):
+            record["spawn_receipt_only"] = True
+            record.setdefault("runtime_kind", "spawn_receipt")
+            try:
+                alive = _pid_is_alive(int(runtime_id.split(":", 1)[1]))
+            except Exception:
+                alive = False
+            record["stale"] = not alive
+            record["stale_reason"] = None if alive else "stale/dead pid"
+            if not alive and record.get("status") in {"spawned", "spawn_receipt_only", "running"}:
+                record["status"] = "stale_dead_pid"
+                record["current_phase"] = "stale_dead_pid"
+            continue
+
+        if record.get("child_session_id") or record.get("delegation_id"):
+            record.setdefault("runtime_kind", "real_child_session")
+            record["spawn_receipt_only"] = False
+            last_seen_raw = record.get("last_seen_epoch") or record.get("last_seen_ts")
+            if not isinstance(last_seen_raw, (int, float)):
+                last_seen_raw = current
+                record["last_seen_epoch"] = last_seen_raw
+            stale = current - float(last_seen_raw) > ROLE_STALE_AFTER_SECONDS
+            record["stale"] = stale
+            record["stale_reason"] = "child session heartbeat stale" if stale else None
+            if record.get("status") in {"spawned", "running"} and not stale:
+                record["status"] = "active_child_work"
+                record["current_phase"] = record.get("current_phase") or "active_child_work"
+            continue
+
+        record.setdefault("runtime_kind", "unknown")
+    return state
 
 
 _DB_CACHE: Dict[str, Any] = {}
@@ -326,6 +395,56 @@ def _role_cards_for(tracking_dir: str) -> Dict[str, str]:
     return cards
 
 
+def _shared_context_pack_path(tracking_dir: Optional[str], role_card_path: str) -> Optional[str]:
+    card_path = Path(role_card_path)
+    if card_path.exists():
+        try:
+            for line in card_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.lower().startswith("use shared context pack:"):
+                    target = line.split(":", 1)[1].strip()
+                    if not target:
+                        break
+                    resolved = (card_path.parent / target).expanduser().resolve()
+                    return str(resolved)
+        except Exception:
+            pass
+    if tracking_dir:
+        shared = Path(tracking_dir) / "shared-context-pack.md"
+        if shared.exists():
+            return str(shared)
+    return None
+
+
+def _role_policy_metadata(role: str) -> Dict[str, Any]:
+    if role == "builder":
+        return {
+            "toolset_profile": "edit/test",
+            "mutation_profile": "source-mutation-allowed",
+            "source_mutation_allowed": True,
+        }
+    if role in {"controller", "plan_builder"}:
+        return {
+            "toolset_profile": "docs-only",
+            "mutation_profile": "tracking-docs-only" if role == "controller" else "docs-only",
+            "source_mutation_allowed": False,
+        }
+    if role in {"adversary", "reviewer", "guardian", "plan_adversary", "plan_reviewer"}:
+        return {
+            "toolset_profile": "read/test/review",
+            "mutation_profile": "read-only",
+            "source_mutation_allowed": False,
+        }
+    return {"source_mutation_allowed": False}
+
+
+def _annotate_role_record(record: Dict[str, Any], *, state: WarroomGoalState, role: str, role_card_path: str) -> Dict[str, Any]:
+    record.update(_role_policy_metadata(role))
+    shared_context_pack_path = _shared_context_pack_path(state.tracking_dir, role_card_path)
+    if shared_context_pack_path:
+        record["shared_context_pack_path"] = shared_context_pack_path
+    return record
+
+
 def _utc_stamp() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -359,8 +478,15 @@ def _role_record(
     evidence_path: str,
     exit_code: Optional[int] = None,
     error: Optional[str] = None,
+    child_session_id: Optional[str] = None,
+    delegation_id: Optional[str] = None,
+    runtime_kind: Optional[str] = None,
+    current_phase: Optional[str] = None,
+    spawn_receipt_only: Optional[bool] = None,
 ) -> Dict[str, Any]:
     now = _utc_stamp()
+    now_epoch = time.time()
+    inferred_kind = runtime_kind or ("real_child_session" if child_session_id or delegation_id else ("spawn_receipt" if str(runtime_id).startswith("pid:") else adapter))
     record: Dict[str, Any] = {
         "role": role,
         "status": status,
@@ -368,10 +494,18 @@ def _role_record(
         "role_card_sha256": _sha256_file(role_card_path) if Path(role_card_path).exists() else None,
         "adapter": adapter,
         "runtime_id": runtime_id,
+        "runtime_kind": inferred_kind,
+        "child_session_id": child_session_id,
+        "delegation_id": delegation_id,
+        "spawn_receipt_only": bool(spawn_receipt_only) if spawn_receipt_only is not None else inferred_kind == "spawn_receipt",
+        "current_phase": current_phase or status,
         "started_at": now,
         "last_seen_at": now,
+        "last_seen_epoch": now_epoch,
         "evidence_path": evidence_path,
         "exit_code": exit_code,
+        "stale": False,
+        "stale_reason": None,
     }
     if error:
         record["error"] = error
@@ -426,19 +560,24 @@ def _start_roles_for_state(
         if not role_card_path or not Path(role_card_path).exists():
             missing_cards.append(role)
             evidence_path = str(evidence_dir / f"{role}.json")
-            state.role_records[role] = {
-                "role": role,
-                "status": "gap",
-                "role_card_path": role_card_path,
-                "role_card_sha256": None,
-                "adapter": "gap",
-                "runtime_id": "missing-role-card",
-                "started_at": _utc_stamp(),
-                "last_seen_at": _utc_stamp(),
-                "evidence_path": evidence_path,
-                "exit_code": None,
-                "error": "missing role card",
-            }
+            state.role_records[role] = _annotate_role_record(
+                {
+                    "role": role,
+                    "status": "gap",
+                    "role_card_path": role_card_path,
+                    "role_card_sha256": None,
+                    "adapter": "gap",
+                    "runtime_id": "missing-role-card",
+                    "started_at": _utc_stamp(),
+                    "last_seen_at": _utc_stamp(),
+                    "evidence_path": evidence_path,
+                    "exit_code": None,
+                    "error": "missing role card",
+                },
+                state=state,
+                role=role,
+                role_card_path=role_card_path,
+            )
             continue
 
         evidence_path = str(evidence_dir / f"{role}.json")
@@ -451,30 +590,57 @@ def _start_roles_for_state(
                 runtime_id=state.session_id,
                 evidence_path=evidence_path,
             )
+            record = _annotate_role_record(record, state=state, role=role, role_card_path=role_card_path)
             _write_json(Path(evidence_path), {"record": record, "event": "controller_state_created"})
         else:
             try:
+                child_session_id: Optional[str] = None
+                delegation_id: Optional[str] = None
+                runtime_kind: Optional[str] = None
+                current_phase: Optional[str] = None
+                spawn_receipt_only: Optional[bool] = None
                 if adapter is not None:
                     result = adapter(role=role, role_card_path=role_card_path, evidence_path=evidence_path, state=state)
                     adapter_name = str(result.get("adapter") or "native_delegate")
-                    runtime_id = str(result.get("runtime_id") or result.get("delegation_id") or result.get("session_id") or result.get("pid") or "unknown")
+                    child_session_id = result.get("child_session_id") or result.get("session_id")
+                    delegation_id = result.get("delegation_id")
+                    runtime_id = str(result.get("runtime_id") or delegation_id or child_session_id or result.get("pid") or "unknown")
                     exit_code = result.get("exit_code")
+                    current_phase = str(result.get("current_phase") or result.get("phase") or "active_child_work")
+                    stdout_empty = not str(result.get("stdout") or result.get("output") or "").strip()
+                    json_payload = result.get("json_payload") or result.get("payload") or result.get("result")
+                    structured_payload = bool(json_payload or child_session_id or delegation_id)
+                    artifact = result.get("artifact") or result.get("artifact_path")
+                    artifact_exists = bool(artifact and Path(str(artifact)).exists())
+                    if exit_code == 0 and stdout_empty and not structured_payload and not artifact_exists:
+                        raise RuntimeError("INCOMPLETE_TRANSPORT: rc=0 with empty stdout, no JSON payload, and no artifact")
+                    runtime_kind = "real_child_session" if child_session_id or delegation_id else None
+                    spawn_receipt_only = False if runtime_kind == "real_child_session" else None
                 elif use_local_process:
                     result = _spawn_local_role_process(state, role, role_card_path, evidence_path)
                     adapter_name = str(result["adapter"])
                     runtime_id = str(result["runtime_id"])
                     exit_code = result.get("exit_code")
+                    runtime_kind = "spawn_receipt"
+                    current_phase = "spawn_receipt_only"
+                    spawn_receipt_only = True
                 else:
                     raise RuntimeError("no native_delegate or local_process adapter available")
                 record = _role_record(
                     role=role,
-                    status="spawned",
+                    status="active_child_work" if runtime_kind == "real_child_session" else "spawn_receipt_only",
                     role_card_path=role_card_path,
                     adapter=adapter_name,
                     runtime_id=runtime_id,
                     evidence_path=evidence_path,
                     exit_code=exit_code,
+                    child_session_id=str(child_session_id) if child_session_id else None,
+                    delegation_id=str(delegation_id) if delegation_id else None,
+                    runtime_kind=runtime_kind,
+                    current_phase=current_phase,
+                    spawn_receipt_only=spawn_receipt_only,
                 )
+                record = _annotate_role_record(record, state=state, role=role, role_card_path=role_card_path)
                 if not Path(evidence_path).exists():
                     _write_json(Path(evidence_path), {"record": record, "event": "role_spawned"})
             except Exception as exc:
@@ -488,9 +654,10 @@ def _start_roles_for_state(
                     evidence_path=evidence_path,
                     error=str(exc),
                 )
+                record = _annotate_role_record(record, state=state, role=role, role_card_path=role_card_path)
                 _write_json(Path(evidence_path), {"record": record, "event": "role_spawn_failed"})
         state.role_records[role] = record
-        state.roles_started[role] = record.get("status") in {"running", "spawned", "done"}
+        state.roles_started[role] = record.get("status") in {"running", "spawned", "spawn_receipt_only", "active_child_work", "done"}
         state.role_spawn_attempts.append({
             "role": role,
             "status": record.get("status"),
@@ -516,11 +683,12 @@ def _start_roles_for_state(
         state.gates["role_cards"] = "pass"
         state.gates["role_spawn"] = "pass"
         adapters = {str(r.get("adapter") or "") for r in state.role_records.values()}
-        if adapters and adapters <= {"controller_state", "local_process"}:
+        real_children = any(r.get("child_session_id") or r.get("delegation_id") for r in state.role_records.values())
+        if not real_children and adapters and adapters <= {"controller_state", "local_process"}:
             state.gates["delegate_runtime"] = "stub_only"
             state.delegate_runtime_available = False
             state.gate_evidence.setdefault("delegate_runtime", []).append(
-                "local_process role receipts prove spawn only; real delegated work still requires Controller/model loop"
+                "local_process role receipts prove spawn receipt only; real delegated work requires child_session_id/delegation_id"
             )
         else:
             state.gates["delegate_runtime"] = "pass"
@@ -545,6 +713,58 @@ def start_warroom_roles(
     if state is None:
         return None
     state = _start_roles_for_state(state, roles, adapter=adapter, use_local_process=use_local_process)
+    save_warroom_goal(session_id, state)
+    return state
+
+
+def record_child_progress(
+    session_id: str,
+    *,
+    child_session_id: Optional[str] = None,
+    delegation_id: Optional[str] = None,
+    runtime_id: Optional[str] = None,
+    phase: Optional[str] = None,
+    status: str = "active_child_work",
+) -> Optional[WarroomGoalState]:
+    state = load_warroom_goal(session_id)
+    if state is None:
+        return None
+    child_session_id = str(child_session_id or "").strip() or None
+    delegation_id = str(delegation_id or "").strip() or None
+    runtime_id = str(runtime_id or "").strip() or None
+    if not any((child_session_id, delegation_id, runtime_id)):
+        return None
+
+    matched_record: Optional[Dict[str, Any]] = None
+    for record in (state.role_records or {}).values():
+        if child_session_id and str(record.get("child_session_id") or "") == child_session_id:
+            matched_record = record
+            break
+        if delegation_id and str(record.get("delegation_id") or "") == delegation_id:
+            matched_record = record
+            break
+        if runtime_id and str(record.get("runtime_id") or "") == runtime_id:
+            matched_record = record
+            break
+    if matched_record is None:
+        return None
+
+    now_epoch = time.time()
+    matched_record["last_seen_at"] = _utc_stamp()
+    matched_record["last_seen_epoch"] = now_epoch
+    matched_record["status"] = status or matched_record.get("status") or "active_child_work"
+    matched_record["current_phase"] = phase or matched_record.get("current_phase") or matched_record["status"]
+    matched_record["stale"] = False
+    matched_record["stale_reason"] = None
+    if child_session_id:
+        matched_record["child_session_id"] = child_session_id
+    if delegation_id:
+        matched_record["delegation_id"] = delegation_id
+    if runtime_id and not matched_record.get("runtime_id"):
+        matched_record["runtime_id"] = runtime_id
+    if matched_record.get("child_session_id") or matched_record.get("delegation_id"):
+        matched_record["runtime_kind"] = "real_child_session"
+        matched_record["spawn_receipt_only"] = False
     save_warroom_goal(session_id, state)
     return state
 
@@ -631,6 +851,15 @@ def _path_inside(path: str, root: str) -> bool:
         return p == r or r in p.parents
     except Exception:
         return False
+
+
+def _controller_tracking_doc_allowed(state: WarroomGoalState, tool_name: str, args: Dict[str, Any]) -> bool:
+    if state.current_role != "controller" or tool_name not in {"write_file", "patch"}:
+        return False
+    path = _path_arg(tool_name, args)
+    if not path or not state.tracking_dir or not _path_inside(path, state.tracking_dir):
+        return False
+    return Path(path).suffix.lower() in TRACKING_DOC_SUFFIXES
 
 
 def create_warroom_goal(
@@ -863,6 +1092,9 @@ def enforce_tool_policy(session_id: str, tool_name: str, args: Dict[str, Any]) -
     if not mutating:
         return None
 
+    if _controller_tracking_doc_allowed(state, tool_name, args):
+        return None
+
     if state.current_role != "builder":
         return f"WARROOM V3 blocked: role {state.current_role or 'none'} cannot mutate code. Builder is the only mutation role."
     if state.gates.get("tracking") != "pass":
@@ -933,7 +1165,7 @@ def goal_completion_output(state: WarroomGoalState, response: str) -> str:
     )
 
 
-def guard_final_response(session_id: str, response: str) -> str:
+def guard_final_response(session_id: str, response: str, *, closure: bool = False) -> str:
     state = load_warroom_goal(session_id)
     if state is None or not response:
         return response
@@ -944,9 +1176,10 @@ def guard_final_response(session_id: str, response: str) -> str:
             response.rstrip()
             + f"\n\nWARROOM V3 auto_continued:{state.noncritical_pause_attempts[-1]['reason']} — non-mission-critical stop denied."
         )
-    if state.required_action == "spawn_roles":
+    has_final_claim = _has_final_completion_claim(response)
+    if state.required_action == "spawn_roles" and has_final_claim:
         return "WARROOM V3 FINAL BLOCKED: required role spawn action is pending. GAP: normal chat fallback denied until roles spawn or explicit GAP is recorded."
-    if _has_final_completion_claim(response):
+    if has_final_claim:
         proof = state.proof_packet_path
         if not proof or not Path(proof).exists() or not state.final_claim_allowed:
             return (

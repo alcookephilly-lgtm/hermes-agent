@@ -653,6 +653,14 @@ def check_delegate_requirements() -> bool:
     return True
 
 
+_CHILD_INDEX_FIRST_DISCOVERY_BLOCK = (
+    "## Index-First / Robot-Hand Code Discovery\n"
+    "Before any raw file reads/searches, follow this exact order:\n"
+    "Graphify report -> jcodemunch/jcode -> CodeGraph if initialized -> smart-read -> native read/search fallback only after named GAP.\n"
+    "If CodeGraph is not initialized, report GAP. Do not run codegraph init, codegraph uninit, or mutate MCP config unless explicitly approved."
+)
+
+
 def _build_child_system_prompt(
     goal: str,
     context: Optional[str] = None,
@@ -683,6 +691,7 @@ def _build_child_system_prompt(
             f"{workspace_path}\n"
             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
         )
+    parts.append("\n" + _CHILD_INDEX_FIRST_DISCOVERY_BLOCK)
     parts.append(
         "\nComplete this task using the tools available to you. "
         "When finished, provide a clear, concise summary of:\n"
@@ -837,14 +846,23 @@ def _build_child_progress_callback(
     def _relay(
         event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs
     ):
-        if not parent_cb:
-            return
-        payload = _identity_kwargs()
-        payload.update(kwargs)  # caller overrides (e.g. status, duration_seconds)
+        if parent_cb:
+            payload = _identity_kwargs()
+            payload.update(kwargs)  # caller overrides (e.g. status, duration_seconds)
+            try:
+                parent_cb(event_type, tool_name, preview, args, **payload)
+            except Exception as e:
+                logger.debug("Parent callback failed: %s", e)
         try:
-            parent_cb(event_type, tool_name, preview, args, **payload)
+            from hermes_cli.warroom_goal import record_child_progress
+
+            record_child_progress(
+                getattr(parent_agent, "session_id", "") or "",
+                child_session_id=(session_ref or {}).get("session_id"),
+                phase=preview or tool_name or event_type,
+            )
         except Exception as e:
-            logger.debug("Parent callback failed: %s", e)
+            logger.debug("Warroom child heartbeat update failed: %s", e)
 
     def _callback(
         event_type, tool_name: str = None, preview: str = None, args=None, **kwargs
@@ -1306,14 +1324,14 @@ def _dump_subagent_timeout_diagnostic(
     worker_thread: Optional[threading.Thread],
     goal: str,
 ) -> Optional[str]:
-    """Write a structured diagnostic dump for a subagent that timed out
-    before making any API call.
+    """Write a structured diagnostic dump for any subagent timeout.
 
     See issue #14726: users hit "subagent timed out after 300s with no response"
-    with zero API calls and no way to inspect what happened. This helper
-    writes a dedicated log under ``~/.hermes/logs/subagent-<sid>-<ts>.log``
-    capturing the child's config, system-prompt / tool-schema sizes, activity
-    tracker snapshot, and the worker thread's Python stack at timeout.
+    with no way to inspect what happened. This helper writes a dedicated log
+    under ``~/.hermes/logs/subagent-<sid>-<ts>.log`` capturing child identity,
+    config, system-prompt / tool-schema sizes, activity tracker snapshot, last
+    message/tool summary, next safe action, and the worker thread's Python stack
+    at timeout.
 
     Returns the absolute path to the diagnostic file, or None on failure.
     """
@@ -1344,6 +1362,8 @@ def _dump_subagent_timeout_diagnostic(
         _w("## Timeout")
         _w(f"  task_index:        {task_index}")
         _w(f"  subagent_id:       {subagent_id}")
+        _w(f"  child_session_id:  {getattr(child, 'session_id', None)!r}")
+        _w(f"  role_id:           {getattr(child, '_delegate_role', None)!r}")
         _w(f"  configured_timeout: {timeout_seconds}s")
         _w(f"  actual_duration:   {duration_seconds:.2f}s")
         _w("")
@@ -1411,6 +1431,35 @@ def _dump_subagent_timeout_diagnostic(
             _w(f"  <get_activity_summary failed: {exc}>")
         _w("")
 
+        _w("## Last message / tool summary")
+        try:
+            child_messages = getattr(child, "_session_messages", None) or getattr(child, "messages", None) or []
+            if isinstance(child_messages, list) and child_messages:
+                for msg in child_messages[-5:]:
+                    if not isinstance(msg, dict):
+                        continue
+                    role = msg.get("role", "?")
+                    content = _stringify_tool_content(msg.get("content", ""))
+                    tool_calls = msg.get("tool_calls") or []
+                    tool_names = []
+                    for tc in tool_calls:
+                        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                        name = fn.get("name") if isinstance(fn, dict) else None
+                        if name:
+                            tool_names.append(str(name))
+                    preview = content[:300].replace("\n", " ") if content else ""
+                    _w(f"  role={role!r} tools={tool_names!r} content={preview!r}")
+            else:
+                _w("  <no child session messages captured>")
+        except Exception as exc:
+            _w(f"  <last-message summary failed: {exc}>")
+        _w("")
+
+        _w("## Next safe action")
+        _w("  Inspect this diagnostic plus the parent role ledger before retrying the role.")
+        _w("  If api_call_count advanced, resume/retry from the child session id when available; do not treat spawn receipt as completed work.")
+        _w("")
+
         _w("## Worker thread stack at timeout")
         if worker_thread is not None and worker_thread.is_alive():
             frames = _sys._current_frames()
@@ -1429,10 +1478,10 @@ def _dump_subagent_timeout_diagnostic(
         _w("")
 
         _w("## Notes")
-        _w("  This file is written ONLY when a subagent times out with 0 API calls.")
-        _w("  0-API-call timeouts mean the child never reached its first LLM request.")
+        _w("  This file is written for every subagent timeout, including timeouts after API/tool activity.")
+        _w("  A timeout with only a pid/spawn receipt is not proof of delegated work.")
         _w("  Common causes: oversized prompt rejected by provider, transport hang,")
-        _w("  credential resolution stuck. See issue #14726 for context.")
+        _w("  credential resolution stuck, slow API call, or unresponsive network/tool request.")
 
         dump_path.write_text("\n".join(lines), encoding="utf-8")
         return str(dump_path)
@@ -1539,18 +1588,23 @@ def _run_single_child(
                     )
                     break  # stop touching parent, let gateway timeout fire
 
+                child_session = getattr(child, "session_id", None) or getattr(child, "_session_id", None) or "unknown"
+                child_role = getattr(child, "_delegate_role", None) or "unknown"
+                stale_label = f"stale_count={_stale_count[0]}/{stale_limit}"
+                phase = child_tool or child_summary.get("last_activity_desc") or "idle"
                 if child_tool:
                     desc = (
-                        f"delegate_task: subagent running {child_tool} "
+                        f"delegate_task: child_session={child_session} role={child_role} "
+                        f"phase={phase} {stale_label} "
                         f"(iteration {child_iter}/{child_max})"
                     )
                 else:
                     child_desc = child_summary.get("last_activity_desc", "")
-                    if child_desc:
-                        desc = (
-                            f"delegate_task: subagent {child_desc} "
-                            f"(iteration {child_iter}/{child_max})"
-                        )
+                    desc = (
+                        f"delegate_task: child_session={child_session} role={child_role} "
+                        f"phase={phase} {stale_label} "
+                        f"(iteration {child_iter}/{child_max})"
+                    )
             except Exception:
                 pass
             try:
@@ -1655,9 +1709,9 @@ def _run_single_child(
                 duration,
             )
 
-            # When a subagent times out BEFORE making any API call, dump a
-            # diagnostic to help users (and us) see what the child was doing.
-            # See #14726 — without this, 0-API-call hangs are black boxes.
+            # Any timeout gets a diagnostic packet. Timeouts with API/tool
+            # activity still need child/session identity, last activity, and a
+            # next safe action instead of the old generic slow-call sentence.
             diagnostic_path: Optional[str] = None
             child_api_calls = 0
             try:
@@ -1665,12 +1719,10 @@ def _run_single_child(
                 child_api_calls = int(_summary.get("api_call_count", 0) or 0)
             except Exception:
                 pass
-            if is_timeout and child_api_calls == 0:
+            if is_timeout:
                 diagnostic_path = _dump_subagent_timeout_diagnostic(
                     child=child,
                     task_index=task_index,
-                    # is_timeout implies a cap was configured (result(timeout=None)
-                    # never raises FuturesTimeoutError); guard for the type checker.
                     timeout_seconds=float(child_timeout or 0.0),
                     duration_seconds=float(duration),
                     worker_thread=_worker_thread_holder.get("t"),
@@ -1678,9 +1730,10 @@ def _run_single_child(
                 )
                 if diagnostic_path:
                     logger.warning(
-                        "Subagent %d 0-API-call timeout — diagnostic written to %s",
+                        "Subagent %d timeout diagnostic written to %s (api_calls=%d)",
                         task_index,
                         diagnostic_path,
+                        child_api_calls,
                     )
 
             if child_progress_cb:
@@ -1707,14 +1760,14 @@ def _run_single_child(
                         f"first LLM request (prompt construction, credential "
                         f"resolution, or transport may be stuck)."
                     )
-                    if diagnostic_path:
-                        _err += f" Diagnostic: {diagnostic_path}"
                 else:
                     _err = (
                         f"Subagent timed out after {child_timeout}s with "
-                        f"{child_api_calls} API call(s) completed — likely "
-                        f"stuck on a slow API call or unresponsive network request."
+                        f"{child_api_calls} API call(s) completed — diagnostic "
+                        f"packet captured last activity and next safe action."
                     )
+                if diagnostic_path:
+                    _err += f" Diagnostic: {diagnostic_path}"
             else:
                 _err = str(_timeout_exc)
 

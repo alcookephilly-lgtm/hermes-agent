@@ -42,7 +42,7 @@ import time
 import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures.thread import _worker
+from concurrent.futures.thread import _threads_queues, _worker
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -67,19 +67,32 @@ class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
         num_threads = len(self._threads)
         if num_threads < self._max_workers:
             thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
+            create_worker_context = getattr(self, "_create_worker_context", None)
+            if create_worker_context is not None:
+                worker_args = (
+                    weakref.ref(self, weakref_cb),
+                    create_worker_context(),
+                    self._work_queue,
+                )
+            else:
+                worker_args = (
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,
+                    getattr(self, "_initializer", None),
+                    getattr(self, "_initargs", ()),
+                )
             t = threading.Thread(
                 name=thread_name,
                 target=_worker,
-                args=(
-                    weakref.ref(self, weakref_cb),
-                    self._work_queue,
-                    self._initializer,
-                    self._initargs,
-                ),
+                args=worker_args,
                 daemon=True,
             )
             t.start()
             self._threads.add(t)
+            try:
+                _threads_queues.__setitem__(t, self._work_queue)  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------

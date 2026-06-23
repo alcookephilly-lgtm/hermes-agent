@@ -1,18 +1,17 @@
 """Regression tests for subagent timeout diagnostic dump (issue #14726).
 
-When delegate_task's child subagent times out without having made any API
-call, a structured diagnostic file is written under
+When delegate_task's child subagent times out, a structured diagnostic file is
+written under
 ``~/.hermes/logs/subagent-timeout-<sid>-<ts>.log``. This gives users a
 concrete artifact to inspect (worker thread stack, system prompt size,
-tool schema bytes, credential pool state, etc.) instead of the previous
-opaque "subagent timed out" error.
+tool schema bytes, credential pool state, last message/tool summary, child
+session id, role id, etc.) instead of the previous opaque "subagent timed out"
+error.
 
 These tests pin:
 - the diagnostic writer's output format and content
-- the timeout branch in _run_single_child only dumps when api_calls == 0
+- the timeout branch in _run_single_child dumps for zero-call and post-API timeouts
 - the error message surfaces the diagnostic path
-- api_calls > 0 timeouts do NOT write a dump (the old "stuck on slow API
-  call" explanation still applies)
 """
 from __future__ import annotations
 
@@ -43,6 +42,7 @@ class _StubChild:
         tool_schema=None,
     ):
         self._subagent_id = subagent_id
+        self.session_id = f"session-{subagent_id}"
         self._delegate_depth = 1
         self._delegate_role = "leaf"
         self.model = "test/model"
@@ -64,6 +64,10 @@ class _StubChild:
         self._api_call_count = api_call_count
         self._hang = threading.Event()
         self._hang_seconds = hang_seconds
+        self._session_messages = [
+            {"role": "assistant", "tool_calls": [{"function": {"name": "terminal"}}]},
+            {"role": "tool", "content": "last tool output"},
+        ]
 
     def get_activity_summary(self):
         return {
@@ -122,6 +126,8 @@ class TestDumpSubagentTimeoutDiagnostic:
         # Timeout facts
         assert "task_index:        7" in content
         assert "subagent_id:       sa-7-abc123" in content
+        assert "child_session_id:  'session-sa-7-abc123'" in content
+        assert "role_id:           'leaf'" in content
         assert "configured_timeout: 300.0s" in content
         assert "actual_duration:   300.01s" in content
         # Goal
@@ -140,6 +146,10 @@ class TestDumpSubagentTimeoutDiagnostic:
         assert "tool_schema_bytes:" in content
         # Activity summary
         assert "api_call_count: 0" in content
+        assert "Last message / tool summary" in content
+        assert "terminal" in content
+        assert "last tool output" in content
+        assert "Next safe action" in content
         # Worker stack
         assert "Worker thread stack at timeout" in content
         # The thread is parked inside _hang.wait → cond.wait → waiter.acquire
@@ -232,7 +242,7 @@ class TestDumpSubagentTimeoutDiagnostic:
 
 class TestRunSingleChildTimeoutDump:
     """The timeout branch in _run_single_child must emit the diagnostic
-    dump when api_calls == 0, and must NOT emit it when api_calls > 0."""
+    dump for every timeout, including api_calls > 0."""
 
     def _invoke_with_short_timeout(self, child, monkeypatch):
         """Run _run_single_child with a tiny timeout to force the timeout branch."""
@@ -266,19 +276,18 @@ class TestRunSingleChildTimeoutDump:
         assert "Diagnostic:" in result["error"]
         assert str(dump_path) in result["error"]
 
-    def test_nonzero_api_calls_skips_dump_and_uses_old_message(self, hermes_home, monkeypatch):
+    def test_nonzero_api_calls_writes_diagnostic_packet(self, hermes_home, monkeypatch):
         child = _StubChild(api_call_count=5, hang_seconds=10.0)
         result = self._invoke_with_short_timeout(child, monkeypatch)
 
         assert result["status"] == "timeout"
         assert result["api_calls"] == 5
-        # No diagnostic file should be written for timeouts that made
-        # actual API calls — the old generic "stuck on slow call" message
-        # still applies.
-        assert result.get("diagnostic_path") is None
-        assert "stuck on a slow API call" in result["error"]
-        # And no subagent-timeout-* file should exist under logs/
-        logs_dir = hermes_home / "logs"
-        if logs_dir.is_dir():
-            dumps = list(logs_dir.glob("subagent-timeout-*.log"))
-            assert dumps == []
+        assert result.get("diagnostic_path") is not None
+        dump_path = Path(result["diagnostic_path"])
+        assert dump_path.is_file()
+        assert dump_path.parent == hermes_home / "logs"
+        assert "5 API call(s) completed" in result["error"]
+        assert "Diagnostic:" in result["error"]
+        content = dump_path.read_text()
+        assert "api_call_count: 5" in content
+        assert "Next safe action" in content

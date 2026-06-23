@@ -132,6 +132,26 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("YOUR TASK", prompt)
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_includes_index_first_robot_hand_discovery_block_in_order(self):
+        prompt = _build_child_system_prompt("Fix the tests")
+        self.assertIn("Index-First / Robot-Hand Code Discovery", prompt)
+        self.assertIn(
+            "Graphify report -> jcodemunch/jcode -> CodeGraph if initialized -> smart-read -> native read/search fallback only after named GAP.",
+            prompt,
+        )
+        self.assertIn("If CodeGraph is not initialized, report GAP.", prompt)
+        self.assertIn("Do not run codegraph init, codegraph uninit, or mutate MCP config unless explicitly approved.", prompt)
+
+        graphify_pos = prompt.index("Graphify report")
+        jcode_pos = prompt.index("jcodemunch/jcode")
+        codegraph_pos = prompt.index("CodeGraph if initialized")
+        smart_read_pos = prompt.index("smart-read")
+        fallback_pos = prompt.index("native read/search fallback only after named GAP")
+        self.assertLess(graphify_pos, jcode_pos)
+        self.assertLess(jcode_pos, codegraph_pos)
+        self.assertLess(codegraph_pos, smart_read_pos)
+        self.assertLess(smart_read_pos, fallback_pos)
+
     def test_goal_with_context(self):
         prompt = _build_child_system_prompt("Fix the tests", "Error: assertion failed in test_foo.py line 42")
         self.assertIn("Fix the tests", prompt)
