@@ -314,7 +314,10 @@ class WarroomGoalState:
             stale = "stale" if record.get("stale") else "not-stale"
             active_bits.append(f"{role}:{status}:{child_session}:last_seen={last_seen}:phase={phase}:{stale}")
         progress = "; ".join(active_bits) if active_bits else "no role records"
-        return f"WARROOM V3 {self.workflow}: {self.status} (role={self.current_role or 'none'}) progress=[{progress}]"
+        return (
+            f"WARROOM V3 {self.workflow}: {self.status} (role={self.current_role or 'none'}) "
+            f"{runtime_drift_line()} progress=[{progress}]"
+        )
 
 
 def _pid_is_alive(pid: int) -> bool:

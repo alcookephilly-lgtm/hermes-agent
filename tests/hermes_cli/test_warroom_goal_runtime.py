@@ -90,17 +90,18 @@ def test_notice_reports_runtime_drift_visibility(monkeypatch, tmp_path):
         lambda args, cwd: "bbbbbbbbbbbb2222" if args == ["rev-parse", "HEAD"] else None,
     )
 
-    notice = warroom_goal.notice_for_state(
-        warroom_goal.WarroomGoalState(workflow="global_plan_adversary", status="active")
-    )
+    state = warroom_goal.WarroomGoalState(workflow="global_plan_adversary", status="active")
+    notice = warroom_goal.notice_for_state(state)
+    status_line = state.status_line()
 
-    assert "Runtime drift:" in notice
-    assert "loaded_code_commit=aaaaaaaaaaaa" in notice
-    assert "repo_HEAD=bbbbbbbbbbbb" in notice
-    assert "stale=yes" in notice
-    assert "repo_head_mismatch" in notice
-    assert "loaded_file_changed_on_disk" in notice
-    assert f"loaded_code_path={loaded_file}" in notice
+    for rendered in (notice, status_line):
+        assert "Runtime drift:" in rendered
+        assert "loaded_code_commit=aaaaaaaaaaaa" in rendered
+        assert "repo_HEAD=bbbbbbbbbbbb" in rendered
+        assert "stale=yes" in rendered
+        assert "repo_head_mismatch" in rendered
+        assert "loaded_file_changed_on_disk" in rendered
+        assert f"loaded_code_path={loaded_file}" in rendered
 
 
 def test_notice_reports_runtime_not_stale_when_loaded_code_matches_repo(monkeypatch, tmp_path):
