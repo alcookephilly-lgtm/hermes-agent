@@ -32,6 +32,89 @@ REAL_DELEGATED_RUNTIME_GAP = (
     "local_process pid receipts are spawn_receipt_only"
 )
 
+
+def _sha256_file_optional(path: Path) -> Optional[str]:
+    try:
+        h = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _git_output(args: List[str], cwd: Path) -> Optional[str]:
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            text=True,
+            capture_output=True,
+            timeout=1,
+            check=False,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout.strip()
+    return out or None
+
+
+def _repo_root_for(path: Path) -> Optional[Path]:
+    for parent in [path.parent, *path.parents]:
+        if (parent / ".git").exists():
+            return parent
+    root = _git_output(["rev-parse", "--show-toplevel"], path.parent)
+    return Path(root) if root else None
+
+
+def _short_commit(value: Optional[str]) -> str:
+    return value[:12] if value else "unknown"
+
+
+_LOADED_CODE_PATH = Path(__file__).resolve()
+_LOADED_CODE_SHA256 = _sha256_file_optional(_LOADED_CODE_PATH)
+_LOADED_REPO_ROOT = _repo_root_for(_LOADED_CODE_PATH)
+_LOADED_GIT_HEAD = _git_output(["rev-parse", "HEAD"], _LOADED_REPO_ROOT) if _LOADED_REPO_ROOT else None
+
+
+def runtime_drift_status() -> Dict[str, Any]:
+    """Compare the code imported into this process with the repo on disk."""
+    current_file_sha = _sha256_file_optional(_LOADED_CODE_PATH)
+    current_repo_head = _git_output(["rev-parse", "HEAD"], _LOADED_REPO_ROOT) if _LOADED_REPO_ROOT else None
+    reasons: List[str] = []
+    if _LOADED_GIT_HEAD and current_repo_head and _LOADED_GIT_HEAD != current_repo_head:
+        reasons.append("repo_head_mismatch")
+    if _LOADED_CODE_SHA256 and current_file_sha and _LOADED_CODE_SHA256 != current_file_sha:
+        reasons.append("loaded_file_changed_on_disk")
+    return {
+        "loaded_code_commit": _LOADED_GIT_HEAD,
+        "repo_head_commit": current_repo_head,
+        "stale": bool(reasons),
+        "stale_reasons": reasons,
+        "loaded_code_path": str(_LOADED_CODE_PATH),
+        "repo_path": str(_LOADED_REPO_ROOT) if _LOADED_REPO_ROOT else "unknown",
+        "loaded_code_sha256": _LOADED_CODE_SHA256,
+        "current_file_sha256": current_file_sha,
+    }
+
+
+def runtime_drift_line() -> str:
+    status = runtime_drift_status()
+    reasons = ",".join(status["stale_reasons"]) if status["stale_reasons"] else "none"
+    stale = "yes" if status["stale"] else "no"
+    return (
+        "Runtime drift: "
+        f"loaded_code_commit={_short_commit(status['loaded_code_commit'])} "
+        f"repo_HEAD={_short_commit(status['repo_head_commit'])} "
+        f"stale={stale} "
+        f"reasons={reasons} "
+        f"loaded_code_path={status['loaded_code_path']} "
+        f"repo_path={status['repo_path']}"
+    )
+
 FAST_ROLES = ["controller", "builder", "adversary", "reviewer", "guardian"]
 PLAN_ROLES = ["controller", "plan_builder", "plan_adversary", "plan_reviewer"]
 BUILD_ROLES = ["builder", "adversary", "reviewer", "guardian"]
@@ -1038,11 +1121,13 @@ def notice_for_state(state: WarroomGoalState) -> str:
         return (
             f"WARROOM V3 {state.workflow} enforced state created.\n"
             f"Status: {state.status}. Controller active.\n"
+            f"{runtime_drift_line()}\n"
             f"GAP: {state.last_gap}"
         )
     return (
         f"WARROOM V3 {state.workflow} enforced state created.\n"
         f"Status: {state.status}. Controller active.\n"
+        f"{runtime_drift_line()}\n"
         "Required roles are spawned with persisted evidence or workflow blocks with explicit GAP."
     )
 

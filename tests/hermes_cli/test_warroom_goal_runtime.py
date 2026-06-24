@@ -54,6 +54,61 @@ def _unlock_runtime_for_policy_test(state):
     return state
 
 
+def test_notice_reports_runtime_drift_visibility(monkeypatch, tmp_path):
+    from hermes_cli import warroom_goal
+
+    loaded_file = tmp_path / "warroom_goal.py"
+    loaded_file.write_text("current file on disk", encoding="utf-8")
+    monkeypatch.setattr(warroom_goal, "_LOADED_CODE_PATH", loaded_file)
+    monkeypatch.setattr(warroom_goal, "_LOADED_CODE_SHA256", "loaded-sha")
+    monkeypatch.setattr(warroom_goal, "_LOADED_REPO_ROOT", tmp_path)
+    monkeypatch.setattr(warroom_goal, "_LOADED_GIT_HEAD", "aaaaaaaaaaaa1111")
+    monkeypatch.setattr(warroom_goal, "_sha256_file_optional", lambda path: "current-sha")
+    monkeypatch.setattr(
+        warroom_goal,
+        "_git_output",
+        lambda args, cwd: "bbbbbbbbbbbb2222" if args == ["rev-parse", "HEAD"] else None,
+    )
+
+    notice = warroom_goal.notice_for_state(
+        warroom_goal.WarroomGoalState(workflow="global_plan_adversary", status="active")
+    )
+
+    assert "Runtime drift:" in notice
+    assert "loaded_code_commit=aaaaaaaaaaaa" in notice
+    assert "repo_HEAD=bbbbbbbbbbbb" in notice
+    assert "stale=yes" in notice
+    assert "repo_head_mismatch" in notice
+    assert "loaded_file_changed_on_disk" in notice
+    assert f"loaded_code_path={loaded_file}" in notice
+
+
+def test_notice_reports_runtime_not_stale_when_loaded_code_matches_repo(monkeypatch, tmp_path):
+    from hermes_cli import warroom_goal
+
+    loaded_file = tmp_path / "warroom_goal.py"
+    loaded_file.write_text("same file", encoding="utf-8")
+    monkeypatch.setattr(warroom_goal, "_LOADED_CODE_PATH", loaded_file)
+    monkeypatch.setattr(warroom_goal, "_LOADED_CODE_SHA256", "same-sha")
+    monkeypatch.setattr(warroom_goal, "_LOADED_REPO_ROOT", tmp_path)
+    monkeypatch.setattr(warroom_goal, "_LOADED_GIT_HEAD", "cccccccccccc3333")
+    monkeypatch.setattr(warroom_goal, "_sha256_file_optional", lambda path: "same-sha")
+    monkeypatch.setattr(
+        warroom_goal,
+        "_git_output",
+        lambda args, cwd: "cccccccccccc3333" if args == ["rev-parse", "HEAD"] else None,
+    )
+
+    notice = warroom_goal.notice_for_state(
+        warroom_goal.WarroomGoalState(workflow="global_plan_adversary", status="active")
+    )
+
+    assert "loaded_code_commit=cccccccccccc" in notice
+    assert "repo_HEAD=cccccccccccc" in notice
+    assert "stale=no" in notice
+    assert "reasons=none" in notice
+
+
 def test_detect_warroom_goal_triggers_and_global_fallback():
     from hermes_cli.warroom_goal import detect_warroom_goal
 
