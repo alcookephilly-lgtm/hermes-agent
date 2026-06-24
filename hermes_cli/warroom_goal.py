@@ -27,6 +27,10 @@ STATE_VERSION = 3
 WARROOM_PLAN_WORKFLOWS = {"strict_plan_adversary", "global_plan_adversary"}
 ROLE_STALE_AFTER_SECONDS = 300.0
 TRACKING_DOC_SUFFIXES = {"", ".md", ".txt", ".json", ".jsonl", ".yaml", ".yml", ".log"}
+REAL_DELEGATED_RUNTIME_GAP = (
+    "real delegated role runtime missing: spawn_receipt_only receipts do not prove role execution; "
+    "local_process pid receipts are spawn_receipt_only"
+)
 
 FAST_ROLES = ["controller", "builder", "adversary", "reviewer", "guardian"]
 PLAN_ROLES = ["controller", "plan_builder", "plan_adversary", "plan_reviewer"]
@@ -592,6 +596,8 @@ def _start_roles_for_state(
     aggregate_path = evidence_dir / "role-spawn-evidence.json"
     state.role_spawn_evidence_path = str(aggregate_path)
     state.gates.setdefault("role_spawn", "pending")
+    relevant_roles = set(roles_to_start) | set(state.required_roles)
+    require_real_non_controller_runtime = any(role != "controller" for role in roles_to_start)
 
     missing_cards: List[str] = []
     failed_roles: List[str] = []
@@ -721,23 +727,37 @@ def _start_roles_for_state(
         state.required_action = "blocked_gap"
     else:
         state.gates["role_cards"] = "pass"
-        state.gates["role_spawn"] = "pass"
         adapters = {str(r.get("adapter") or "") for r in state.role_records.values()}
-        real_children = any(r.get("child_session_id") or r.get("delegation_id") for r in state.role_records.values())
-        if not real_children and adapters and adapters <= {"controller_state", "local_process"}:
-            state.gates["delegate_runtime"] = "stub_only"
+        real_non_controller_children = any(
+            role != "controller" and (record.get("child_session_id") or record.get("delegation_id"))
+            for role, record in state.role_records.items()
+            if role in relevant_roles
+        )
+        delegate_runtime_gate = "pass"
+        if not real_non_controller_children and adapters and adapters <= {"controller_state", "local_process"}:
+            delegate_runtime_gate = "stub_only"
+        elif not real_non_controller_children:
+            delegate_runtime_gate = "gap"
+
+        if require_real_non_controller_runtime and not real_non_controller_children:
+            state.status = "gap"
+            state.gates["role_spawn"] = "gap"
+            state.gates["delegate_runtime"] = delegate_runtime_gate
             state.delegate_runtime_available = False
-            state.gate_evidence.setdefault("delegate_runtime", []).append(
-                "local_process role receipts prove spawn receipt only; real delegated work requires child_session_id/delegation_id"
-            )
+            state.gate_evidence.setdefault("delegate_runtime", []).append(REAL_DELEGATED_RUNTIME_GAP)
+            state.role_spawn_gap = REAL_DELEGATED_RUNTIME_GAP
+            state.last_gap = REAL_DELEGATED_RUNTIME_GAP
+            state.required_action = "blocked_gap"
         else:
-            state.gates["delegate_runtime"] = "pass"
-            state.delegate_runtime_available = True
+            state.gates["role_spawn"] = "pass"
+            state.gates["delegate_runtime"] = delegate_runtime_gate
+            state.delegate_runtime_available = delegate_runtime_gate == "pass"
+            state.required_action = None
+            state.role_spawn_gap = None
+            state.last_gap = None
+            if state.status == "gap":
+                state.status = "active"
         state.role_spawn_adapter = "mixed" if len({r.get("adapter") for r in state.role_records.values()}) > 1 else next(iter(state.role_records.values())).get("adapter")
-        state.required_action = None
-        state.role_spawn_gap = None
-        if state.status == "gap" and not state.last_gap:
-            state.status = "active"
     _write_json(aggregate_path, {"session_id": state.session_id, "workflow": state.workflow, "records": state.role_records})
     return state
 
@@ -996,7 +1016,7 @@ def controller_kickoff_prompt(state: WarroomGoalState) -> str:
 
 
 def notice_for_state(state: WarroomGoalState) -> str:
-    if state.status == "blocked" and state.last_gap:
+    if state.status in {"blocked", "gap"} and state.last_gap:
         return (
             f"WARROOM V3 {state.workflow} enforced state created.\n"
             f"Status: {state.status}. Controller active.\n"
@@ -1135,6 +1155,8 @@ def enforce_tool_policy(session_id: str, tool_name: str, args: Dict[str, Any]) -
             return f"WARROOM V3 blocked: {parser_block_reason}"
         return None
     state = _auto_start_build_roles_if_ready(session_id, state)
+    if state.status in {"halted", "gap"}:
+        return f"WARROOM V3 blocked: workflow is {state.status} ({state.halt_reason or state.last_gap or 'no reason recorded'})."
     if state.required_action == "spawn_roles":
         return "WARROOM V3 blocked: required role spawn action is pending; normal chat/tool fallback denied."
 
@@ -1151,10 +1173,13 @@ def enforce_tool_policy(session_id: str, tool_name: str, args: Dict[str, Any]) -
             return f"WARROOM V3 blocked: role {state.current_role} cannot spawn delegate_task. Controller owns orchestration."
         if state.gates.get("role_spawn") != "pass":
             state.status = "gap"
+            state.gates["role_spawn"] = "gap"
             state.gates["delegate_runtime"] = "gap"
-            state.last_gap = "required roles not spawned before delegate_task"
+            state.role_spawn_gap = state.role_spawn_gap or REAL_DELEGATED_RUNTIME_GAP
+            state.last_gap = state.role_spawn_gap
+            state.required_action = "blocked_gap"
             save_warroom_goal(session_id, state)
-            return "WARROOM V3 GAP: required role spawn evidence missing; agents were not pretended to fire."
+            return f"WARROOM V3 GAP: {state.last_gap}"
         return None
 
     if not mutating:

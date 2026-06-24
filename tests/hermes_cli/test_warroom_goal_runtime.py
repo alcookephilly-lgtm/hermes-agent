@@ -43,6 +43,17 @@ def _strict_goal(
     )
 
 
+def _unlock_runtime_for_policy_test(state):
+    state.status = "active"
+    state.gates["role_spawn"] = "pass"
+    state.gates["delegate_runtime"] = "pass"
+    state.delegate_runtime_available = True
+    state.required_action = None
+    state.role_spawn_gap = None
+    state.last_gap = None
+    return state
+
+
 def test_detect_warroom_goal_triggers_and_global_fallback():
     from hermes_cli.warroom_goal import detect_warroom_goal
 
@@ -127,10 +138,12 @@ def test_global_goal_creates_plan_roles_without_budget_or_fallback(hermes_home, 
     )
     assert state.workflow == "global_plan_adversary"
     assert state.required_roles == ["controller", "plan_builder", "plan_adversary", "plan_reviewer"]
-    assert state.gates["role_spawn"] == "pass"
+    assert state.status == "gap"
+    assert state.gates["role_spawn"] == "gap"
     assert state.gates["delegate_runtime"] == "stub_only"
     assert state.delegate_runtime_available is False
-    assert state.required_action is None
+    assert state.required_action == "blocked_gap"
+    assert "real delegated role runtime missing" in (state.last_gap or "")
     assert "50" not in state.gates
 
     handled = handle_global_goal_slash(
@@ -212,6 +225,7 @@ def test_strict_state_requires_plan_before_mutation(hermes_home, tmp_path):
         allowed_mutation_root=str(tmp_path),
     )
     from hermes_cli.warroom_goal import save_warroom_goal
+    _unlock_runtime_for_policy_test(state)
     state.current_role = "builder"
     save_warroom_goal("sid-strict", state)
     msg = enforce_tool_policy("sid-strict", "write_file", {"path": str(tmp_path / "x.py")})
@@ -262,6 +276,7 @@ def test_tool_policy_blocks_reviewer_and_skill_dir_mutation(hermes_home, tmp_pat
         tracking_dir=str(tmp_path),
         allowed_mutation_root=str(tmp_path),
     )
+    _unlock_runtime_for_policy_test(state)
     state.current_role = "reviewer"
     save_warroom_goal("sid-policy", state)
     assert "reviewer" in enforce_tool_policy("sid-policy", "write_file", {"path": str(tmp_path / "x.py")}).lower()
@@ -373,6 +388,8 @@ def test_tracking_gate_blocks_builder_mutation(hermes_home, tmp_path):
         tracking_dir=str(missing_tracking),
         allowed_mutation_root=str(tmp_path),
     )
+    _unlock_runtime_for_policy_test(state)
+    state.gates["tracking"] = "blocked"
     state.current_role = "builder"
     save_warroom_goal("sid-tracking-block", state)
     msg = enforce_tool_policy("sid-tracking-block", "write_file", {"path": str(tmp_path / "x.py")})
@@ -391,10 +408,12 @@ def test_role_spawn_success_persists_ids_hashes_and_evidence(hermes_home, tmp_pa
         allowed_mutation_root=str(tmp_path),
     )
 
-    assert state.gates["role_spawn"] == "pass"
+    assert state.status == "gap"
+    assert state.gates["role_spawn"] == "gap"
     assert state.gates["delegate_runtime"] == "stub_only"
     assert state.delegate_runtime_available is False
-    assert state.required_action is None
+    assert state.required_action == "blocked_gap"
+    assert "real delegated role runtime missing" in (state.last_gap or "")
     assert set(state.role_records) == {"controller", "builder", "adversary", "reviewer", "guardian"}
     for role, record in state.role_records.items():
         assert record["role_card_sha256"]
@@ -403,6 +422,25 @@ def test_role_spawn_success_persists_ids_hashes_and_evidence(hermes_home, tmp_pa
         assert role == "controller" or record["runtime_kind"] == "spawn_receipt"
         assert role == "controller" or record["spawn_receipt_only"] is True
     assert Path(state.role_spawn_evidence_path).exists()
+
+
+def test_fake_local_role_spawn_blocks_manual_fallback_with_runtime_gap(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy
+
+    create_warroom_goal(
+        "sid-fake-runtime-gap",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+
+    blocked_write = enforce_tool_policy("sid-fake-runtime-gap", "write_file", {"path": str(tmp_path / "x.py")})
+    assert blocked_write is not None
+    assert "real delegated role runtime missing" in blocked_write
+
+    blocked_delegate = enforce_tool_policy("sid-fake-runtime-gap", "delegate_task", {"task": "fallback"})
+    assert blocked_delegate is not None
+    assert "real delegated role runtime missing" in blocked_delegate
 
 
 def test_missing_role_card_blocks_spawn_with_explicit_gap(hermes_home, tmp_path):
@@ -442,8 +480,11 @@ def test_strict_plan_starts_plan_roles_then_build_roles_after_gates(hermes_home,
     state.gates["tracking"] = "pass"
     save_warroom_goal("sid-plan-sequence", state)
     advanced = start_plan_build_roles_if_ready("sid-plan-sequence")
+    assert advanced is not None
     assert {"builder", "adversary", "reviewer", "guardian"}.issubset(set(advanced.role_records))
-    assert advanced.gates["build_role_spawn"] == "pass"
+    assert advanced.gates["build_role_spawn"] == "gap"
+    assert advanced.required_action == "blocked_gap"
+    assert "real delegated role runtime missing" in (advanced.last_gap or "")
 
 
 def test_builder_self_report_cannot_unlock_guardian_final_gate(hermes_home, tmp_path):
@@ -526,6 +567,9 @@ def test_role_ledger_distinguishes_real_child_session_stale_pid_and_status_line(
 
     updated = start_warroom_roles("sid-real-child", ["reviewer"], adapter=adapter, use_local_process=False)
     assert updated is not None
+    assert updated.gates["role_spawn"] == "pass"
+    assert updated.gates["delegate_runtime"] == "pass"
+    assert updated.required_action is None
     record = updated.role_records["reviewer"]
     assert record["runtime_kind"] == "real_child_session"
     assert record["spawn_receipt_only"] is False
@@ -568,6 +612,7 @@ def test_controller_can_write_tracking_docs_but_not_source(hermes_home, tmp_path
         tracking_dir=str(tmp_path / ".warroom"),
         allowed_mutation_root=str(tmp_path),
     )
+    _unlock_runtime_for_policy_test(state)
     state.current_role = "controller"
     save_warroom_goal("sid-controller-tracking", state)
 
@@ -636,6 +681,7 @@ def test_terminal_and_execute_code_fail_closed_for_non_builder_and_builder_scope
         tracking_dir=str(tmp_path),
         allowed_mutation_root=str(tmp_path),
     )
+    _unlock_runtime_for_policy_test(state)
     state.current_role = "reviewer"
     save_warroom_goal("sid-terminal-policy", state)
     assert "reviewer" in enforce_tool_policy("sid-terminal-policy", "terminal", {"command": "touch x"}).lower()
@@ -744,18 +790,60 @@ def test_core_run_conversation_slash_goal_reaches_runtime_without_user_nudge(her
     agent = SimpleNamespace(
         session_id="sid-core-global-goal",
         api_mode="codex_app_server",
+        model="test-model",
+        provider="test-provider",
+        base_url=None,
+        platform="cli",
+        max_iterations=50,
+        iteration_budget=SimpleNamespace(remaining=50, used=0, max_total=50),
+        quiet_mode=True,
+        session_input_tokens=0,
+        session_output_tokens=0,
+        session_cache_read_tokens=0,
+        session_cache_write_tokens=0,
+        session_reasoning_tokens=0,
+        session_prompt_tokens=0,
+        session_completion_tokens=0,
+        session_total_tokens=0,
+        session_estimated_cost_usd=0.0,
+        session_cost_status="ok",
+        session_cost_source="test",
+        context_compressor=SimpleNamespace(last_prompt_tokens=0),
+        _tool_guardrail_halt_decision=None,
+        _response_was_previewed=False,
+        _interrupt_message=None,
+        _stream_callback=None,
+        _turn_failed_file_mutations={},
+        _skill_nudge_interval=0,
+        _iters_since_skill=0,
+        valid_tool_names=set(),
         _run_codex_app_server_turn=fake_codex_turn,
+        _save_trajectory=lambda *a, **k: None,
+        _cleanup_task_resources=lambda *a, **k: None,
+        _drop_trailing_empty_response_scaffolding=lambda *a, **k: None,
+        _persist_session=lambda *a, **k: None,
+        _turn_completion_explainer_enabled=lambda: False,
+        _file_mutation_verifier_enabled=lambda: False,
+        _format_file_mutation_failure_footer=lambda *a, **k: "",
+        _format_turn_completion_explanation=lambda *a, **k: "",
+        _drain_pending_steer=lambda: None,
+        _sync_external_memory_for_turn=lambda *a, **k: None,
+        _spawn_background_review=lambda *a, **k: None,
+        clear_interrupt=lambda: None,
+        _safe_print=lambda *a, **k: None,
+        _emit_status=lambda *a, **k: None,
+        _handle_max_iterations=lambda *a, **k: "",
     )
 
     result = conversation_loop.run_conversation(agent, "/goal core API ingress hardwire")
 
-    assert result["final_response"] == "controller drove"
-    assert captured["user_message"].startswith("/goal core API ingress hardwire")
-    assert "WARROOM V3 CONTROLLER" in captured["user_message"]
-    assert captured["messages"][0]["content"] == "/goal core API ingress hardwire"
+    assert "WARROOM V3 global_plan_adversary enforced state created." in result["final_response"]
+    assert "real delegated role runtime missing" in result["final_response"]
+    assert captured == {}
     state = load_warroom_goal("sid-core-global-goal")
-    assert state.gates["controller_kickoff"] == "pass"
-    assert "same_turn_model_context_injected" in state.gate_evidence["controller_kickoff"]
+    assert state is not None
+    assert state.status == "gap"
+    assert state.gates.get("controller_kickoff") is None
 
 
 def test_acp_goal_command_uses_global_hardwire_without_goalmanager(hermes_home, tmp_path):
@@ -772,8 +860,8 @@ def test_acp_goal_command_uses_global_hardwire_without_goalmanager(hermes_home, 
     response = HermesACPAgent._cmd_goal(server, "ACP ingress hardwire", state)
 
     assert "WARROOM V3 global_plan_adversary" in response
-    assert state.queued_prompts
-    assert "WARROOM V3 CONTROLLER" in state.queued_prompts[0]
+    assert "real delegated role runtime missing" in response
+    assert state.queued_prompts == []
     assert GoalManager("sid-acp-global-goal").state is None
     assert load_warroom_goal("sid-acp-global-goal").workflow == "global_plan_adversary"
 
@@ -811,15 +899,20 @@ def test_plan_build_roles_auto_start_when_builder_mutation_reaches_policy(hermes
         allowed_mutation_root=str(tmp_path),
     )
     assert set(state.role_records) == {"controller", "plan_builder", "plan_adversary", "plan_reviewer"}
+    _unlock_runtime_for_policy_test(state)
     state.gates["plan"] = "pass"
     state.gates["tracking"] = "pass"
     state.current_role = "builder"
     save_warroom_goal("sid-auto-build-roles", state)
 
-    assert enforce_tool_policy("sid-auto-build-roles", "write_file", {"path": str(tmp_path / "x.py")}) is None
+    blocked = enforce_tool_policy("sid-auto-build-roles", "write_file", {"path": str(tmp_path / "x.py")})
+    assert blocked is not None
+    assert "real delegated role runtime missing" in blocked
     updated = load_warroom_goal("sid-auto-build-roles")
+    assert updated is not None
     assert {"builder", "adversary", "reviewer", "guardian"}.issubset(updated.role_records)
-    assert updated.gates["build_role_spawn"] == "pass"
+    assert updated.gates["build_role_spawn"] == "gap"
+    assert updated.required_action == "blocked_gap"
 
 
 def test_noncritical_stop_phrase_is_auto_continued_in_final_guard(hermes_home, tmp_path):
