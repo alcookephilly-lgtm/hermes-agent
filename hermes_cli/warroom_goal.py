@@ -115,6 +115,63 @@ def runtime_drift_line() -> str:
         f"repo_path={status['repo_path']}"
     )
 
+
+def _role_delegate_goal(state: "WarroomGoalState", role: str, role_card_path: str, evidence_path: str) -> str:
+    try:
+        role_card_text = Path(role_card_path).read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        role_card_text = f"<role card read failed: {exc}>"
+    return (
+        "[WARROOM V3 ROLE DISPATCH]\n"
+        f"Role: {role}\n"
+        f"Workflow: {state.workflow}\n"
+        f"Parent session: {state.session_id}\n"
+        f"Tracking dir: {state.tracking_dir or ''}\n"
+        f"Allowed mutation root: {state.allowed_mutation_root or ''}\n"
+        f"Evidence path: {evidence_path}\n\n"
+        "Follow the role card exactly. If you perform or verify work, write concise evidence to the evidence path.\n"
+        "Do not claim final completion; Guardian/final gate owns closure.\n\n"
+        f"Goal:\n{state.original_goal}\n\n"
+        f"Role card ({role_card_path}):\n{role_card_text}"
+    )
+
+
+def _native_background_delegate_adapter(parent_agent: Any):
+    def _adapter(*, role: str, role_card_path: str, evidence_path: str, state: "WarroomGoalState") -> Dict[str, Any]:
+        from tools.delegate_tool import delegate_task
+
+        raw = delegate_task(
+            goal=_role_delegate_goal(state, role, role_card_path, evidence_path),
+            context=(
+                "Warroom runtime role dispatch. Return role-specific findings/evidence only. "
+                "Parent Controller remains source of orchestration truth."
+            ),
+            toolsets=["terminal", "file", "search", "session_search"],
+            role="leaf",
+            background=True,
+            parent_agent=parent_agent,
+        )
+        try:
+            payload = json.loads(raw)
+        except Exception as exc:
+            raise RuntimeError(f"native delegate returned non-JSON response: {raw!r}") from exc
+        if payload.get("error"):
+            raise RuntimeError(str(payload.get("error")))
+        delegation_id = str(payload.get("delegation_id") or "").strip()
+        if not delegation_id:
+            raise RuntimeError(f"native delegate did not return delegation_id: {payload}")
+        return {
+            "adapter": "native_delegate_background",
+            "delegation_id": delegation_id,
+            "runtime_id": delegation_id,
+            "exit_code": 0,
+            "stdout": raw,
+            "json_payload": payload,
+            "current_phase": "background_dispatched",
+        }
+
+    return _adapter
+
 FAST_ROLES = ["controller", "builder", "adversary", "reviewer", "guardian"]
 PLAN_ROLES = ["controller", "plan_builder", "plan_adversary", "plan_reviewer"]
 BUILD_ROLES = ["builder", "adversary", "reviewer", "guardian"]
@@ -422,6 +479,7 @@ def handle_global_goal_slash(
     *,
     tracking_dir: Optional[str] = None,
     allowed_mutation_root: Optional[str] = None,
+    parent_agent: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """Pre-model global /goal router for surfaces without slash dispatch.
 
@@ -452,6 +510,7 @@ def handle_global_goal_slash(
             arg,
             tracking_dir=tracking_dir,
             allowed_mutation_root=allowed_mutation_root,
+            parent_agent=parent_agent,
         )
         return {
             "handled": True,
@@ -1029,6 +1088,7 @@ def create_warroom_goal(
     *,
     tracking_dir: Optional[str] = None,
     allowed_mutation_root: Optional[str] = None,
+    parent_agent: Optional[Any] = None,
 ) -> WarroomGoalState:
     detection = detect_warroom_goal(arg)
     if detection is None:
@@ -1095,7 +1155,8 @@ def create_warroom_goal(
         final_claim_allowed=False,
     )
     if state.status == "active":
-        state = _start_roles_for_state(state)
+        role_adapter = _native_background_delegate_adapter(parent_agent) if parent_agent is not None else None
+        state = _start_roles_for_state(state, adapter=role_adapter, use_local_process=parent_agent is None)
     save_warroom_goal(session_id, state)
     return state
 

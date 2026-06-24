@@ -1781,6 +1781,7 @@ class HermesACPAgent(acp.Agent):
             state.session_id,
             f"/goal {args}".strip(),
             allowed_mutation_root=str(state.cwd or Path.cwd()),
+            parent_agent=getattr(state, "agent", None),
         )
         if result is None:
             return "WARROOM V3 GAP: /goal hardwire did not handle command."

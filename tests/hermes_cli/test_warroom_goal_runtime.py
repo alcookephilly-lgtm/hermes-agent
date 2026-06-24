@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pytest
 
@@ -52,6 +53,25 @@ def _unlock_runtime_for_policy_test(state):
     state.role_spawn_gap = None
     state.last_gap = None
     return state
+
+
+def _fake_background_delegate(monkeypatch):
+    calls = []
+
+    def fake_delegate_task(**kwargs):
+        calls.append(kwargs)
+        return json.dumps(
+            {
+                "status": "dispatched",
+                "delegation_id": f"delegation-{len(calls)}",
+                "mode": "background",
+            }
+        )
+
+    import tools.delegate_tool as delegate_tool
+
+    monkeypatch.setattr(delegate_tool, "delegate_task", fake_delegate_task)
+    return calls
 
 
 def test_notice_reports_runtime_drift_visibility(monkeypatch, tmp_path):
@@ -182,7 +202,7 @@ def test_detect_warroom_goal_accepts_acceptance_and_constraints_variants(accepta
     assert strict.missing_sections == []
 
 
-def test_global_goal_creates_plan_roles_without_budget_or_fallback(hermes_home, tmp_path):
+def test_global_goal_creates_plan_roles_without_budget_or_fallback(hermes_home, tmp_path, monkeypatch):
     from hermes_cli.warroom_goal import create_warroom_goal, handle_global_goal_slash, load_warroom_goal
 
     state = create_warroom_goal(
@@ -210,6 +230,32 @@ def test_global_goal_creates_plan_roles_without_budget_or_fallback(hermes_home, 
     assert handled is not None
     assert "WARROOM V3 global_plan_adversary" in handled["response"]
     assert load_warroom_goal("sid-global-api").workflow == "global_plan_adversary"
+
+    calls = _fake_background_delegate(monkeypatch)
+    parent_agent = object()
+    handled_live = handle_global_goal_slash(
+        "sid-global-api-live",
+        "/goal ship from API ingress",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+        parent_agent=parent_agent,
+    )
+    live_state = load_warroom_goal("sid-global-api-live")
+    assert handled_live is not None
+    assert live_state is not None
+    assert handled_live["kickoff"] is not None
+    assert "real delegated role runtime missing" not in handled_live["response"]
+    assert live_state.status == "active"
+    assert live_state.gates["role_spawn"] == "pass"
+    assert live_state.gates["delegate_runtime"] == "pass"
+    assert live_state.delegate_runtime_available is True
+    assert len(calls) == 3
+    assert {r["delegation_id"] for r in live_state.role_records.values() if r.get("delegation_id")} == {
+        "delegation-1",
+        "delegation-2",
+        "delegation-3",
+    }
+    assert all(call["background"] is True and call["parent_agent"] is parent_agent for call in calls)
 
 
 def test_create_fast_state_persists_roles_and_gates(hermes_home, tmp_path):
@@ -982,6 +1028,7 @@ def test_core_run_conversation_slash_goal_reaches_runtime_without_user_nudge(her
         return {"final_response": "controller drove", "messages": kwargs["messages"], "api_call_count": 1}
 
     monkeypatch.setattr(conversation_loop, "build_turn_context", fake_context)
+    delegate_calls = _fake_background_delegate(monkeypatch)
     agent = SimpleNamespace(
         session_id="sid-core-global-goal",
         api_mode="codex_app_server",
@@ -1032,16 +1079,19 @@ def test_core_run_conversation_slash_goal_reaches_runtime_without_user_nudge(her
 
     result = conversation_loop.run_conversation(agent, "/goal core API ingress hardwire")
 
-    assert "WARROOM V3 global_plan_adversary enforced state created." in result["final_response"]
-    assert "real delegated role runtime missing" in result["final_response"]
-    assert captured == {}
+    assert result["final_response"] == "controller drove"
+    assert len(delegate_calls) == 3
+    assert captured != {}
+    assert "WARROOM V3 global_plan_adversary enforced state created." in captured["user_message"]
+    assert "real delegated role runtime missing" not in captured["user_message"]
     state = load_warroom_goal("sid-core-global-goal")
     assert state is not None
-    assert state.status == "gap"
-    assert state.gates.get("controller_kickoff") is None
+    assert state.status == "active"
+    assert state.gates["delegate_runtime"] == "pass"
+    assert state.gates["controller_kickoff"] == "pass"
 
 
-def test_acp_goal_command_uses_global_hardwire_without_goalmanager(hermes_home, tmp_path):
+def test_acp_goal_command_uses_global_hardwire_without_goalmanager(hermes_home, tmp_path, monkeypatch):
     pytest.importorskip("acp")
     from types import SimpleNamespace
     from acp_adapter.server import HermesACPAgent
@@ -1050,15 +1100,22 @@ def test_acp_goal_command_uses_global_hardwire_without_goalmanager(hermes_home, 
 
     server = object.__new__(HermesACPAgent)
     server.session_manager = SimpleNamespace(save_session=lambda session_id: None)
-    state = SimpleNamespace(session_id="sid-acp-global-goal", cwd=tmp_path, queued_prompts=[])
+    parent_agent = SimpleNamespace(session_id="sid-acp-global-goal")
+    calls = _fake_background_delegate(monkeypatch)
+    state = SimpleNamespace(session_id="sid-acp-global-goal", cwd=tmp_path, queued_prompts=[], agent=parent_agent)
 
     response = HermesACPAgent._cmd_goal(server, "ACP ingress hardwire", state)
 
     assert "WARROOM V3 global_plan_adversary" in response
-    assert "real delegated role runtime missing" in response
-    assert state.queued_prompts == []
+    assert "real delegated role runtime missing" not in response
+    assert state.queued_prompts
+    assert "WARROOM V3 CONTROLLER" in state.queued_prompts[0]
+    assert len(calls) == 3
     assert GoalManager("sid-acp-global-goal").state is None
-    assert load_warroom_goal("sid-acp-global-goal").workflow == "global_plan_adversary"
+    state_record = load_warroom_goal("sid-acp-global-goal")
+    assert state_record is not None
+    assert state_record.workflow == "global_plan_adversary"
+    assert state_record.gates["delegate_runtime"] == "pass"
 
 
 

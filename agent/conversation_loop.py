@@ -525,6 +525,7 @@ def run_conversation(
             agent.session_id or "",
             original_user_message if isinstance(original_user_message, str) else user_message,
             allowed_mutation_root=os.getenv("TERMINAL_CWD") or os.getcwd(),
+            parent_agent=agent,
         )
     except Exception as _goal_exc:
         _goal_handled = {
