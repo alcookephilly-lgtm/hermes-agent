@@ -51,14 +51,32 @@ ALL_ROLES = [
 REQUIRED_SECTION_INTENTS = ("Acceptance", "Constraints", "Verify with")
 HEADING_PREFIX_RE = re.compile(r"^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)")
 MUTATING_TOOLS = {"write_file", "patch", "skill_manage"}
+READ_ONLY_RECOVERY_TOOLS = {"read_file", "search_files", "session_search", "skill_view", "skills_list"}
+READ_ONLY_PROCESS_ACTIONS = {"list", "poll", "log", "wait"}
 FINAL_CLAIM_RE = re.compile(r"\b(done|fixed|complete|completed|shipped|hardwired)\b", re.I)
 NEGATED_CLAIM_RE = re.compile(r"\b(not|no|isn[’\']t|is not|still|remain(?:s|ing)?|open|failed|blocked|gap)\b", re.I)
 E2E_CLAIM_RE = re.compile(r"\be2e\b|end[- ]to[- ]end", re.I)
 HEALTH_ONLY_RE = re.compile(r"health check|/health|status endpoint", re.I)
 E2E_EVIDENCE_RE = re.compile(r"pytest|playwright|browser|selenium|end[- ]to[- ]end test|e2e test", re.I)
+SAFE_TERMINAL_REDIRECT_RE = re.compile(r"(?:^|[\s;&|])\d?>\s*/dev/null\b|(?:^|[\s;&|])\d?>&\d\b")
+FILE_TERMINAL_REDIRECT_RE = re.compile(r"(?:^|[\s;&|])\d?>>?\s*\S")
 DESTRUCTIVE_TERMINAL_RE = re.compile(
     r"\b(rm\s+-|mv\s+|cp\s+|touch\s+|mkdir\s+|chmod\s+|chown\s+|sed\s+-i|git\s+(?:reset|clean|checkout|restore)\b|python\b.*\b(write|write_text|write_bytes|unlink|remove|rmtree)\b|tee\s+|>>\s*\S|>\s*\S)",
     re.I,
+)
+ADMIN_MUTATING_TERMINAL_RE = re.compile(
+    r"""
+    \b(
+        systemctl\s+(?:start|stop|restart|reload|enable|disable|mask|unmask)\b
+        |service\s+(?:\S+\s+)?(?:start|stop|restart|reload|enable|disable|mask|unmask)\b
+        |docker\s+(?:(?:start|stop|restart|rm|rmi|run|build|pull|push)\b|compose\s+(?:up|down|restart)\b)
+        |kubectl\s+(?:apply|delete|patch|create|scale|set|rollout\s+restart)\b
+        |(?:apt|apt-get|dnf|yum|pip|npm)\s+(?:install|remove|purge|upgrade|update|uninstall)\b
+        |git\s+(?:push|commit|merge|rebase|cherry-pick|am|apply)\b
+        |(?:^|[;&|]|['\"])\s*(?:kill|pkill|killall)\b
+    )
+    """,
+    re.I | re.X,
 )
 EXECUTE_CODE_WRITE_RE = re.compile(r"\b(open\(.+['\"]w|write_text\(|write_bytes\(|shutil\.rmtree|os\.remove|Path\(.+\)\.unlink)", re.I)
 ALLOWED_HALT_REASONS = [
@@ -1102,12 +1120,37 @@ def _parser_block_reason(state: WarroomGoalState) -> Optional[str]:
 
 def _terminal_mutates(args: Dict[str, Any]) -> bool:
     cmd = str(args.get("command") or "")
-    return bool(DESTRUCTIVE_TERMINAL_RE.search(cmd) or ">>" in cmd)
+    sanitized = SAFE_TERMINAL_REDIRECT_RE.sub(" ", cmd)
+    return bool(
+        DESTRUCTIVE_TERMINAL_RE.search(sanitized)
+        or ADMIN_MUTATING_TERMINAL_RE.search(sanitized)
+        or FILE_TERMINAL_REDIRECT_RE.search(sanitized)
+    )
 
 
 def _execute_code_mutates(args: Dict[str, Any]) -> bool:
     code = str(args.get("code") or "")
     return bool(EXECUTE_CODE_WRITE_RE.search(code))
+
+
+def _tool_mutates(tool_name: str, args: Dict[str, Any]) -> bool:
+    if tool_name == "terminal":
+        return _terminal_mutates(args)
+    if tool_name in {"execute_code", "delegate_task"}:
+        return True
+    if tool_name == "process":
+        return str(args.get("action") or "") not in READ_ONLY_PROCESS_ACTIONS
+    return tool_name in MUTATING_TOOLS
+
+
+def _read_only_recovery_tool_allowed(tool_name: str, args: Dict[str, Any]) -> bool:
+    if tool_name in READ_ONLY_RECOVERY_TOOLS:
+        return True
+    if tool_name == "terminal":
+        return not _terminal_mutates(args)
+    if tool_name == "process":
+        return str(args.get("action") or "") in READ_ONLY_PROCESS_ACTIONS
+    return False
 
 
 def _plan_build_roles_missing(state: WarroomGoalState) -> bool:
@@ -1141,34 +1184,27 @@ def enforce_tool_policy(session_id: str, tool_name: str, args: Dict[str, Any]) -
     if state is None or state.status == "done":
         return None
     if state.status in {"halted", "gap"}:
+        if _read_only_recovery_tool_allowed(tool_name, args):
+            return None
         return f"WARROOM V3 blocked: workflow is {state.status} ({state.halt_reason or state.last_gap or 'no reason recorded'})."
     parser_block_reason = _parser_block_reason(state)
     if parser_block_reason:
-        if tool_name == "delegate_task":
-            return f"WARROOM V3 blocked: {parser_block_reason}"
-        mutating = tool_name in MUTATING_TOOLS
-        if tool_name == "terminal":
-            mutating = _terminal_mutates(args)
-        elif tool_name == "execute_code":
-            mutating = True
-        if mutating:
+        if _tool_mutates(tool_name, args):
             return f"WARROOM V3 blocked: {parser_block_reason}"
         return None
     state = _auto_start_build_roles_if_ready(session_id, state)
     if state.status in {"halted", "gap"}:
+        if _read_only_recovery_tool_allowed(tool_name, args):
+            return None
         return f"WARROOM V3 blocked: workflow is {state.status} ({state.halt_reason or state.last_gap or 'no reason recorded'})."
     if state.required_action == "spawn_roles":
         return "WARROOM V3 blocked: required role spawn action is pending; normal chat/tool fallback denied."
 
-    mutating = tool_name in MUTATING_TOOLS
+    mutating = _tool_mutates(tool_name, args)
     # Terminal can be read-only proof work for Controller. Only mutating shell
     # commands are builder-only; execute_code remains mutation-capable because
     # arbitrary Python is too broad for role-policy proof.
-    if tool_name == "terminal":
-        mutating = _terminal_mutates(args)
-    elif tool_name == "execute_code":
-        mutating = True
-    elif tool_name == "delegate_task":
+    if tool_name == "delegate_task":
         if state.current_role not in {"controller", None}:
             return f"WARROOM V3 blocked: role {state.current_role} cannot spawn delegate_task. Controller owns orchestration."
         if state.gates.get("role_spawn") != "pass":

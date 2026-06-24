@@ -443,6 +443,112 @@ def test_fake_local_role_spawn_blocks_manual_fallback_with_runtime_gap(hermes_ho
     assert "real delegated role runtime missing" in blocked_delegate
 
 
+
+def test_halted_state_allows_read_only_recovery_tools_but_blocks_mutation(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, halt_warroom_goal
+
+    create_warroom_goal(
+        "sid-halted-recovery",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    halted = halt_warroom_goal("sid-halted-recovery", reason="explicit_user_stop")
+    assert halted is not None
+    assert halted.status == "halted"
+
+    assert enforce_tool_policy("sid-halted-recovery", "session_search", {}) is None
+    assert enforce_tool_policy("sid-halted-recovery", "read_file", {"path": str(tmp_path / "proof.log")}) is None
+    assert enforce_tool_policy("sid-halted-recovery", "search_files", {"pattern": "proof"}) is None
+    assert enforce_tool_policy("sid-halted-recovery", "process", {"action": "list"}) is None
+    assert enforce_tool_policy("sid-halted-recovery", "process", {"action": "log", "session_id": "proc-1"}) is None
+    assert enforce_tool_policy("sid-halted-recovery", "terminal", {"command": "git status --short --branch"}) is None
+    assert enforce_tool_policy(
+        "sid-halted-recovery",
+        "terminal",
+        {"command": "ssh vps 'du -xhd1 / 2>/dev/null | sort -h | tail -40'"},
+    ) is None
+    assert enforce_tool_policy(
+        "sid-halted-recovery",
+        "terminal",
+        {"command": "ssh vps 'docker system df -v 2>/dev/null || true'"},
+    ) is None
+    assert enforce_tool_policy(
+        "sid-halted-recovery",
+        "terminal",
+        {"command": "ssh vps 'systemctl list-unit-files 2>/dev/null | grep -i mls || true'"},
+    ) is None
+
+    for tool_name, args in [
+        ("write_file", {"path": str(tmp_path / "x.py")}),
+        ("patch", {"path": str(tmp_path / "x.py"), "old_string": "x", "new_string": "y"}),
+        ("execute_code", {"code": "print('x')"}),
+        ("delegate_task", {"task": "fallback"}),
+        ("process", {"action": "kill", "session_id": "proc-1"}),
+        ("terminal", {"command": "touch x", "workdir": str(tmp_path)}),
+        ("terminal", {"command": "mkdir build", "workdir": str(tmp_path)}),
+        ("terminal", {"command": "printf hi > note.txt", "workdir": str(tmp_path)}),
+        ("terminal", {"command": "printf hi >> note.txt", "workdir": str(tmp_path)}),
+        ("terminal", {"command": "ssh vps 'systemctl restart nginx'"}),
+        ("terminal", {"command": "ssh vps 'docker restart web'"}),
+        ("terminal", {"command": "ssh vps 'kubectl delete pod x'"}),
+        ("terminal", {"command": "ssh vps 'apt-get install -y jq'"}),
+    ]:
+        blocked = enforce_tool_policy("sid-halted-recovery", tool_name, args)
+        assert blocked is not None
+        assert "workflow is halted" in blocked
+
+
+
+def test_gap_state_allows_read_only_recovery_tools_but_blocks_mutation(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy
+
+    state = create_warroom_goal(
+        "sid-gap-recovery",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    assert state.status == "gap"
+    assert "real delegated role runtime missing" in (state.last_gap or "")
+
+    assert enforce_tool_policy("sid-gap-recovery", "read_file", {"path": str(tmp_path / "proof.log")}) is None
+    assert enforce_tool_policy("sid-gap-recovery", "process", {"action": "poll", "session_id": "proc-1"}) is None
+    assert enforce_tool_policy(
+        "sid-gap-recovery",
+        "terminal",
+        {"command": "ssh vps 'grep -i error /var/log/syslog 2>/dev/null || true'"},
+    ) is None
+
+    for tool_name, args in [
+        ("write_file", {"path": str(tmp_path / "x.py")}),
+        ("terminal", {"command": "ssh vps 'systemctl restart nginx'"}),
+        ("terminal", {"command": "ssh vps 'docker restart web'"}),
+        ("terminal", {"command": "ssh vps 'kubectl delete pod x'"}),
+        ("terminal", {"command": "ssh vps 'apt-get install -y jq'"}),
+    ]:
+        blocked = enforce_tool_policy("sid-gap-recovery", tool_name, args)
+        assert blocked is not None
+        assert "workflow is gap" in blocked
+        assert "real delegated role runtime missing" in blocked
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("ssh vps 'systemctl restart nginx'", True),
+        ("ssh vps 'docker restart web'", True),
+        ("ssh vps 'kubectl delete pod x'", True),
+        ("ssh vps 'apt-get install -y jq'", True),
+        ("ssh vps 'docker system df -v 2>/dev/null || true'", False),
+    ],
+)
+def test_terminal_mutates_flags_admin_system_commands(command, expected):
+    from hermes_cli.warroom_goal import _terminal_mutates
+
+    assert _terminal_mutates({"command": command}) is expected
+
+
 def test_missing_role_card_blocks_spawn_with_explicit_gap(hermes_home, tmp_path):
     from hermes_cli.warroom_goal import create_warroom_goal, save_warroom_goal, start_warroom_roles
 
@@ -704,6 +810,40 @@ def test_terminal_and_execute_code_fail_closed_for_non_builder_and_builder_scope
     mutating_outside = enforce_tool_policy("sid-terminal-policy", "terminal", {"command": "touch x", "workdir": "/tmp"})
     assert mutating_outside is not None and "outside allowed worktree" in mutating_outside
     assert "execute_code is not allowed" in enforce_tool_policy("sid-terminal-policy", "execute_code", {"code": "Path('x').write_text('x')"})
+
+
+
+def test_controller_read_only_terminal_allows_safe_stderr_redirects_but_blocks_file_redirects(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-controller-readonly-terminal",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    _unlock_runtime_for_policy_test(state)
+    state.current_role = "controller"
+    save_warroom_goal("sid-controller-readonly-terminal", state)
+
+    assert enforce_tool_policy(
+        "sid-controller-readonly-terminal",
+        "terminal",
+        {"command": "ssh vps 'du -xhd1 / 2>/dev/null | sort -h | tail -40'", "workdir": str(tmp_path)},
+    ) is None
+    assert enforce_tool_policy(
+        "sid-controller-readonly-terminal",
+        "terminal",
+        {"command": "docker system df -v 2>/dev/null || true", "workdir": str(tmp_path)},
+    ) is None
+
+    blocked = enforce_tool_policy(
+        "sid-controller-readonly-terminal",
+        "terminal",
+        {"command": "printf hi > note.txt", "workdir": str(tmp_path)},
+    )
+    assert blocked is not None
+    assert "Builder is the only mutation role" in blocked
 
 
 def test_guardian_unlock_requires_existing_guardian_pass_evidence(hermes_home, tmp_path):
