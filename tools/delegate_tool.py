@@ -657,6 +657,7 @@ _CHILD_INDEX_FIRST_DISCOVERY_BLOCK = (
     "## Index-First / Robot-Hand Code Discovery\n"
     "Before any raw file reads/searches, follow this exact order:\n"
     "Graphify report -> jcodemunch/jcode -> CodeGraph if initialized -> smart-read -> native read/search fallback only after named GAP.\n"
+    "Accepted robot-hand commands include direct aliases and mcp2cli forms, e.g. mcp2cli '@jcodemunch' search-text ..., mcp2cli '@jdocmunch' ..., mcp2cli '@smart-read' sc-read --file-path ..., plus direct graphify/cli-anything aliases.\n"
     "If CodeGraph is not initialized, report GAP. Do not run codegraph init, codegraph uninit, or mutate MCP config unless explicitly approved."
 )
 

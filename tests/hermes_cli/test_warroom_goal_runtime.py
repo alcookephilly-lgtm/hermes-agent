@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import os
+import time
 
 import pytest
 
@@ -72,6 +74,36 @@ def _fake_background_delegate(monkeypatch):
 
     monkeypatch.setattr(delegate_tool, "delegate_task", fake_delegate_task)
     return calls
+
+
+def _write_graph_report(path: Path, corpus_root: Path, *, age_seconds: int = 0) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "# Graph Report - "
+        f"{corpus_root}  (2026-06-24)\n\n"
+        "## Corpus Check\n"
+        "- synthetic test fixture\n",
+        encoding="utf-8",
+    )
+    if age_seconds:
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_extract_graph_report_path_converts_windows_path_to_wsl():
+    from hermes_cli.warroom_goal import _extract_graph_report_path
+
+    goal_text = (
+        _strict_goal()
+        + "\ngraphify: Shared graph is at "
+        + r"C:\Users\Paul\Shared Repo\graphify-out\GRAPH_REPORT.md"
+        + ". Gate=BLOCK: graph stale: age=172470s."
+    )
+
+    assert _extract_graph_report_path(goal_text) == Path(
+        "/mnt/c/Users/Paul/Shared Repo/graphify-out/GRAPH_REPORT.md"
+    )
 
 
 def test_notice_reports_runtime_drift_visibility(monkeypatch, tmp_path):
@@ -279,6 +311,225 @@ def test_create_fast_state_persists_roles_and_gates(hermes_home, tmp_path):
     assert reloaded.workflow == "fast_adversary"
 
 
+def test_stale_graphify_report_refreshes_and_continues(hermes_home, tmp_path, monkeypatch):
+    from hermes_cli import warroom_goal
+    from hermes_cli.warroom_goal import create_warroom_goal
+
+    tracking = tmp_path / "tracking"
+    tracking.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    report = _write_graph_report(repo / "graphify-out" / "GRAPH_REPORT.md", repo, age_seconds=90000)
+    refresh_calls = []
+    calls = _fake_background_delegate(monkeypatch)
+    parent_agent = object()
+
+    monkeypatch.setattr(warroom_goal, "_repo_root_for", lambda path: repo)
+    monkeypatch.setattr(warroom_goal, "_graphify_refresh_command", lambda repo_root: ["graphify-refresh-safe"])
+
+    def fake_run(command, **kwargs):
+        refresh_calls.append({"command": list(command), "cwd": kwargs.get("cwd")})
+        _write_graph_report(report, repo, age_seconds=0)
+        os.utime(report, None)
+        return type("Proc", (), {"returncode": 0, "stdout": "refreshed", "stderr": ""})()
+
+    monkeypatch.setattr(warroom_goal.subprocess, "run", fake_run)
+
+    state = create_warroom_goal(
+        "sid-graphify-refresh",
+        _strict_goal(),
+        tracking_dir=str(tracking),
+        allowed_mutation_root=str(repo),
+        parent_agent=parent_agent,
+    )
+
+    assert refresh_calls == [{"command": ["graphify-refresh-safe"], "cwd": str(repo)}]
+    assert state.gates["graphify"] == "pass"
+    assert state.status == "active"
+    assert state.gates["role_spawn"] == "pass"
+    assert state.gates["delegate_runtime"] == "pass"
+    assert any(item.startswith("GRAPH_REFRESHED:") for item in state.gate_evidence["graphify"])
+    assert len(calls) == 3
+
+
+def test_shared_same_corpus_stale_graphify_report_refreshes_from_shared_root(hermes_home, tmp_path, monkeypatch):
+    from hermes_cli import warroom_goal
+    from hermes_cli.warroom_goal import create_warroom_goal
+
+    tracking = tmp_path / "tracking"
+    tracking.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    shared_root = tmp_path / "Shared Corpus"
+    shared_worktree = shared_root / "worktree"
+    shared_worktree.mkdir(parents=True)
+    shared_report = _write_graph_report(
+        shared_root / "graphify-out" / "GRAPH_REPORT.md",
+        shared_root,
+        age_seconds=169457,
+    )
+    refresh_command_roots = []
+    refresh_calls = []
+    calls = _fake_background_delegate(monkeypatch)
+    parent_agent = object()
+
+    monkeypatch.setattr(warroom_goal, "_repo_root_for", lambda path: repo)
+
+    def fake_refresh_command(refresh_root):
+        refresh_command_roots.append(refresh_root)
+        return ["graphify-refresh-safe"]
+
+    def fake_run(command, **kwargs):
+        refresh_calls.append({"command": list(command), "cwd": kwargs.get("cwd")})
+        _write_graph_report(shared_report, shared_root, age_seconds=0)
+        os.utime(shared_report, None)
+        return type("Proc", (), {"returncode": 0, "stdout": "refreshed", "stderr": ""})()
+
+    monkeypatch.setattr(warroom_goal, "_graphify_refresh_command", fake_refresh_command)
+    monkeypatch.setattr(warroom_goal.subprocess, "run", fake_run)
+
+    state = create_warroom_goal(
+        "sid-graphify-shared-refresh",
+        _strict_goal() + f"\ngraphify: Shared graph is at {shared_report}. Gate=BLOCK: graph stale: age=169457s.",
+        tracking_dir=str(tracking),
+        allowed_mutation_root=str(shared_worktree),
+        parent_agent=parent_agent,
+    )
+
+    assert refresh_command_roots
+    assert all(root == shared_root for root in refresh_command_roots)
+    assert refresh_calls == [{"command": ["graphify-refresh-safe"], "cwd": str(shared_root)}]
+    assert state.gates["graphify"] == "pass"
+    assert state.status == "active"
+    assert state.gates["role_spawn"] == "pass"
+    assert state.gates["delegate_runtime"] == "pass"
+    assert any(item.startswith("GRAPH_REFRESHED:") for item in state.gate_evidence["graphify"])
+    assert len(calls) == 3
+
+
+def test_stale_graphify_no_index_boundary_halts_without_refresh(hermes_home, tmp_path, monkeypatch):
+    from hermes_cli import warroom_goal
+    from hermes_cli.warroom_goal import create_warroom_goal
+
+    tracking = tmp_path / "tracking"
+    tracking.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    _write_graph_report(repo / "graphify-out" / "GRAPH_REPORT.md", repo, age_seconds=90000)
+    refresh_calls = []
+
+    monkeypatch.setattr(warroom_goal, "_repo_root_for", lambda path: repo)
+    monkeypatch.setattr(warroom_goal, "_graphify_refresh_command", lambda repo_root: ["graphify-refresh-safe"])
+
+    def fail_run(*args, **kwargs):
+        refresh_calls.append(args[0] if args else kwargs.get("args"))
+        raise AssertionError("graph refresh should not run")
+
+    monkeypatch.setattr(warroom_goal.subprocess, "run", fail_run)
+
+    state = create_warroom_goal(
+        "sid-graphify-no-index",
+        _strict_goal() + "\nNo-index boundary.",
+        tracking_dir=str(tracking),
+        allowed_mutation_root=str(repo),
+    )
+
+    assert state.status in {"blocked", "gap"}
+    assert state.gates["graphify"] == "blocked"
+    assert "explicit_no_index_no_mutation_boundary" in (state.last_gap or "")
+    assert refresh_calls == []
+
+
+def test_stale_graphify_refresh_rc0_noop_stays_gap(hermes_home, tmp_path, monkeypatch):
+    from hermes_cli import warroom_goal
+    from hermes_cli.warroom_goal import create_warroom_goal
+
+    tracking = tmp_path / "tracking"
+    tracking.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    report = _write_graph_report(repo / "graphify-out" / "GRAPH_REPORT.md", repo, age_seconds=90000)
+    refresh_calls = []
+    calls = _fake_background_delegate(monkeypatch)
+    parent_agent = object()
+
+    monkeypatch.setattr(warroom_goal, "_repo_root_for", lambda path: repo)
+    monkeypatch.setattr(warroom_goal, "_graphify_refresh_command", lambda refresh_root: ["graphify-refresh-safe"])
+
+    def fake_run(command, **kwargs):
+        refresh_calls.append({"command": list(command), "cwd": kwargs.get("cwd")})
+        assert report.exists()
+        return type("Proc", (), {"returncode": 0, "stdout": "noop", "stderr": ""})()
+
+    monkeypatch.setattr(warroom_goal.subprocess, "run", fake_run)
+
+    state = create_warroom_goal(
+        "sid-graphify-noop-refresh",
+        _strict_goal(),
+        tracking_dir=str(tracking),
+        allowed_mutation_root=str(repo),
+        parent_agent=parent_agent,
+    )
+
+    assert refresh_calls == [{"command": ["graphify-refresh-safe"], "cwd": str(repo)}]
+    assert state.status == "gap"
+    assert state.gates["graphify"] == "gap"
+    assert "refresh_output_still_stale" in (state.last_gap or "")
+    assert state.gates["role_spawn"] != "pass"
+    assert state.gates["delegate_runtime"] == "pending"
+    assert len(calls) == 0
+
+
+def test_wrong_corpus_graphify_report_marks_not_applicable_and_continues(hermes_home, tmp_path, monkeypatch):
+    from hermes_cli import warroom_goal
+    from hermes_cli.warroom_goal import create_warroom_goal
+
+    tracking = tmp_path / "tracking"
+    tracking.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    shared_report = _write_graph_report(
+        tmp_path / "shared" / "graphify-out" / "GRAPH_REPORT.md",
+        tmp_path / "other",
+        age_seconds=169457,
+    )
+    calls = _fake_background_delegate(monkeypatch)
+    parent_agent = object()
+
+    monkeypatch.setattr(warroom_goal, "_repo_root_for", lambda path: repo)
+    monkeypatch.setattr(
+        warroom_goal.shutil,
+        "which",
+        lambda tool_name: "/bin/mcp2cli" if tool_name == "mcp2cli" else None,
+    )
+
+    def fail_run(*args, **kwargs):
+        raise AssertionError("graph refresh should not run")
+
+    monkeypatch.setattr(warroom_goal.subprocess, "run", fail_run)
+
+    state = create_warroom_goal(
+        "sid-graphify-wrong-corpus",
+        _strict_goal() + f"\ngraphify: Shared graph is at {shared_report}. Gate=BLOCK: graph stale: age=169457s.",
+        tracking_dir=str(tracking),
+        allowed_mutation_root=str(repo),
+        parent_agent=parent_agent,
+    )
+
+    assert state.gates["graphify"] == "pass"
+    assert state.status == "active"
+    assert state.gates["role_spawn"] == "pass"
+    assert state.gates["delegate_runtime"] == "pass"
+    assert any(item.startswith("GRAPH_NOT_APPLICABLE:") for item in state.gate_evidence["graphify"])
+    assert "GRAPH_ALTERNATE_DISCOVERY:mcp2cli" in state.gate_evidence["graphify"]
+    assert len(calls) == 3
+
+
 def test_role_records_expose_shared_context_pack_and_profiles(hermes_home, tmp_path):
     from hermes_cli.warroom_goal import create_warroom_goal, load_warroom_goal
 
@@ -403,7 +654,7 @@ def test_final_guard_blocks_done_without_proof_and_health_only(hermes_home, tmp_
         tracking_dir=str(tmp_path),
         allowed_mutation_root=str(tmp_path),
     )
-    blocked = guard_final_response("sid-final", "DONE. Health check passed.")
+    blocked = guard_final_response("sid-final", "DONE. Health check passed.", closure=True)
     assert "blocked" in blocked.lower()
     assert "proof packet" in blocked.lower()
 
@@ -411,10 +662,10 @@ def test_final_guard_blocks_done_without_proof_and_health_only(hermes_home, tmp_
     Path(state.proof_packet_path).write_text("Status: PASS\nGuardian verdict: PASS\n", encoding="utf-8")
     state.final_claim_allowed = True
     save_warroom_goal("sid-final", state)
-    blocked = guard_final_response("sid-final", "DONE. Health check passed.")
+    blocked = guard_final_response("sid-final", "DONE. Health check passed.", closure=True)
     assert "health check" in blocked.lower()
 
-    ok = guard_final_response("sid-final", "DONE. pytest E2E passed and proof packet written.")
+    ok = guard_final_response("sid-final", "DONE. pytest E2E passed and proof packet written.", closure=True)
     assert ok.startswith("GOAL COMPLETED")
     assert "Proof packet:" in ok
     assert "Guardian verdict: PASS" in ok
@@ -740,11 +991,34 @@ def test_normal_chat_does_not_run_final_guard_while_spawn_pending(hermes_home, t
     )
     state.required_action = "spawn_roles"
     save_warroom_goal("sid-spawn-pending", state)
+    normal_response = "DONE. pytest E2E passed."
     assert guard_final_response("sid-spawn-pending", "Working on it.") == "Working on it."
+    assert guard_final_response("sid-spawn-pending", normal_response) == normal_response
     assert guard_final_response("sid-spawn-pending", "Working on it.", closure=True) == "Working on it."
-    blocked = guard_final_response("sid-spawn-pending", "DONE. pytest E2E passed.")
+    blocked = guard_final_response("sid-spawn-pending", normal_response, closure=True)
     assert "FINAL BLOCKED" in blocked
     assert "required role spawn action is pending" in blocked
+
+
+def test_normal_chat_final_words_bypass_gap_state(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, guard_final_response, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-gap-normal-chat",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.status = "gap"
+    state.required_action = "blocked_gap"
+    state.last_gap = "real delegated role runtime missing"
+    save_warroom_goal("sid-gap-normal-chat", state)
+    normal_response = "DONE. Bug source found. Complete notes written."
+
+    assert guard_final_response("sid-gap-normal-chat", normal_response) == normal_response
+    blocked = guard_final_response("sid-gap-normal-chat", normal_response, closure=True)
+    assert "FINAL BLOCKED" in blocked
+    assert "proof packet" in blocked
 
 
 def test_role_ledger_distinguishes_real_child_session_stale_pid_and_status_line(hermes_home, tmp_path):

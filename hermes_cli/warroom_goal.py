@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -26,11 +27,16 @@ GLOBAL_TRIGGER = "Global slash /goal:"
 STATE_VERSION = 3
 WARROOM_PLAN_WORKFLOWS = {"strict_plan_adversary", "global_plan_adversary"}
 ROLE_STALE_AFTER_SECONDS = 300.0
+GRAPHIFY_STALE_AFTER_SECONDS = 24 * 3600.0
 TRACKING_DOC_SUFFIXES = {"", ".md", ".txt", ".json", ".jsonl", ".yaml", ".yml", ".log"}
 REAL_DELEGATED_RUNTIME_GAP = (
     "real delegated role runtime missing: spawn_receipt_only receipts do not prove role execution; "
     "local_process pid receipts are spawn_receipt_only"
 )
+GRAPH_REPORT_PATH_RE = re.compile(
+    r"(?P<path>(?:[A-Za-z]:[\\/]|/)[^`\"'\r\n]*?graphify-out[\\/]GRAPH_REPORT\.md)"
+)
+GRAPH_REPORT_HEADER_RE = re.compile(r"^# Graph Report - (?P<root>.+?)\s+\((?P<stamp>\d{4}-\d{2}-\d{2})\)\s*$")
 
 
 def _sha256_file_optional(path: Path) -> Optional[str]:
@@ -1085,6 +1091,272 @@ def _controller_tracking_doc_allowed(state: WarroomGoalState, tool_name: str, ar
     return Path(path).suffix.lower() in TRACKING_DOC_SUFFIXES
 
 
+def _normalize_graph_report_path(path_text: str) -> str:
+    if re.match(r"^[A-Za-z]:[\\/]", path_text or ""):
+        drive = path_text[0].lower()
+        suffix = path_text[2:].replace("\\", "/").lstrip("/")
+        return f"/mnt/{drive}/{suffix}"
+    return path_text
+
+
+def _extract_graph_report_path(goal_text: str) -> Optional[Path]:
+    match = GRAPH_REPORT_PATH_RE.search(goal_text or "")
+    if not match:
+        return None
+    path_text = _normalize_graph_report_path(match.group("path"))
+    try:
+        return Path(path_text).expanduser().resolve()
+    except Exception:
+        return Path(path_text).expanduser()
+
+
+def _parse_graph_report_header(report_path: Path) -> tuple[Optional[str], Optional[str]]:
+    try:
+        with report_path.open("r", encoding="utf-8", errors="replace") as fh:
+            header = fh.readline().strip()
+    except Exception:
+        return None, None
+    match = GRAPH_REPORT_HEADER_RE.match(header)
+    if not match:
+        return None, None
+    return match.group("root").strip(), match.group("stamp")
+
+
+def _graphify_alternatives(repo_root: Path, *, preferred_report: Optional[Path] = None) -> List[str]:
+    alternatives: List[str] = []
+    local_report = _graphify_generated_report_path(repo_root)
+    if local_report.exists() and (preferred_report is None or local_report != preferred_report):
+        alternatives.append(f"GRAPH_ALTERNATE_PATH:{local_report}")
+    for tool_name in ("mcp2cli", "graphify", "cli-anything-jcodemunch-mcp", "cli-anything-smart-read-mcp"):
+        if shutil.which(tool_name):
+            alternatives.append(f"GRAPH_ALTERNATE_DISCOVERY:{tool_name}")
+            break
+    return alternatives
+
+
+def _graphify_generated_report_path(root: Path) -> Path:
+    try:
+        return (root / "graphify-out" / "GRAPH_REPORT.md").resolve()
+    except Exception:
+        return root / "graphify-out" / "GRAPH_REPORT.md"
+
+
+def _graphify_refresh_command(refresh_root: Path) -> Optional[List[str]]:
+    safe_script = refresh_root / "scripts" / "graphify-update-safe.py"
+    if safe_script.exists():
+        return [sys.executable, str(safe_script)]
+    graphify_bin = shutil.which("graphify")
+    if graphify_bin:
+        return [graphify_bin, "update"]
+    return None
+
+
+def _graphify_covers_target(corpus_root: Optional[str], *, repo_root: Path, allowed_path: Path) -> bool:
+    return bool(corpus_root) and (
+        _path_inside(str(repo_root), str(corpus_root)) or _path_inside(str(allowed_path), str(corpus_root))
+    )
+
+
+def _graphify_refresh_root(corpus_root: Optional[str], *, fallback_root: Path) -> Path:
+    if not corpus_root:
+        return fallback_root
+    try:
+        return Path(corpus_root).expanduser().resolve()
+    except Exception:
+        return Path(corpus_root).expanduser()
+
+
+def _is_generated_graphify_output(report_path: Path, refresh_root: Path) -> bool:
+    try:
+        return report_path.resolve() == _graphify_generated_report_path(refresh_root)
+    except Exception:
+        return report_path == refresh_root / "graphify-out" / "GRAPH_REPORT.md"
+
+
+def _graphify_refresh_block_reason(goal_text: str, *, report_path: Path, refresh_root: Path) -> Optional[str]:
+    normalized = (goal_text or "").lower()
+    if (
+        "no-index" in normalized
+        or "no index" in normalized
+        or "no indexing" in normalized
+        or "no-mutation" in normalized
+        or "no mutation" in normalized
+        or "do not mutate" in normalized
+    ):
+        return "GRAPH_REFRESH_EXCEPTION:explicit_no_index_no_mutation_boundary"
+    if not _is_generated_graphify_output(report_path, refresh_root):
+        return "GRAPH_REFRESH_EXCEPTION:destructive_delete_uninit_risk_non_generated_output"
+    sensitive_parts = {"secret", "secrets", "credential", "credentials", "vault", ".ssh", ".aws"}
+    if any(part.lower() in sensitive_parts for part in report_path.parts):
+        return "GRAPH_REFRESH_EXCEPTION:secrets_credentials_risk"
+    if _graphify_refresh_command(refresh_root) is None:
+        return "GRAPH_REFRESH_EXCEPTION:no_safe_refresh_path"
+    return None
+
+
+def _refresh_graphify_report(refresh_root: Path, report_path: Path) -> tuple[bool, List[str]]:
+    command = _graphify_refresh_command(refresh_root)
+    if not command:
+        return False, ["GRAPH_REFRESH_EXCEPTION:no_safe_refresh_path"]
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=str(refresh_root),
+            text=True,
+            capture_output=True,
+            timeout=300,
+            check=False,
+        )
+    except Exception as exc:
+        return False, [f"GRAPH_REFRESH_EXCEPTION:refresh_failed:{exc}"]
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        tail = detail[-1] if detail else f"rc={proc.returncode}"
+        return False, [f"GRAPH_REFRESH_EXCEPTION:refresh_failed:{tail}"]
+    if not report_path.exists():
+        return False, ["GRAPH_REFRESH_EXCEPTION:refresh_missing_output"]
+    return True, [f"GRAPH_REFRESHED:{report_path}", f"GRAPH_REFRESH_COMMAND:{' '.join(command)}"]
+
+
+def _evaluate_graphify_gate(goal_text: str, *, allowed_root: str, now: Optional[float] = None) -> Dict[str, Any]:
+    current = time.time() if now is None else now
+    allowed_path = Path(allowed_root or Path.cwd()).expanduser().resolve()
+    repo_root = _repo_root_for(allowed_path) or allowed_path
+    preferred_report = _extract_graph_report_path(goal_text)
+    local_report = _graphify_generated_report_path(repo_root)
+    candidates: List[Path] = []
+    for candidate in (preferred_report, local_report):
+        if candidate is None:
+            continue
+        if all(existing != candidate for existing in candidates):
+            candidates.append(candidate)
+
+    evidence: List[str] = []
+    selected_report: Optional[Path] = None
+    selected_corpus: Optional[str] = None
+    saw_wrong_corpus = False
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        corpus_root, _stamp = _parse_graph_report_header(candidate)
+        covers_repo = _graphify_covers_target(corpus_root, repo_root=repo_root, allowed_path=allowed_path)
+        if covers_repo:
+            selected_report = candidate
+            selected_corpus = corpus_root
+            if preferred_report is not None and candidate != preferred_report:
+                evidence.append(f"GRAPH_ALTERNATE_PATH:{candidate}")
+            break
+        if corpus_root:
+            saw_wrong_corpus = True
+            evidence.append(f"GRAPH_NOT_APPLICABLE:{candidate} corpus={corpus_root} repo={repo_root}")
+        else:
+            evidence.append(f"GRAPH_REPORT_HEADER_UNPARSEABLE:{candidate}")
+
+    if selected_report is None:
+        alternatives = _graphify_alternatives(repo_root, preferred_report=preferred_report)
+        if saw_wrong_corpus:
+            if alternatives:
+                return {"gate": "pass", "status": "active", "evidence": evidence + alternatives}
+            gap = "GRAPH_REFRESH_EXCEPTION:wrong_corpus_no_alternate"
+            return {
+                "gate": "gap",
+                "status": "gap",
+                "evidence": evidence + [gap],
+                "last_gap": gap,
+                "required_action": "blocked_gap",
+            }
+        if alternatives:
+            return {"gate": "pass", "status": "active", "evidence": evidence + alternatives}
+        gap = "GRAPH_REFRESH_EXCEPTION:no_report_no_alternate"
+        return {
+            "gate": "gap",
+            "status": "gap",
+            "evidence": evidence + [gap],
+            "last_gap": gap,
+            "required_action": "blocked_gap",
+        }
+
+    age_seconds = max(0, int(current - selected_report.stat().st_mtime))
+    evidence.extend(
+        [
+            f"GRAPH_REPORT_PATH:{selected_report}",
+            f"GRAPH_REPORT_CORPUS:{selected_corpus or 'unknown'}",
+            f"GRAPH_REPORT_AGE_SECONDS:{age_seconds}",
+        ]
+    )
+    if age_seconds <= GRAPHIFY_STALE_AFTER_SECONDS:
+        evidence.append("GRAPH_REPORT_FRESH")
+        return {"gate": "pass", "status": "active", "evidence": evidence}
+
+    refresh_root = _graphify_refresh_root(selected_corpus, fallback_root=repo_root)
+    evidence.append(f"GRAPH_REFRESH_ROOT:{refresh_root}")
+
+    block_reason = _graphify_refresh_block_reason(goal_text, report_path=selected_report, refresh_root=refresh_root)
+    if block_reason:
+        return {
+            "gate": "blocked",
+            "status": "blocked",
+            "evidence": evidence + [block_reason],
+            "last_gap": block_reason,
+            "required_action": "blocked_gap",
+        }
+
+    refreshed, refresh_evidence = _refresh_graphify_report(refresh_root, selected_report)
+    evidence.extend(refresh_evidence)
+    if not refreshed:
+        gap = refresh_evidence[-1] if refresh_evidence else "GRAPH_REFRESH_EXCEPTION:refresh_failed"
+        return {
+            "gate": "gap",
+            "status": "gap",
+            "evidence": evidence,
+            "last_gap": gap,
+            "required_action": "blocked_gap",
+        }
+
+    if not selected_report.exists():
+        gap = "GRAPH_REFRESH_EXCEPTION:refresh_missing_output"
+        return {
+            "gate": "gap",
+            "status": "gap",
+            "evidence": evidence + [gap],
+            "last_gap": gap,
+            "required_action": "blocked_gap",
+        }
+
+    refreshed_corpus, _refreshed_stamp = _parse_graph_report_header(selected_report)
+    if not refreshed_corpus:
+        gap = "GRAPH_REFRESH_EXCEPTION:refresh_output_header_unparseable"
+        return {
+            "gate": "gap",
+            "status": "gap",
+            "evidence": evidence + [gap],
+            "last_gap": gap,
+            "required_action": "blocked_gap",
+        }
+    if not _graphify_covers_target(refreshed_corpus, repo_root=repo_root, allowed_path=allowed_path):
+        gap = "GRAPH_REFRESH_EXCEPTION:refresh_output_wrong_corpus"
+        return {
+            "gate": "gap",
+            "status": "gap",
+            "evidence": evidence + [gap],
+            "last_gap": gap,
+            "required_action": "blocked_gap",
+        }
+
+    refreshed_age = max(0, int(time.time() - selected_report.stat().st_mtime))
+    evidence.append(f"GRAPH_REPORT_AGE_SECONDS:{refreshed_age}")
+    if refreshed_age > GRAPHIFY_STALE_AFTER_SECONDS:
+        gap = "GRAPH_REFRESH_EXCEPTION:refresh_output_still_stale"
+        return {
+            "gate": "gap",
+            "status": "gap",
+            "evidence": evidence + [gap],
+            "last_gap": gap,
+            "required_action": "blocked_gap",
+        }
+    return {"gate": "pass", "status": "active", "evidence": evidence}
+
+
 def create_warroom_goal(
     session_id: str,
     arg: str,
@@ -1107,11 +1379,12 @@ def create_warroom_goal(
     now = time.time()
     tracking = tracking_dir or _default_tracking_dir()
     allowed_root = allowed_mutation_root or os.getenv("TERMINAL_CWD") or str(Path.cwd())
+    graphify_gate = _evaluate_graphify_gate(detection.body, allowed_root=allowed_root, now=now)
     roles = list(FAST_ROLES if detection.workflow == "fast_adversary" else STRICT_ROLES)
     cards = _role_cards_for(tracking)
     role_cards_ok = all(Path(cards[role]).exists() for role in roles)
     gates = {
-        "graphify": "pending",
+        "graphify": graphify_gate.get("gate", "pending"),
         "plan": "pass" if detection.workflow == "fast_adversary" else "pending",
         "tracking": "pass" if Path(tracking).exists() else "blocked",
         "role_cards": "pass" if role_cards_ok else "blocked",
@@ -1130,6 +1403,11 @@ def create_warroom_goal(
         gates["role_spawn"] = "blocked"
         last_gap = "Missing required strict sections: " + ", ".join(detection.missing_sections)
         required_action = None
+    elif graphify_gate.get("status") in {"blocked", "gap"}:
+        status = str(graphify_gate.get("status"))
+        gates["role_spawn"] = "blocked" if status == "blocked" else "gap"
+        last_gap = graphify_gate.get("last_gap") or last_gap
+        required_action = graphify_gate.get("required_action") or "blocked_gap"
     elif not role_cards_ok:
         status = "blocked"
         last_gap = "Missing required role card(s)"
@@ -1148,7 +1426,10 @@ def create_warroom_goal(
         roles_started={role: role == "controller" for role in roles},
         role_cards={role: cards[role] for role in roles},
         gates=gates,
-        gate_evidence={"controller_active": ["runtime created Warroom state"]},
+        gate_evidence={
+            "controller_active": ["runtime created Warroom state"],
+            "graphify": list(graphify_gate.get("evidence") or []),
+        },
         tracking_dir=tracking,
         allowed_mutation_root=allowed_root,
         denied_mutation_roots=_default_denied_roots(),
@@ -1446,6 +1727,8 @@ def goal_completion_output(state: WarroomGoalState, response: str) -> str:
 def guard_final_response(session_id: str, response: str, *, closure: bool = False) -> str:
     state = load_warroom_goal(session_id)
     if state is None or not response:
+        return response
+    if not closure:
         return response
     noncritical_state = _record_noncritical_halt_text(session_id, response)
     if noncritical_state is not None:

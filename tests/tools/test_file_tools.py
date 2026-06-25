@@ -92,6 +92,27 @@ class TestRobotHandGate:
         allowed = json.loads(read_file_tool(str(target), task_id=task_id))
         assert "hello" in allowed["content"]
 
+    def test_terminal_observer_records_mcp2cli_smart_read_file(self, tmp_path):
+        from tools.file_tools import (
+            observe_robot_hand_terminal_command,
+            read_file_tool,
+            set_robot_hand_enforcement_for_tests,
+        )
+
+        target = tmp_path / "note.txt"
+        target.write_text("hello\n", encoding="utf-8")
+        task_id = "robot-hand-terminal-observer-mcp2cli"
+        set_robot_hand_enforcement_for_tests(True)
+
+        observe_robot_hand_terminal_command(
+            "mcp2cli '@smart-read' sc-read --file-path note.txt",
+            task_id=task_id,
+            cwd=str(tmp_path),
+        )
+
+        allowed = json.loads(read_file_tool(str(target), task_id=task_id))
+        assert "hello" in allowed["content"]
+
     def test_sensitive_paths_block_even_after_robot_hand_proof(self, tmp_path):
         from tools.file_tools import (
             read_file_tool,

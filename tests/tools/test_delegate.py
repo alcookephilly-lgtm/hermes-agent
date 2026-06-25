@@ -141,6 +141,9 @@ class TestChildSystemPrompt(unittest.TestCase):
         )
         self.assertIn("If CodeGraph is not initialized, report GAP.", prompt)
         self.assertIn("Do not run codegraph init, codegraph uninit, or mutate MCP config unless explicitly approved.", prompt)
+        self.assertIn("mcp2cli '@jcodemunch' search-text", prompt)
+        self.assertIn("mcp2cli '@jdocmunch'", prompt)
+        self.assertIn("mcp2cli '@smart-read' sc-read --file-path", prompt)
 
         graphify_pos = prompt.index("Graphify report")
         jcode_pos = prompt.index("jcodemunch/jcode")
