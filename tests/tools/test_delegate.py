@@ -953,11 +953,11 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertIsNone(creds["model"])
 
     def test_model_only_no_provider(self):
-        """When only model is set (no provider), model is returned but credentials are None."""
+        """Implicit delegation.model without override reason does not override parent."""
         parent = _make_mock_parent(depth=0)
         cfg = {"model": "google/gemini-3-flash-preview", "provider": ""}
         creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertEqual(creds["model"], "google/gemini-3-flash-preview")
+        self.assertIsNone(creds["model"])
         self.assertIsNone(creds["provider"])
         self.assertIsNone(creds["base_url"])
         self.assertIsNone(creds["api_key"])
@@ -971,6 +971,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             "provider": "openrouter",
             "base_url": "http://localhost:1234/v1",
             "api_key": "local-key",
+            "override_reason": "test explicit direct endpoint override",
         }
         creds = _resolve_delegation_credentials(cfg, parent)
         self.assertEqual(creds["model"], "qwen2.5-coder")
@@ -989,6 +990,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             "provider": "custom",
             "base_url": "https://myfoundry.services.ai.azure.com/anthropic",
             "api_key": "foundry-key",
+            "override_reason": "test explicit direct endpoint override",
         }
         creds = _resolve_delegation_credentials(cfg, parent)
         self.assertEqual(creds["provider"], "custom")
@@ -1006,6 +1008,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             "base_url": "https://proxy.example.com/v1",
             "api_key": "proxy-key",
             "api_mode": "anthropic_messages",
+            "override_reason": "test explicit direct endpoint override",
         }
         creds = _resolve_delegation_credentials(cfg, parent)
         self.assertEqual(creds["api_mode"], "anthropic_messages")
@@ -1019,6 +1022,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             "base_url": "https://myfoundry.services.ai.azure.com/anthropic",
             "api_key": "foundry-key",
             "api_mode": "chat_completions",
+            "override_reason": "test explicit direct endpoint override",
         }
         creds = _resolve_delegation_credentials(cfg, parent)
         self.assertEqual(creds["api_mode"], "chat_completions")
@@ -1032,6 +1036,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             "base_url": "https://myfoundry.services.ai.azure.com/anthropic",
             "api_key": "foundry-key",
             "api_mode": "garbage",
+            "override_reason": "test explicit direct endpoint override",
         }
         creds = _resolve_delegation_credentials(cfg, parent)
         self.assertEqual(creds["api_mode"], "anthropic_messages")
@@ -1365,6 +1370,67 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["model"], parent.model)
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["base_url"], parent.base_url)
+
+    @patch("tools.delegate_tool._load_config")
+    def test_implicit_delegation_model_config_does_not_override_controller_model(self, mock_cfg):
+        """Stale delegation.model must not pin children away from controller model."""
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "gpt-5.4",
+            "provider": "openai-codex",
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.model = "gpt-5.5"
+        parent.provider = "openai-codex"
+        parent.base_url = "https://chatgpt.com/backend-api/codex"
+
+        with patch("run_agent.AIAgent") as MockAgent, self.assertLogs("tools.delegate_tool", level="WARNING") as cm:
+            mock_child = MagicMock()
+            mock_child.model = "gpt-5.5"
+            mock_child.provider = "openai-codex"
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Test inherited model", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["model"], "gpt-5.5")
+            self.assertEqual(kwargs["provider"], "openai-codex")
+            self.assertTrue(any("delegation config model/provider override ignored" in item for item in cm.output))
+
+    @patch("tools.delegate_tool._load_config")
+    def test_explicit_delegation_model_override_requires_reason_and_logs(self, mock_cfg):
+        """A different child model is allowed only when an override reason is explicit."""
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "gpt-5.4",
+            "override_reason": "user requested child model override",
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.model = "gpt-5.5"
+        parent.provider = "openai-codex"
+
+        with patch("run_agent.AIAgent") as MockAgent, self.assertLogs("tools.delegate_tool", level="INFO") as cm:
+            mock_child = MagicMock()
+            mock_child.model = "gpt-5.4"
+            mock_child.provider = "openai-codex"
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Test explicit override", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["model"], "gpt-5.4")
+            self.assertEqual(kwargs["provider"], "openai-codex")
+            self.assertTrue(any("user requested child model override" in item for item in cm.output))
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")

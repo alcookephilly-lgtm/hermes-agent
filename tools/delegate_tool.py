@@ -997,6 +997,7 @@ def _build_child_agent(
     # ACP transport overrides — lets a non-ACP parent spawn ACP child agents
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    override_reason: Optional[str] = None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1141,11 +1142,11 @@ def _build_child_agent(
 
     override_reasons = []
     if model and model != parent_model:
-        override_reasons.append("delegation.model")
+        override_reasons.append(override_reason or "delegation.model")
     if override_provider:
-        override_reasons.append("delegation.provider")
+        override_reasons.append(override_reason or "delegation.provider")
     if override_base_url:
-        override_reasons.append("delegation.base_url")
+        override_reasons.append(override_reason or "delegation.base_url")
     if override_acp_command:
         override_reasons.append("explicit acp_command override")
     if override_reasons:
@@ -2354,6 +2355,7 @@ def delegate_task(
                     if task_acp_args is not None
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
+                override_reason=creds.get("override_reason"),
                 role=effective_role,
             )
             # Override with correct parent tool names (before child construction mutated global)
@@ -2428,12 +2430,24 @@ def delegate_task(
             )
 
             if dispatch.get("status") == "dispatched":
+                child_model_value = getattr(child, "model", None)
+                if not isinstance(child_model_value, str) or not child_model_value.strip():
+                    child_model_value = creds["model"] if isinstance(creds.get("model"), str) and creds.get("model") else getattr(parent_agent, "model", None)
+                if not isinstance(child_model_value, str) or not child_model_value.strip():
+                    child_model_value = None
+                child_provider_value = getattr(child, "provider", None)
+                if not isinstance(child_provider_value, str) or not child_provider_value.strip():
+                    child_provider_value = creds.get("provider") if isinstance(creds.get("provider"), str) and creds.get("provider") else getattr(parent_agent, "provider", None)
+                if not isinstance(child_provider_value, str) or not child_provider_value.strip():
+                    child_provider_value = None
                 return json.dumps(
                     {
                         "status": "dispatched",
                         "delegation_id": dispatch["delegation_id"],
                         "goal": _t["goal"],
                         "mode": "background",
+                        "model": child_model_value,
+                        "provider": child_provider_value,
                         "note": (
                             "Subagent is running in the background. You and the "
                             "user can keep working; the full task source and "
@@ -2761,24 +2775,40 @@ def _resolve_child_credential_pool(
     return None
 
 
+def _delegation_override_reason(cfg: dict) -> Optional[str]:
+    """Return an explicit delegation override reason, if configured."""
+    for key in ("override_reason", "model_override_reason", "explicit_override_reason"):
+        value = str(cfg.get(key) or "").strip()
+        if value:
+            return value
+    if is_truthy_value(cfg.get("explicit_model_override"), default=False) or is_truthy_value(
+        cfg.get("allow_model_override"), default=False
+    ):
+        return "delegation explicit override enabled"
+    return None
+
+
+def _inherit_delegation_credentials() -> dict:
+    return {
+        "model": None,
+        "provider": None,
+        "base_url": None,
+        "api_key": None,
+        "api_mode": None,
+        "command": None,
+        "args": None,
+        "override_reason": None,
+    }
+
+
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """Resolve credentials for subagent delegation.
 
-    If ``delegation.base_url`` is configured, subagents use that direct
-    OpenAI-compatible endpoint. ``delegation.api_key`` overrides the key; when
-    omitted, ``api_key`` is returned as ``None`` so ``_build_child_agent``
-    inherits the parent agent's key (``effective_api_key = override_api_key or
-    parent_api_key``). This lets providers that store their key outside
-    ``OPENAI_API_KEY`` (e.g. ``MINIMAX_API_KEY``, ``DASHSCOPE_API_KEY``) work
-    without a duplicate config entry.
-
-    Otherwise, if ``delegation.provider`` is configured, the full credential
-    bundle (base_url, api_key, api_mode, provider) is resolved via the runtime
-    provider system — the same path used by CLI/gateway startup. This lets
-    subagents run on a completely different provider:model pair.
-
-    If neither base_url nor provider is configured, returns None values so the
-    child inherits everything from the parent agent.
+    Default is controller inheritance: the child gets the parent provider and
+    model. Legacy ``delegation.model`` / ``delegation.provider`` config is not
+    allowed to silently pin workers to another model (for example gpt-5.4 under
+    a gpt-5.5 controller). A configured delegation override is honored only
+    when it also carries an explicit override reason.
 
     Raises ValueError with a user-friendly message on credential failure.
     """
@@ -2787,6 +2817,17 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
+    explicit_override_reason = _delegation_override_reason(cfg)
+
+    if (configured_model or configured_provider or configured_base_url or configured_api_key or configured_api_mode) and not explicit_override_reason:
+        parent_model = str(getattr(parent_agent, "model", "") or "")
+        logger.warning(
+            "delegation config model/provider override ignored: parent_model=%s configured_model=%s configured_provider=%s reason=missing explicit override reason",
+            parent_model,
+            configured_model,
+            configured_provider,
+        )
+        return _inherit_delegation_credentials()
 
     if configured_base_url:
         # When delegation.api_key is not set, return None so _build_child_agent
@@ -2832,17 +2873,20 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "base_url": configured_base_url,
             "api_key": api_key,
             "api_mode": api_mode,
+            "command": None,
+            "args": None,
+            "override_reason": explicit_override_reason,
         }
 
     if not configured_provider:
+        # Model-only explicit override: same parent credentials, caller-selected model.
+        if configured_model and explicit_override_reason:
+            inherited = _inherit_delegation_credentials()
+            inherited["model"] = configured_model
+            inherited["override_reason"] = explicit_override_reason
+            return inherited
         # No provider override — child inherits everything from parent
-        return {
-            "model": configured_model,
-            "provider": None,
-            "base_url": None,
-            "api_key": None,
-            "api_mode": None,
-        }
+        return _inherit_delegation_credentials()
 
     # Provider is configured — resolve full credentials
     try:
@@ -2872,6 +2916,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "api_mode": runtime.get("api_mode"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
+        "override_reason": explicit_override_reason,
     }
 
 

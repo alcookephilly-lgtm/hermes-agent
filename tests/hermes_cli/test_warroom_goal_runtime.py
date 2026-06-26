@@ -70,11 +70,14 @@ def _fake_background_delegate(monkeypatch):
 
     def fake_delegate_task(**kwargs):
         calls.append(kwargs)
+        parent_agent = kwargs.get("parent_agent")
         return json.dumps(
             {
                 "status": "dispatched",
                 "delegation_id": f"delegation-{len(calls)}",
                 "mode": "background",
+                "model": getattr(parent_agent, "model", None),
+                "provider": getattr(parent_agent, "provider", None),
             }
         )
 
@@ -273,7 +276,7 @@ def test_global_goal_creates_plan_roles_without_budget_or_fallback(hermes_home, 
     assert load_warroom_goal("sid-global-api").workflow == "global_plan_adversary"
 
     calls = _fake_background_delegate(monkeypatch)
-    parent_agent = object()
+    parent_agent = type("ParentAgent", (), {"model": "gpt-5.5", "provider": "openai-codex"})()
     handled_live = handle_global_goal_slash(
         "sid-global-api-live",
         "/goal ship from API ingress",
@@ -331,7 +334,7 @@ def test_stale_graphify_report_refreshes_and_continues(hermes_home, tmp_path, mo
     report = _write_graph_report(repo / "graphify-out" / "GRAPH_REPORT.md", repo, age_seconds=90000)
     refresh_calls = []
     calls = _fake_background_delegate(monkeypatch)
-    parent_agent = object()
+    parent_agent = type("ParentAgent", (), {"model": "gpt-5.5", "provider": "openai-codex"})()
 
     monkeypatch.setattr(warroom_goal, "_repo_root_for", lambda path: repo)
     monkeypatch.setattr(warroom_goal, "_graphify_refresh_command", lambda repo_root: ["graphify-refresh-safe"])
@@ -381,7 +384,7 @@ def test_shared_same_corpus_stale_graphify_report_refreshes_from_shared_root(her
     refresh_command_roots = []
     refresh_calls = []
     calls = _fake_background_delegate(monkeypatch)
-    parent_agent = object()
+    parent_agent = type("ParentAgent", (), {"model": "gpt-5.5", "provider": "openai-codex"})()
 
     monkeypatch.setattr(warroom_goal, "_repo_root_for", lambda path: repo)
 
@@ -463,7 +466,7 @@ def test_stale_graphify_refresh_rc0_noop_stays_gap(hermes_home, tmp_path, monkey
     report = _write_graph_report(repo / "graphify-out" / "GRAPH_REPORT.md", repo, age_seconds=90000)
     refresh_calls = []
     calls = _fake_background_delegate(monkeypatch)
-    parent_agent = object()
+    parent_agent = type("ParentAgent", (), {"model": "gpt-5.5", "provider": "openai-codex"})()
 
     monkeypatch.setattr(warroom_goal, "_repo_root_for", lambda path: repo)
     monkeypatch.setattr(warroom_goal, "_graphify_refresh_command", lambda refresh_root: ["graphify-refresh-safe"])
@@ -507,7 +510,7 @@ def test_wrong_corpus_graphify_report_marks_not_applicable_and_continues(hermes_
         age_seconds=169457,
     )
     calls = _fake_background_delegate(monkeypatch)
-    parent_agent = object()
+    parent_agent = type("ParentAgent", (), {"model": "gpt-5.5", "provider": "openai-codex"})()
 
     monkeypatch.setattr(warroom_goal, "_repo_root_for", lambda path: repo)
     monkeypatch.setattr(
@@ -1602,6 +1605,8 @@ def test_role_ledger_distinguishes_real_child_session_stale_pid_and_status_line(
             "stdout": "spawned",
             "json_payload": {"ok": True},
             "current_phase": "running-tools",
+            "model": state.controller_model or "gpt-5.5",
+            "provider": "openai-codex",
         }
 
     updated = start_warroom_roles("sid-real-child", ["reviewer"], adapter=adapter, use_local_process=False)
@@ -1964,7 +1969,7 @@ def test_acp_goal_command_uses_global_hardwire_without_goalmanager(hermes_home, 
 
     server = object.__new__(HermesACPAgent)
     server.session_manager = SimpleNamespace(save_session=lambda session_id: None)
-    parent_agent = SimpleNamespace(session_id="sid-acp-global-goal")
+    parent_agent = SimpleNamespace(session_id="sid-acp-global-goal", model="gpt-5.5", provider="openai-codex")
     calls = _fake_background_delegate(monkeypatch)
     state = SimpleNamespace(session_id="sid-acp-global-goal", cwd=tmp_path, queued_prompts=[], agent=parent_agent)
 
@@ -1980,6 +1985,103 @@ def test_acp_goal_command_uses_global_hardwire_without_goalmanager(hermes_home, 
     assert state_record is not None
     assert state_record.workflow == "global_plan_adversary"
     assert state_record.gates["delegate_runtime"] == "pass"
+
+
+def test_warroom_roles_record_actual_delegate_model_for_plan_adversary_roles(hermes_home, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli.warroom_goal import create_warroom_goal
+
+    calls = _fake_background_delegate(monkeypatch)
+    parent_agent = SimpleNamespace(session_id="sid-warroom-model", model="gpt-5.5", provider="openai-codex")
+    state = create_warroom_goal(
+        "sid-warroom-model",
+        "prove plan adversary role model inheritance",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+        parent_agent=parent_agent,
+    )
+
+    assert len(calls) == 3
+    for role in ("plan_builder", "plan_adversary", "plan_reviewer"):
+        record = state.role_records[role]
+        assert record["model"] == "gpt-5.5"
+        assert record["provider"] == "openai-codex"
+        assert record["runtime_kind"] == "real_child_session"
+        assert record["spawn_receipt_only"] is False
+
+
+def test_warroom_roles_record_actual_delegate_model_for_fast_adversary_roles(hermes_home, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli.warroom_goal import create_warroom_goal
+
+    calls = _fake_background_delegate(monkeypatch)
+    parent_agent = SimpleNamespace(session_id="sid-fast-model", model="gpt-5.5", provider="openai-codex")
+    state = create_warroom_goal(
+        "sid-fast-model",
+        "Use adversary skill for: prove fast adversary role model inheritance",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+        parent_agent=parent_agent,
+    )
+
+    assert len(calls) == 4
+    for role in ("builder", "adversary", "reviewer", "guardian"):
+        record = state.role_records[role]
+        assert record["model"] == "gpt-5.5"
+        assert record["provider"] == "openai-codex"
+        assert record["runtime_kind"] == "real_child_session"
+        assert record["spawn_receipt_only"] is False
+
+
+def test_warroom_role_dispatch_blocks_null_model_recording(hermes_home, tmp_path, monkeypatch):
+    from hermes_cli.warroom_goal import create_warroom_goal, save_warroom_goal, start_warroom_roles
+
+    state = create_warroom_goal(
+        "sid-null-model",
+        "prove null child model is a recording gap",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.controller_model = "gpt-5.5"
+    save_warroom_goal("sid-null-model", state)
+
+    def adapter(**kwargs):
+        return {"adapter": "native_delegate", "delegation_id": "delegation-null-model", "runtime_id": "delegation-null-model", "stdout": "spawned"}
+
+    updated = start_warroom_roles("sid-null-model", ["reviewer"], adapter=adapter, use_local_process=False)
+
+    assert updated.status == "gap"
+    assert "MODEL_RECORDING_GAP" in (updated.last_gap or "")
+    assert updated.gates["delegate_runtime"] == "gap"
+
+
+def test_warroom_role_dispatch_blocks_gpt54_child_model_mismatch(hermes_home, tmp_path, monkeypatch):
+    from hermes_cli.warroom_goal import create_warroom_goal, save_warroom_goal, start_warroom_roles
+
+    state = create_warroom_goal(
+        "sid-gpt54-model",
+        "prove gpt-5.4 child mismatch is pinning gap",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.controller_model = "gpt-5.5"
+    save_warroom_goal("sid-gpt54-model", state)
+
+    def adapter(**kwargs):
+        return {
+            "adapter": "native_delegate",
+            "delegation_id": "delegation-gpt54",
+            "runtime_id": "delegation-gpt54",
+            "stdout": "spawned",
+            "model": "gpt-5.4",
+            "provider": "openai-codex",
+        }
+
+    updated = start_warroom_roles("sid-gpt54-model", ["reviewer"], adapter=adapter, use_local_process=False)
+
+    assert updated.status == "gap"
+    assert "model_inherit_controller_default" in (updated.last_gap or "")
+    assert updated.gates["delegate_runtime"] == "gap"
 
 
 

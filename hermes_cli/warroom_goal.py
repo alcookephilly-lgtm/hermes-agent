@@ -179,11 +179,14 @@ def _native_background_delegate_adapter(parent_agent: Any):
         delegation_id = str(payload.get("delegation_id") or "").strip()
         if not delegation_id:
             raise RuntimeError(f"native delegate did not return delegation_id: {payload}")
+        child_model = payload.get("model") or getattr(parent_agent, "model", None)
+        child_provider = payload.get("provider") or getattr(parent_agent, "provider", None)
         return {
             "adapter": "native_delegate_background",
             "delegation_id": delegation_id,
             "runtime_id": delegation_id,
-            "model": getattr(parent_agent, "model", None),
+            "model": child_model,
+            "provider": child_provider,
             "exit_code": 0,
             "stdout": raw,
             "json_payload": payload,
@@ -1040,6 +1043,27 @@ def _start_roles_for_state(
                         raise RuntimeError("INCOMPLETE_TRANSPORT: rc=0 with empty stdout, no JSON payload, and no artifact")
                     runtime_kind = "real_child_session" if child_session_id or delegation_id else None
                     spawn_receipt_only = False if runtime_kind == "real_child_session" else None
+                    actual_child_model = str(result.get("model") or "") if isinstance(result, dict) else ""
+                    actual_child_provider = str(result.get("provider") or "") if isinstance(result, dict) else ""
+                    if not actual_child_model:
+                        raise RuntimeError("MODEL_RECORDING_GAP: role dispatch did not return actual child model")
+                    actual_model_decision = agt_action_gateway(
+                        action="warroom.role_dispatch",
+                        caller="hermes_cli.warroom_goal._start_roles_for_state",
+                        policies=("model_inherit_controller_default",),
+                        target=role,
+                        state={"controller_model": state.controller_model, "workflow": state.workflow},
+                        metadata={
+                            "role": role,
+                            "parent_model": state.controller_model,
+                            "child_model": actual_child_model,
+                            "child_provider": actual_child_provider,
+                            "delegation_id": delegation_id,
+                            "child_session_id": child_session_id,
+                        },
+                    )
+                    if actual_model_decision.blocked:
+                        raise RuntimeError(actual_model_decision.error_message())
                 elif use_local_process:
                     result = _spawn_local_role_process(state, role, role_card_path, evidence_path)
                     adapter_name = str(result["adapter"])
@@ -1081,6 +1105,8 @@ def _start_roles_for_state(
                 )
                 if isinstance(result, dict) and result.get("model"):
                     record["model"] = str(result.get("model"))
+                if isinstance(result, dict) and result.get("provider"):
+                    record["provider"] = str(result.get("provider"))
                 if isinstance(result, dict):
                     stdout_text = str(result.get("stdout") or result.get("output") or "")
                     stderr_text = str(result.get("stderr") or "")
@@ -1096,7 +1122,7 @@ def _start_roles_for_state(
                 if not Path(evidence_path).exists():
                     _write_json(Path(evidence_path), {"record": record, "event": "role_spawned"})
             except Exception as exc:
-                failed_roles.append(role)
+                failed_roles.append(f"{role}: {exc}")
                 record = _role_record(
                     role=role,
                     status="gap",
@@ -1123,6 +1149,7 @@ def _start_roles_for_state(
         state.status = "gap"
         state.gates["role_cards"] = "blocked" if missing_cards else state.gates.get("role_cards", "pass")
         state.gates["role_spawn"] = "gap"
+        state.gates["delegate_runtime"] = "gap"
         gap_bits = []
         if missing_cards:
             gap_bits.append("missing role card(s): " + ", ".join(missing_cards))
