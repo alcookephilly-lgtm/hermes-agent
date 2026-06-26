@@ -213,6 +213,28 @@ HEADING_PREFIX_RE = re.compile(r"^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)")
 MUTATING_TOOLS = {"write_file", "patch", "skill_manage"}
 READ_ONLY_RECOVERY_TOOLS = {"read_file", "search_files", "session_search", "skill_view", "skills_list"}
 READ_ONLY_PROCESS_ACTIONS = {"list", "poll", "log", "wait"}
+ROBOT_HAND_CURRENT_MARKERS = (
+    "ROBOT_HAND_DISCOVERY_PASS",
+    "GRAPHIFY_DISCOVERY_PASS",
+    "JCODEMUNCH_INDEX_CURRENT",
+    "CODEGRAPH_INDEX_CURRENT",
+    "CODEGRAPH_SYNCED",
+    "SMART_READ_USED",
+    "JDOCMUNCH_USED",
+)
+ROBOT_HAND_NAMED_GAPS = (
+    "ROBOT_HAND_GAP",
+    "JCODEMUNCH_STALE_GAP",
+    "GRAPHIFY_STALE_BLOCK",
+    "CODEGRAPH_STALE_GAP",
+)
+ROBOT_HAND_STALE_MARKERS = (
+    "JCODEMUNCH_INDEX_STALE",
+    "JCODEMUNCH_STALE_GAP",
+    "GRAPHIFY_STALE_BLOCK",
+    "CODEGRAPH_STALE",
+    "CODEGRAPH_STALE_GAP",
+)
 FINAL_CLAIM_RE = re.compile(r"\b(done|fixed|complete|completed|shipped|hardwired)\b", re.I)
 NEGATED_CLAIM_RE = re.compile(r"\b(not|no|isn[’\']t|is not|still|remain(?:s|ing)?|open|failed|blocked|gap)\b", re.I)
 E2E_CLAIM_RE = re.compile(r"\be2e\b|end[- ]to[- ]end", re.I)
@@ -239,6 +261,7 @@ ADMIN_MUTATING_TERMINAL_RE = re.compile(
     re.I | re.X,
 )
 EXECUTE_CODE_WRITE_RE = re.compile(r"\b(open\(.+['\"]w|write_text\(|write_bytes\(|shutil\.rmtree|os\.remove|Path\(.+\)\.unlink)", re.I)
+RAW_DISCOVERY_TERMINAL_RE = re.compile(r"\b(grep|rg|find|cat|head|tail)\b", re.I)
 ALLOWED_HALT_REASONS = [
     "explicit_user_stop",
     "credentials_or_physical_access",
@@ -1430,6 +1453,135 @@ def _is_protected_local_target_path(path: str) -> bool:
     return resolved == "/etc" or resolved.startswith("/etc/") or resolved == "/opt" or resolved.startswith("/opt/") or resolved == "/root" or resolved.startswith("/root/")
 
 
+def _terminal_uses_remote_ssh(command: str) -> bool:
+    return "ssh vps" in command or "ssh root@srv1336035.hstgr.cloud" in command
+
+
+def _remote_mutation_approved(state: WarroomGoalState) -> bool:
+    evidence = _state_evidence_strings(state)
+    return state.gates.get("remote_mutation_approval") == "pass" or any(
+        "REMOTE_MUTATION_APPROVED" in item for item in evidence
+    )
+
+
+def _remote_command_touches_protected_local_path(command: str) -> bool:
+    return bool(re.search(r"(?<![\w./-])/(?:etc|opt|root)(?:/|\b)", command or ""))
+
+
+def _state_evidence_strings(state: WarroomGoalState) -> List[str]:
+    items: List[str] = []
+    for value in state.gate_evidence.values():
+        if isinstance(value, list):
+            items.extend(str(item) for item in value)
+        elif value is not None:
+            items.append(str(value))
+    return items
+
+
+def _evidence_contains(state: WarroomGoalState, markers: tuple[str, ...]) -> bool:
+    evidence = _state_evidence_strings(state)
+    return any(marker in item for item in evidence for marker in markers)
+
+
+def _first_evidence_marker(state: WarroomGoalState, markers: tuple[str, ...]) -> Optional[str]:
+    for item in _state_evidence_strings(state):
+        for marker in markers:
+            if marker in item:
+                return marker
+    return None
+
+
+def _is_safe_local_doc_read(state: WarroomGoalState, tool_name: str, args: Dict[str, Any]) -> bool:
+    if tool_name not in {"read_file", "search_files"}:
+        return False
+    path_text = str(args.get("path") or "")
+    if not path_text:
+        return False
+    try:
+        path = Path(path_text).expanduser().resolve()
+    except Exception:
+        return False
+    roots = [state.tracking_dir, state.allowed_mutation_root]
+    if not any(root and _path_inside(str(path), str(root)) for root in roots):
+        return False
+    if tool_name == "search_files":
+        return True
+    suffix = path.suffix.lower()
+    return suffix in TRACKING_DOC_SUFFIXES or "graphify-out" in str(path)
+
+
+def _is_raw_discovery_tool(tool_name: str, args: Dict[str, Any]) -> bool:
+    if tool_name in {"read_file", "search_files"}:
+        return True
+    if tool_name == "terminal":
+        command = str(args.get("command") or "")
+        if _terminal_uses_remote_ssh(command):
+            return False
+        return bool(RAW_DISCOVERY_TERMINAL_RE.search(command))
+    return False
+
+
+def _robot_hand_discovery_decision(
+    state: WarroomGoalState,
+    tool_name: str,
+    args: Dict[str, Any],
+) -> Optional[str]:
+    if state.workflow not in {"fast_adversary", "strict_plan_adversary", "global_plan_adversary"}:
+        return None
+    if not _is_raw_discovery_tool(tool_name, args) or _is_safe_local_doc_read(state, tool_name, args):
+        return None
+    named_gap = _first_evidence_marker(state, ROBOT_HAND_NAMED_GAPS)
+    decision = agt_action_gateway(
+        action="raw_discovery_fallback",
+        caller="hermes_cli.warroom_goal.enforce_tool_policy",
+        policies=("robot_hand_discovery_required",),
+        target=str(args.get("path") or args.get("pattern") or args.get("command") or ""),
+        state={"workflow": state.workflow, "current_role": state.current_role},
+        metadata={
+            "session_id": state.session_id,
+            "role": state.current_role,
+            "tool_name": tool_name,
+            "raw_discovery": True,
+            "robot_hand_current": _evidence_contains(state, ROBOT_HAND_CURRENT_MARKERS),
+            "robot_hand_stale": _evidence_contains(state, ROBOT_HAND_STALE_MARKERS),
+            "robot_hand_gap": named_gap or "",
+            "attempted_path": str(args.get("path") or ""),
+            "attempted_command": str(args.get("command") or ""),
+        },
+    )
+    if decision.blocked:
+        return decision.error_message()
+    return None
+
+
+def _codegraph_before_edit_decision(state: WarroomGoalState, tool_name: str, args: Dict[str, Any]) -> Optional[str]:
+    if state.workflow not in {"fast_adversary", "strict_plan_adversary", "global_plan_adversary"}:
+        return None
+    if not _tool_mutates(tool_name, args):
+        return None
+    decision = agt_action_gateway(
+        action="code_mutation",
+        caller="hermes_cli.warroom_goal.enforce_tool_policy",
+        policies=("codegraph_current_before_edit",),
+        target=str(args.get("path") or args.get("command") or ""),
+        state={"workflow": state.workflow, "current_role": state.current_role},
+        metadata={
+            "session_id": state.session_id,
+            "role": state.current_role,
+            "tool_name": tool_name,
+            "code_mutation": True,
+            "codegraph_stale": _evidence_contains(state, ("CODEGRAPH_STALE", "CODEGRAPH_STALE_GAP")),
+            "codegraph_current": _evidence_contains(state, ("CODEGRAPH_INDEX_CURRENT",)),
+            "codegraph_synced": _evidence_contains(state, ("CODEGRAPH_SYNCED",)),
+            "attempted_path": str(args.get("path") or ""),
+            "attempted_command": str(args.get("command") or ""),
+        },
+    )
+    if decision.blocked:
+        return decision.error_message()
+    return None
+
+
 def _remote_target_local_path_block(state: WarroomGoalState, tool_name: str, args: Dict[str, Any]) -> Optional[str]:
     if state.remote_target != "vps":
         return None
@@ -1439,10 +1591,47 @@ def _remote_target_local_path_block(state: WarroomGoalState, tool_name: str, arg
             return "WARROOM V3 blocked: remote target is vps; local /etc, /opt, and /root are not target files. Use ssh vps."
     if tool_name == "terminal":
         command = str(args.get("command") or "")
-        if "ssh vps" in command or "ssh root@srv1336035.hstgr.cloud" in command:
+        if _terminal_uses_remote_ssh(command):
+            if _terminal_mutates(args) and not _remote_mutation_approved(state):
+                return "WARROOM V3 blocked: remote target vps mutation requires explicit approved mutation phase."
             return None
-        if re.search(r"(?<![\w./-])/(?:etc|opt|root)(?:/|\b)", command):
+        if _remote_command_touches_protected_local_path(command):
             return "WARROOM V3 blocked: remote target is vps; terminal access to /etc, /opt, or /root must go through ssh vps."
+    return None
+
+
+def _remote_target_policy_decision(state: WarroomGoalState, tool_name: str, args: Dict[str, Any]) -> Optional[str]:
+    if state.remote_target != "vps":
+        return None
+    path = str(args.get("path") or "")
+    command = str(args.get("command") or "")
+    protected_local = bool(path and _is_protected_local_target_path(path)) or _remote_command_touches_protected_local_path(command)
+    remote_mutation = tool_name == "terminal" and _terminal_uses_remote_ssh(command) and _terminal_mutates(args)
+    remote_attempt = protected_local or remote_mutation or (tool_name == "terminal" and _terminal_uses_remote_ssh(command))
+    if not remote_attempt:
+        return None
+    decision = agt_action_gateway(
+        action="remote_target_access",
+        caller="hermes_cli.warroom_goal.enforce_tool_policy",
+        policies=("remote_target_requires_ssh", "remote_mutation_requires_approval"),
+        target=path or command,
+        state={"remote_target": state.remote_target, "current_role": state.current_role},
+        metadata={
+            "session_id": state.session_id,
+            "remote_target": state.remote_target,
+            "role": state.current_role,
+            "tool_name": tool_name,
+            "path": path,
+            "command": command,
+            "attempted_path": path,
+            "attempted_command": command,
+            "protected_local_target": protected_local,
+            "remote_mutation": remote_mutation,
+            "remote_mutation_approved": _remote_mutation_approved(state),
+        },
+    )
+    if decision.blocked:
+        return decision.error_message()
     return None
 
 
@@ -2026,25 +2215,22 @@ def enforce_tool_policy(session_id: str, tool_name: str, args: Dict[str, Any]) -
     if state.required_action == "spawn_roles":
         return "WARROOM V3 blocked: required role spawn action is pending; normal chat/tool fallback denied."
 
+    remote_policy = _remote_target_policy_decision(state, tool_name, args)
+    if remote_policy:
+        return remote_policy
     remote_block = _remote_target_local_path_block(state, tool_name, args)
     if remote_block:
-        agt_action_gateway(
-            action="protected_target_path",
-            caller="hermes_cli.warroom_goal.enforce_tool_policy",
-            policies=("remote_target_requires_ssh",),
-            target=str(args.get("path") or args.get("command") or ""),
-            state={"remote_target": state.remote_target, "current_role": state.current_role},
-            metadata={
-                "remote_target": state.remote_target,
-                "role": state.current_role,
-                "tool_name": tool_name,
-                "path": str(args.get("path") or ""),
-                "command": str(args.get("command") or ""),
-            },
-        )
         return remote_block
 
+    robot_hand_block = _robot_hand_discovery_decision(state, tool_name, args)
+    if robot_hand_block:
+        return robot_hand_block
+
     mutating = _tool_mutates(tool_name, args)
+    if mutating:
+        codegraph_block = _codegraph_before_edit_decision(state, tool_name, args)
+        if codegraph_block:
+            return codegraph_block
     # Terminal can be read-only proof work for Controller. Only mutating shell
     # commands are builder-only; execute_code remains mutation-capable because
     # arbitrary Python is too broad for role-policy proof.

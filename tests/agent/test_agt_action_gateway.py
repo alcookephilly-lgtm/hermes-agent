@@ -180,3 +180,90 @@ def test_terminal_and_file_protected_path_call_sites_block_before_execution(monk
     assert "remote_target_requires_ssh" in terminal_result["error"]
     assert "remote_target_requires_ssh" in read_result["error"]
     assert "remote_target_requires_ssh" in write_result["error"]
+
+
+def test_remote_audit_flattens_target_context_and_blocks_mutation_without_approval(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    blocked = agt_action_gateway(
+        action="remote_target_access",
+        caller="test",
+        policies=("remote_target_requires_ssh", "remote_mutation_requires_approval"),
+        target="ssh vps 'sudo systemctl restart hermes-gateway'",
+        state={"remote_target": "vps"},
+        metadata={
+            "session_id": "sid",
+            "remote_target": "vps",
+            "role": "builder",
+            "attempted_path": "",
+            "attempted_command": "ssh vps 'sudo systemctl restart hermes-gateway'",
+            "command": "ssh vps 'sudo systemctl restart hermes-gateway'",
+            "remote_mutation": True,
+            "remote_mutation_approved": False,
+        },
+    )
+
+    assert blocked.decision == "deny"
+    assert blocked.policy == "remote_mutation_requires_approval"
+    event = _events(tmp_path)[-1]
+    assert event["remote_target"] == "vps"
+    assert event["attempted_command"].startswith("ssh vps")
+    assert event["role"] == "builder"
+    assert event["session_id"] == "sid"
+
+
+def test_robot_hand_gateway_blocks_raw_fallback_until_current_or_gap(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    blocked = agt_action_gateway(
+        action="raw_discovery_fallback",
+        caller="test",
+        policies=("robot_hand_discovery_required",),
+        target="search_files:foo",
+        metadata={"raw_discovery": True, "robot_hand_current": False, "robot_hand_stale": False},
+    )
+    assert blocked.decision == "deny"
+    assert "robot-hand discovery required" in blocked.reason
+
+    stale = agt_action_gateway(
+        action="raw_discovery_fallback",
+        caller="test",
+        policies=("robot_hand_discovery_required",),
+        target="search_files:foo",
+        metadata={"raw_discovery": True, "robot_hand_current": True, "robot_hand_stale": True},
+    )
+    assert stale.decision == "deny"
+    assert "stale robot-hand index" in stale.reason
+
+    allowed_gap = agt_action_gateway(
+        action="raw_discovery_fallback",
+        caller="test",
+        policies=("robot_hand_discovery_required",),
+        target="search_files:foo",
+        metadata={"raw_discovery": True, "robot_hand_gap": "ROBOT_HAND_GAP"},
+    )
+    assert allowed_gap.allowed
+    assert "explicit robot-hand gap" in allowed_gap.reason
+
+
+def test_codegraph_stale_gateway_blocks_edit_until_synced(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    blocked = agt_action_gateway(
+        action="code_mutation",
+        caller="test",
+        policies=("codegraph_current_before_edit",),
+        target="module.py",
+        metadata={"code_mutation": True, "codegraph_stale": True},
+    )
+    assert blocked.decision == "deny"
+    assert "CodeGraph stale" in blocked.reason
+
+    synced = agt_action_gateway(
+        action="code_mutation",
+        caller="test",
+        policies=("codegraph_current_before_edit",),
+        target="module.py",
+        metadata={"code_mutation": True, "codegraph_stale": True, "codegraph_synced": True},
+    )
+    assert synced.allowed

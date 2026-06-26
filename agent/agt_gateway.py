@@ -28,6 +28,9 @@ AGT_POLICIES = frozenset(
         "parent_owned_proof_write",
         "no_terminal_junk_as_user_intent",
         "remote_target_requires_ssh",
+        "remote_mutation_requires_approval",
+        "robot_hand_discovery_required",
+        "codegraph_current_before_edit",
         "model_inherit_controller_default",
         "stale_async_quarantine",
     }
@@ -104,6 +107,10 @@ def _state_hash(state: Mapping[str, Any] | None, metadata: Mapping[str, Any]) ->
 def _write_audit(decision: AGTDecision) -> AGTDecision:
     path = _audit_path()
     event = asdict(decision)
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    for key in ("remote_target", "attempted_path", "attempted_command", "role", "session_id"):
+        if key in metadata and key not in event:
+            event[key] = metadata[key]
     event["ts"] = time.time()
     event["audit_path"] = str(path)
     with path.open("a", encoding="utf-8") as fh:
@@ -180,11 +187,45 @@ def agt_action_gateway(
         if remote_target == "vps":
             command = str(meta.get("command") or "")
             target_values = [target, *_metadata_strings(meta, "path", "target_path", "paths")]
-            protected = any(_looks_protected_path(value) for value in target_values)
+            protected = bool(meta.get("protected_local_target")) or any(
+                _looks_protected_path(value) for value in target_values
+            )
             if protected and not _command_uses_ssh(command):
                 decision = "deny"
                 matched_policy = "remote_target_requires_ssh"
                 reason = "remote target vps requires ssh vps for protected target paths"
+
+    if decision == "allow" and "remote_mutation_requires_approval" in policy_list:
+        remote_target = str(meta.get("remote_target") or state_map.get("remote_target") or "")
+        if remote_target == "vps" and meta.get("remote_mutation") is True:
+            if not meta.get("remote_mutation_approved"):
+                decision = "deny"
+                matched_policy = "remote_mutation_requires_approval"
+                reason = "remote target vps mutation requires explicit approved mutation phase"
+
+    if decision == "allow" and "robot_hand_discovery_required" in policy_list:
+        if meta.get("raw_discovery") is True:
+            has_current = bool(meta.get("robot_hand_current"))
+            named_gap = str(meta.get("robot_hand_gap") or "")
+            stale_without_gap = bool(meta.get("robot_hand_stale")) and not named_gap
+            if stale_without_gap:
+                decision = "deny"
+                matched_policy = "robot_hand_discovery_required"
+                reason = "stale robot-hand index cannot silently count as current discovery"
+            elif not has_current and not named_gap:
+                decision = "deny"
+                matched_policy = "robot_hand_discovery_required"
+                reason = "robot-hand discovery required before raw file search/read fallback"
+            elif named_gap:
+                matched_policy = "robot_hand_discovery_required"
+                reason = f"explicit robot-hand gap permits raw fallback: {named_gap}"
+
+    if decision == "allow" and "codegraph_current_before_edit" in policy_list:
+        if meta.get("code_mutation") is True and meta.get("codegraph_stale") is True:
+            if not (meta.get("codegraph_current") or meta.get("codegraph_synced")):
+                decision = "deny"
+                matched_policy = "codegraph_current_before_edit"
+                reason = "CodeGraph stale status requires sync or block before edit"
 
     if decision == "allow" and "parent_owned_proof_write" in policy_list:
         role = str(meta.get("role") or state_map.get("current_role") or "")

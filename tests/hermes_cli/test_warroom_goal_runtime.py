@@ -58,6 +58,13 @@ def _unlock_runtime_for_policy_test(state):
     return state
 
 
+def _agt_events(home: Path):
+    for path in (home / "logs" / "agt_action_gateway.jsonl", home / "agt_action_gateway.jsonl"):
+        if path.exists():
+            return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return []
+
+
 def _fake_background_delegate(monkeypatch):
     calls = []
 
@@ -1283,12 +1290,166 @@ def test_remote_vps_target_blocks_local_target_paths(hermes_home, tmp_path):
 
     assert state.remote_target == "vps"
     blocked_read = enforce_tool_policy("sid-remote-vps", "read_file", {"path": "/etc/passwd"})
+    blocked_opt = enforce_tool_policy("sid-remote-vps", "read_file", {"path": "/opt/mls-vulture/config"})
+    blocked_root = enforce_tool_policy("sid-remote-vps", "search_files", {"path": "/root", "pattern": "*.conf"})
     blocked_shell = enforce_tool_policy("sid-remote-vps", "terminal", {"command": "cat /opt/app/config.yaml"})
     allowed_ssh = enforce_tool_policy("sid-remote-vps", "terminal", {"command": "ssh vps 'cat /etc/passwd'", "workdir": str(tmp_path)})
 
     assert blocked_read and "ssh vps" in blocked_read
+    assert blocked_opt and "ssh vps" in blocked_opt
+    assert blocked_root and "ssh vps" in blocked_root
     assert blocked_shell and "ssh vps" in blocked_shell
     assert allowed_ssh is None
+    events = _agt_events(hermes_home)
+    remote_events = [event for event in events if event.get("remote_target") == "vps"]
+    assert remote_events
+    for event in remote_events:
+        assert event.get("caller") == "hermes_cli.warroom_goal.enforce_tool_policy"
+        assert event.get("role") == "builder"
+        assert event.get("session_id") == "sid-remote-vps"
+        assert event.get("reason")
+        assert event.get("decision") in {"allow", "deny"}
+        assert "attempted_path" in event and "attempted_command" in event
+
+
+def test_remote_vps_mutating_ssh_requires_explicit_approval_state(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-remote-vps-mutate",
+        "Use adversary skill for: build hardwire\nRemote target: vps",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    _unlock_runtime_for_policy_test(state)
+    state.current_role = "builder"
+    save_warroom_goal("sid-remote-vps-mutate", state)
+
+    blocked = enforce_tool_policy(
+        "sid-remote-vps-mutate",
+        "terminal",
+        {"command": "ssh vps 'sudo systemctl restart hermes-gateway'", "workdir": str(tmp_path)},
+    )
+    assert blocked and "explicit approved mutation phase" in blocked
+
+    state.gates["remote_mutation_approval"] = "pass"
+    save_warroom_goal("sid-remote-vps-mutate", state)
+    allowed = enforce_tool_policy(
+        "sid-remote-vps-mutate",
+        "terminal",
+        {"command": "ssh vps 'sudo systemctl restart hermes-gateway'", "workdir": str(tmp_path)},
+    )
+    assert allowed is None
+
+
+def test_local_build_doc_reads_remain_allowed_without_robot_hand_gap(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, save_warroom_goal
+
+    doc = tmp_path / "build-note.md"
+    doc.write_text("proof note", encoding="utf-8")
+    state = create_warroom_goal(
+        "sid-local-doc-read",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    _unlock_runtime_for_policy_test(state)
+    state.current_role = "controller"
+    save_warroom_goal("sid-local-doc-read", state)
+
+    assert enforce_tool_policy("sid-local-doc-read", "read_file", {"path": str(doc)}) is None
+
+
+def test_robot_hand_discovery_required_before_raw_search_in_adversary_workflow(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-robot-adversary",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    _unlock_runtime_for_policy_test(state)
+    state.current_role = "controller"
+    save_warroom_goal("sid-robot-adversary", state)
+
+    blocked = enforce_tool_policy("sid-robot-adversary", "search_files", {"path": "/repo", "pattern": "foo"})
+    assert blocked and "robot-hand discovery required" in blocked
+
+    state.gate_evidence["robot_hand"] = ["ROBOT_HAND_DISCOVERY_PASS:jcodemunch current"]
+    save_warroom_goal("sid-robot-adversary", state)
+    assert enforce_tool_policy("sid-robot-adversary", "search_files", {"path": "/repo", "pattern": "foo"}) is None
+
+
+def test_robot_hand_discovery_required_before_raw_search_in_plan_adversary_workflow(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-robot-plan",
+        _strict_goal(),
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    _unlock_runtime_for_policy_test(state)
+    state.current_role = "controller"
+    save_warroom_goal("sid-robot-plan", state)
+
+    blocked = enforce_tool_policy("sid-robot-plan", "terminal", {"command": "grep -R foo hermes_cli", "workdir": str(tmp_path)})
+    assert blocked and "robot-hand discovery required" in blocked
+
+    state.gate_evidence["robot_hand"] = ["SMART_READ_USED:/tmp/plan.md"]
+    save_warroom_goal("sid-robot-plan", state)
+    assert enforce_tool_policy("sid-robot-plan", "terminal", {"command": "grep -R foo hermes_cli", "workdir": str(tmp_path)}) is None
+
+
+def test_stale_jcodemunch_and_codegraph_do_not_silently_pass(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, save_warroom_goal
+
+    target = tmp_path / "module.py"
+    target.write_text("x = 1\n", encoding="utf-8")
+    state = create_warroom_goal(
+        "sid-stale-index",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    _unlock_runtime_for_policy_test(state)
+    state.current_role = "builder"
+    state.gate_evidence["robot_hand"] = ["JCODEMUNCH_INDEX_STALE:indexed 2026-06-24"]
+    state.gate_evidence["codegraph"] = ["CODEGRAPH_STALE:status says stale"]
+    save_warroom_goal("sid-stale-index", state)
+
+    raw_blocked = enforce_tool_policy("sid-stale-index", "search_files", {"path": "/repo", "pattern": "foo"})
+    edit_blocked = enforce_tool_policy("sid-stale-index", "write_file", {"path": str(target), "content": "x = 2\n"})
+    assert raw_blocked and "stale robot-hand index" in raw_blocked
+    assert edit_blocked and "CodeGraph stale" in edit_blocked
+
+    state.gate_evidence["robot_hand"] = ["JCODEMUNCH_STALE_GAP:index unavailable; fallback audited"]
+    state.gate_evidence["codegraph"] = ["CODEGRAPH_STALE:status says stale", "CODEGRAPH_SYNCED:status up to date"]
+    save_warroom_goal("sid-stale-index", state)
+    assert enforce_tool_policy("sid-stale-index", "search_files", {"path": "/repo", "pattern": "foo"}) is None
+    assert enforce_tool_policy("sid-stale-index", "write_file", {"path": str(target), "content": "x = 3\n"}) is None
+
+
+def test_explicit_robot_hand_gap_permits_raw_fallback_with_audit_record(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-robot-gap",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    _unlock_runtime_for_policy_test(state)
+    state.current_role = "controller"
+    state.gate_evidence["robot_hand"] = ["ROBOT_HAND_GAP:mcp server unavailable"]
+    save_warroom_goal("sid-robot-gap", state)
+
+    assert enforce_tool_policy("sid-robot-gap", "search_files", {"path": "/repo", "pattern": "foo"}) is None
+    event = _agt_events(hermes_home)[-1]
+    assert event["policy"] == "robot_hand_discovery_required"
+    assert event["decision"] == "allow"
+    assert event["metadata"]["robot_hand_gap"] == "ROBOT_HAND_GAP"
 
 
 def test_child_role_cannot_write_parent_owned_proof_state(hermes_home, tmp_path):
