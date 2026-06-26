@@ -132,6 +132,39 @@ def test_child_self_report_cannot_satisfy_done_proof(monkeypatch, tmp_path):
     assert decision.policy == "no_child_self_report_as_proof"
 
 
+def test_final_claim_requires_current_state_hash_match(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    decision = agt_action_gateway(
+        action="final_completion_claim",
+        caller="test",
+        policies=("proof.required_for_done",),
+        target="sid",
+        metadata={
+            "final_completion_claim": True,
+            "proof_packet_exists": True,
+            "guardian_pass": True,
+            "current_state_hash_matches": False,
+        },
+    )
+    assert decision.decision == "deny"
+    assert "current state hash match" in decision.reason
+
+    allowed = agt_action_gateway(
+        action="final_completion_claim",
+        caller="test",
+        policies=("proof.required_for_done",),
+        target="sid",
+        metadata={
+            "final_completion_claim": True,
+            "proof_packet_exists": True,
+            "guardian_pass": True,
+            "current_state_hash_matches": True,
+        },
+    )
+    assert allowed.allowed
+
+
 def test_terminal_and_file_protected_path_call_sites_block_before_execution(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_REMOTE_TARGET", "vps")

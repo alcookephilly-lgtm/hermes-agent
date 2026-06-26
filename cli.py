@@ -2852,6 +2852,15 @@ def _strip_leaked_terminal_responses(text: str) -> str:
     return cleaned
 
 
+def _prepare_cli_user_text_for_model_turn(text: str) -> tuple[str, bool, bool]:
+    """Clean submitted CLI text and say whether it is pure terminal junk."""
+    original = text
+    cleaned = _strip_leaked_bracketed_paste_wrappers(text)
+    cleaned, had_mouse_reports = _strip_leaked_terminal_responses_with_meta(cleaned)
+    pure_terminal_junk = bool(original.strip()) and not cleaned.strip()
+    return cleaned, had_mouse_reports, pure_terminal_junk
+
+
 def _estimate_tui_input_height(
     lines: list[str] | tuple[str, ...],
     prompt_text: str,
@@ -13298,10 +13307,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         user_input, submit_images = user_input
 
                     if isinstance(user_input, str):
-                        user_input = _strip_leaked_bracketed_paste_wrappers(user_input)
-                        user_input, _had_mouse_reports = _strip_leaked_terminal_responses_with_meta(user_input)
+                        user_input, _had_mouse_reports, _pure_terminal_junk = _prepare_cli_user_text_for_model_turn(user_input)
                         if _had_mouse_reports:
                             self._recover_terminal_input_modes(reason="mouse reports leaked into submitted input")
+                        if _pure_terminal_junk and not submit_images:
+                            continue
                     
                     # Check for commands — but detect dragged/pasted file paths first.
                     # See _detect_file_drop() for details.

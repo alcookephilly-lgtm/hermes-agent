@@ -646,7 +646,7 @@ def test_tool_policy_blocks_reviewer_and_skill_dir_mutation(hermes_home, tmp_pat
 
 
 def test_final_guard_blocks_done_without_proof_and_health_only(hermes_home, tmp_path):
-    from hermes_cli.warroom_goal import create_warroom_goal, guard_final_response, save_warroom_goal
+    from hermes_cli.warroom_goal import create_warroom_goal, guard_final_response, record_role_output, save_warroom_goal
 
     state = create_warroom_goal(
         "sid-final",
@@ -660,8 +660,10 @@ def test_final_guard_blocks_done_without_proof_and_health_only(hermes_home, tmp_
 
     state.proof_packet_path = str(tmp_path / "proof-packet.md")
     Path(state.proof_packet_path).write_text("Status: PASS\nGuardian verdict: PASS\n", encoding="utf-8")
-    state.final_claim_allowed = True
     save_warroom_goal("sid-final", state)
+    guardian = tmp_path / "guardian.txt"
+    guardian.write_text("Guardian verdict: PASS\n", encoding="utf-8")
+    record_role_output("sid-final", "guardian", evidence_path=str(guardian), verdict="PASS")
     blocked = guard_final_response("sid-final", "DONE. Health check passed.", closure=True)
     assert "health check" in blocked.lower()
 
@@ -1075,10 +1077,39 @@ def test_builder_self_report_cannot_unlock_guardian_final_gate(hermes_home, tmp_
     assert "Normal chat fallback: NO" in completed
     from hermes_cli.warroom_goal import load_warroom_goal
     completed_state = load_warroom_goal("sid-guardian-unlock")
+    assert completed_state is not None
     assert completed_state.status == "done"
     assert completed_state.gates["proof_packet"] == "pass"
     assert completed_state.gates["e2e_claim"] == "pass"
     assert "GOAL COMPLETED emitted" in completed_state.gate_evidence["completion_output"]
+
+
+def test_final_claim_requires_current_state_hash_match(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, guard_final_response, record_role_output, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-final-hash",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    proof = tmp_path / "proof-packet.md"
+    proof.write_text("tests passed\n", encoding="utf-8")
+    state.proof_packet_path = str(proof)
+    save_warroom_goal("sid-final-hash", state)
+
+    guardian = tmp_path / "guardian.txt"
+    guardian.write_text("Guardian verdict: PASS\n", encoding="utf-8")
+    unlocked = record_role_output("sid-final-hash", "guardian", evidence_path=str(guardian), verdict="PASS")
+    assert unlocked is not None
+    assert unlocked.final_claim_state_hash
+
+    unlocked.role_records["builder"] = {"status": "done", "evidence_path": str(tmp_path / "late-builder.txt")}
+    save_warroom_goal("sid-final-hash", unlocked)
+
+    blocked = guard_final_response("sid-final-hash", "DONE. pytest E2E passed and proof packet written.", closure=True)
+    assert "FINAL BLOCKED" in blocked
+    assert "state hash" in blocked
 
 
 def test_normal_chat_does_not_run_final_guard_while_spawn_pending(hermes_home, tmp_path):

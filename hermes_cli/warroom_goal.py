@@ -312,6 +312,7 @@ class WarroomGoalState:
     noncritical_pause_attempts: List[Dict[str, Any]] = field(default_factory=list)
     cleanup_gap: Optional[str] = None
     final_claim_allowed: bool = False
+    final_claim_state_hash: Optional[str] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, sort_keys=True)
@@ -336,6 +337,15 @@ class WarroomGoalState:
             f"WARROOM V3 {self.workflow}: {self.status} (role={self.current_role or 'none'}) "
             f"{runtime_drift_line()} progress=[{progress}]"
         )
+
+
+def _final_claim_state_hash(state: WarroomGoalState) -> str:
+    """Stable hash of the state a Guardian PASS unlocked for final claims."""
+    payload = asdict(state)
+    for volatile in ("created_at", "updated_at", "final_claim_state_hash"):
+        payload.pop(volatile, None)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -1128,6 +1138,7 @@ def record_role_output(
         state.guardian_pass = verdict_pass
         state.final_claim_allowed = state.guardian_pass and bool(state.proof_packet_path and Path(state.proof_packet_path).exists())
         state.gates["guardian"] = "pass" if state.guardian_pass else "blocked"
+        state.final_claim_state_hash = _final_claim_state_hash(state) if state.final_claim_allowed else None
         if not state.guardian_pass:
             state.last_gap = "Guardian PASS evidence missing or invalid"
     save_warroom_goal(session_id, state)
@@ -1915,6 +1926,8 @@ def guard_final_response(session_id: str, response: str, *, closure: bool = Fals
     if has_final_claim:
         proof = state.proof_packet_path
         proof_exists = bool(proof and Path(proof).exists())
+        current_state_hash = _final_claim_state_hash(state)
+        state_hash_matches = bool(state.final_claim_state_hash and state.final_claim_state_hash == current_state_hash)
         final_decision = agt_action_gateway(
             action="final_completion_claim",
             caller="hermes_cli.warroom_goal.guard_final_response",
@@ -1925,15 +1938,18 @@ def guard_final_response(session_id: str, response: str, *, closure: bool = Fals
                 "final_completion_claim": True,
                 "proof_packet_exists": proof_exists,
                 "guardian_pass": bool(state.final_claim_allowed),
+                "current_state_hash": current_state_hash,
+                "final_claim_state_hash": state.final_claim_state_hash,
+                "current_state_hash_matches": state_hash_matches,
                 "child_self_report": False,
             },
         )
         if final_decision.blocked:
             return (
                 "WARROOM V3 FINAL BLOCKED: final done/fixed/complete claim requires proof packet "
-                "and Guardian PASS.\nGAP: proof packet/final_claim_allowed missing."
+                "Guardian PASS, and current state hash match.\nGAP: proof packet/final_claim_allowed/state hash missing or stale."
             )
-        if E2E_CLAIM_RE.search(response) and HEALTH_ONLY_RE.search(response) and not E2E_EVIDENCE_RE.search(response):
+        if HEALTH_ONLY_RE.search(response) and not E2E_EVIDENCE_RE.search(response):
             return "WARROOM V3 FINAL BLOCKED: health checks alone do not prove E2E."
         state.status = "done"
         state.gates["e2e_claim"] = "pass"

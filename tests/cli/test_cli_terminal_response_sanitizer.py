@@ -5,7 +5,7 @@ leak into the input buffer after terminal resize storms or multiplexer
 tab switches — see issue #14692.
 """
 
-from cli import _strip_leaked_terminal_responses
+from cli import _prepare_cli_user_text_for_model_turn, _strip_leaked_terminal_responses
 
 
 class TestStripLeakedTerminalResponses:
@@ -87,3 +87,16 @@ class TestStripLeakedTerminalResponses:
     def test_preserves_normal_text_containing_torn_cpr_shape(self):
         text = "see section 48;1R for details"
         assert _strip_leaked_terminal_responses(text) == text
+
+    def test_pure_terminal_junk_gets_no_model_turn(self):
+        cleaned, had_mouse_reports, pure_terminal_junk = _prepare_cli_user_text_for_model_turn("22R48;1R")
+        assert cleaned == ""
+        assert had_mouse_reports is False
+        assert pure_terminal_junk is True
+
+    def test_normal_user_text_is_not_quarantined_from_model_turn(self):
+        text = "normal request 48;1R with words"
+        cleaned, had_mouse_reports, pure_terminal_junk = _prepare_cli_user_text_for_model_turn(text)
+        assert cleaned == text
+        assert had_mouse_reports is False
+        assert pure_terminal_junk is False

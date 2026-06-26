@@ -224,11 +224,15 @@ def agt_action_gateway(
             matched_policy = "no_child_self_report_as_proof"
             reason = "child self-report cannot satisfy proof"
         if decision == "allow" and meta.get("final_completion_claim") is True:
-            has_proof = bool(meta.get("proof_packet_exists") and meta.get("guardian_pass"))
+            has_proof = bool(
+                meta.get("proof_packet_exists")
+                and meta.get("guardian_pass")
+                and meta.get("current_state_hash_matches")
+            )
             if not has_proof:
                 decision = "deny"
                 matched_policy = "proof.required_for_done"
-                reason = "final completion requires proof packet and Guardian PASS"
+                reason = "final completion requires proof packet, Guardian PASS, and current state hash match"
 
     if decision == "allow" and override_reason:
         reason = "explicit override allowed"
