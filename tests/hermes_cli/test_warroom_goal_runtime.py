@@ -779,6 +779,237 @@ def test_role_spawn_success_persists_ids_hashes_and_evidence(hermes_home, tmp_pa
     assert Path(state.role_spawn_evidence_path).exists()
 
 
+
+def test_wave4_stale_async_result_is_quarantined_and_cannot_overwrite_final_state(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import (
+        create_warroom_goal,
+        load_warroom_goal,
+        record_role_output,
+        save_warroom_goal,
+        warroom_state_hash,
+    )
+
+    state = create_warroom_goal(
+        "sid-wave4-stale-async",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.status = "active"
+    state.role_records["reviewer"] = {
+        "role": "reviewer",
+        "status": "active_child_work",
+        "current_phase": "reviewing",
+        "runtime_kind": "real_child_session",
+        "child_session_id": "child-reviewer-1",
+        "delegation_id": "delegation-reviewer-1",
+        "evidence_path": str(tmp_path / "current-reviewer.json"),
+        "last_seen_at": "old",
+        "last_seen_epoch": 1,
+        "stale": False,
+        "stale_reason": None,
+    }
+    old_hash = warroom_state_hash(state)
+    final_proof = tmp_path / "final-proof.md"
+    final_proof.write_text("final proof stays current\n", encoding="utf-8")
+    state.proof_packet_path = str(final_proof)
+    state.guardian_pass = True
+    state.final_claim_allowed = True
+    state.status = "done"
+    save_warroom_goal("sid-wave4-stale-async", state)
+
+    late = tmp_path / "late-reviewer.md"
+    late.write_text("late stale result\n", encoding="utf-8")
+    updated = record_role_output(
+        "sid-wave4-stale-async",
+        "reviewer",
+        evidence_path=str(late),
+        status="completed",
+        expected_state_hash=old_hash,
+        expected_state_version=state.version,
+        child_session_id="child-reviewer-1",
+        delegation_id="delegation-reviewer-1",
+    )
+    assert updated is not None
+
+    record = updated.role_records["reviewer"]
+    assert record["status"] == "stale_async_result"
+    assert record["current_phase"] == "quarantined"
+    assert record["quarantine_status"] == "quarantined"
+    assert record["state_class"] == "stale_async_result"
+    assert Path(record["quarantine_path"]).exists()
+    assert record["quarantined_evidence_path"] == str(late)
+    fresh = load_warroom_goal("sid-wave4-stale-async")
+    assert fresh is not None
+    assert fresh.status == "done"
+    assert fresh.proof_packet_path == str(final_proof)
+    assert fresh.final_claim_allowed is True
+
+
+
+def test_wave4_heartbeat_updates_real_child_and_receipt_only_cannot_upgrade(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, record_child_progress, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-wave4-heartbeat",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.role_records["reviewer"] = {
+        "role": "reviewer",
+        "status": "running",
+        "current_phase": "spawned",
+        "runtime_kind": "real_child_session",
+        "child_session_id": "child-reviewer-heartbeat",
+        "delegation_id": "delegation-reviewer-heartbeat",
+        "runtime_id": "runtime-reviewer-heartbeat",
+        "evidence_path": str(tmp_path / "reviewer-evidence.json"),
+        "last_seen_at": "old",
+        "last_seen_epoch": 1,
+        "stale": True,
+        "stale_reason": "old",
+    }
+    pid_record = next(record for role, record in state.role_records.items() if role != "controller" and str(record.get("runtime_id", "")).startswith("pid:"))
+    pid_runtime_id = pid_record["runtime_id"]
+    pid_role = pid_record["role"]
+    save_warroom_goal("sid-wave4-heartbeat", state)
+
+    updated = record_child_progress(
+        "sid-wave4-heartbeat",
+        child_session_id="child-reviewer-heartbeat",
+        delegation_id="delegation-reviewer-heartbeat",
+        phase="running focused tests",
+    )
+    assert updated is not None
+    real = updated.role_records["reviewer"]
+    assert real["status"] == "active_child_work"
+    assert real["current_phase"] == "running focused tests"
+    assert real["stale"] is False
+    assert real["last_seen_epoch"] > 1
+    assert Path(real["last_heartbeat_path"]).exists()
+
+    updated = record_child_progress(
+        "sid-wave4-heartbeat",
+        runtime_id=pid_runtime_id,
+        phase="heartbeat without child id",
+        status="active_child_work",
+    )
+    assert updated is not None
+    receipt = updated.role_records[pid_role]
+    assert receipt["status"] == "spawn_receipt_only"
+    assert receipt["current_phase"] == "heartbeat without child id"
+    assert receipt["runtime_kind"] == "spawn_receipt"
+    assert receipt["spawn_receipt_only"] is True
+
+
+
+def test_wave4_stalled_role_gets_diagnostic_packet(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, mark_role_stalled, save_warroom_goal
+
+    evidence = tmp_path / "reviewer-evidence.json"
+    evidence.write_text("{}\n", encoding="utf-8")
+    state = create_warroom_goal(
+        "sid-wave4-stalled",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.role_records["reviewer"] = {
+        "role": "reviewer",
+        "status": "active_child_work",
+        "current_phase": "running command",
+        "runtime_kind": "real_child_session",
+        "runtime_id": "runtime-reviewer-timeout",
+        "child_session_id": "child-reviewer-timeout",
+        "delegation_id": "delegation-reviewer-timeout",
+        "evidence_path": str(evidence),
+        "last_seen_at": "2026-06-26T00:00:00Z",
+        "last_seen_epoch": 1,
+    }
+    save_warroom_goal("sid-wave4-stalled", state)
+
+    stalled = mark_role_stalled(
+        "sid-wave4-stalled",
+        "reviewer",
+        runtime_id="runtime-reviewer-timeout",
+        child_session_id="child-reviewer-timeout",
+        delegation_id="delegation-reviewer-timeout",
+        elapsed=301.2,
+        current_phase="running command",
+        evidence_path=str(evidence),
+        next_safe_action="harvest then rescue",
+    )
+    assert stalled is not None
+    record = stalled.role_records["reviewer"]
+    assert record["status"] == "stalled"
+    diagnostic = json.loads(Path(record["diagnostic_path"]).read_text(encoding="utf-8"))
+    assert diagnostic["role"] == "reviewer"
+    assert diagnostic["runtime_id"] == "runtime-reviewer-timeout"
+    assert diagnostic["child_session_id"] == "child-reviewer-timeout"
+    assert diagnostic["delegation_id"] == "delegation-reviewer-timeout"
+    assert diagnostic["elapsed"] == 301.2
+    assert diagnostic["last_seen_at"] == "2026-06-26T00:00:00Z"
+    assert diagnostic["current_phase"] == "running command"
+    assert diagnostic["evidence_path"] == str(evidence)
+    assert diagnostic["next_safe_action"] == "harvest then rescue"
+
+
+@pytest.mark.parametrize(
+    ("session_id", "goal"),
+    [
+        ("sid-wave4-adversary-path", "Use adversary skill for: build hardwire"),
+        ("sid-wave4-plan-adversary-path", _strict_goal()),
+    ],
+)
+def test_wave4_adversary_and_plan_paths_share_stale_heartbeat_logic(hermes_home, tmp_path, session_id, goal):
+    from hermes_cli.warroom_goal import create_warroom_goal, record_child_progress, record_role_output, save_warroom_goal, warroom_state_hash
+
+    state = create_warroom_goal(
+        session_id,
+        goal,
+        tracking_dir=str(tmp_path / session_id),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.status = "active"
+    state.role_records["reviewer"] = {
+        "role": "reviewer",
+        "status": "running",
+        "current_phase": "spawned",
+        "runtime_kind": "real_child_session",
+        "child_session_id": f"child-{session_id}",
+        "delegation_id": f"delegation-{session_id}",
+        "evidence_path": str(tmp_path / f"{session_id}-evidence.json"),
+        "last_seen_at": "old",
+        "last_seen_epoch": 1,
+    }
+    save_warroom_goal(session_id, state)
+    updated = record_child_progress(session_id, child_session_id=f"child-{session_id}", phase="phase-one")
+    assert updated is not None
+    assert updated.role_records["reviewer"]["status"] == "active_child_work"
+    assert updated.role_records["reviewer"]["current_phase"] == "phase-one"
+
+    old_hash = warroom_state_hash(updated)
+    updated.status = "done"
+    save_warroom_goal(session_id, updated)
+    late = tmp_path / f"{session_id}-late.md"
+    late.write_text("late\n", encoding="utf-8")
+    quarantined = record_role_output(
+        session_id,
+        "reviewer",
+        evidence_path=str(late),
+        status="completed",
+        expected_state_hash=old_hash,
+        expected_state_version=updated.version,
+        child_session_id=f"child-{session_id}",
+    )
+    assert quarantined is not None
+    assert quarantined.role_records["reviewer"]["status"] == "stale_async_result"
+    assert quarantined.role_records["reviewer"]["current_phase"] == "quarantined"
+    assert quarantined.role_records["reviewer"]["quarantine_status"] == "quarantined"
+
+
+
 def test_fake_local_role_spawn_blocks_manual_fallback_with_runtime_gap(hermes_home, tmp_path):
     from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy
 

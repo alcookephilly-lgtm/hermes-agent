@@ -396,7 +396,10 @@ def refresh_role_runtime_status(state: WarroomGoalState, *, now: Optional[float]
             stale = current - float(last_seen_raw) > ROLE_STALE_AFTER_SECONDS
             record["stale"] = stale
             record["stale_reason"] = "child session heartbeat stale" if stale else None
-            if record.get("status") in {"spawned", "running"} and not stale:
+            if stale and record.get("status") in {"spawned", "running", "active_child_work"}:
+                record["status"] = "stalled"
+                record["current_phase"] = "stalled"
+            elif record.get("status") in {"spawned", "running"} and not stale:
                 record["status"] = "active_child_work"
                 record["current_phase"] = record.get("current_phase") or "active_child_work"
             continue
@@ -710,6 +713,139 @@ def _role_spawn_dir(state: WarroomGoalState) -> Path:
 def _write_json(path: Path, data: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def warroom_state_hash(state: WarroomGoalState) -> str:
+    """Stable hash used to reject late async writes against stale state."""
+    payload = asdict(state)
+    # ``updated_at`` is persistence bookkeeping. It should not make an
+    # otherwise unchanged state reject its own async result.
+    payload["updated_at"] = 0.0
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _role_from_record(state: WarroomGoalState, record: Dict[str, Any]) -> str:
+    for role, candidate in (state.role_records or {}).items():
+        if candidate is record:
+            return role
+    return str(record.get("role") or "unknown")
+
+
+def _write_role_heartbeat(state: WarroomGoalState, record: Dict[str, Any]) -> Optional[str]:
+    tracking_dir = Path(state.tracking_dir or "") if state.tracking_dir else None
+    if tracking_dir is None:
+        return None
+    try:
+        role = _role_from_record(state, record)
+        stamp = str(record.get("last_seen_at") or _utc_stamp()).replace(":", "").replace("-", "")
+        path = tracking_dir / "heartbeats" / f"{role}-{stamp}.json"
+        _write_json(
+            path,
+            {
+                "event": "heartbeat",
+                "role": role,
+                "status": record.get("status"),
+                "current_phase": record.get("current_phase"),
+                "child_session_id": record.get("child_session_id"),
+                "delegation_id": record.get("delegation_id"),
+                "runtime_id": record.get("runtime_id"),
+                "evidence_path": record.get("evidence_path"),
+                "last_seen_at": record.get("last_seen_at"),
+                "last_seen_epoch": record.get("last_seen_epoch"),
+                "spawn_receipt_only": record.get("spawn_receipt_only"),
+                "state_hash": warroom_state_hash(state),
+            },
+        )
+        return str(path)
+    except Exception:
+        return None
+
+
+def _write_async_quarantine(
+    state: WarroomGoalState,
+    *,
+    role: str,
+    evidence_path: str,
+    status: str,
+    current_hash: str,
+    expected_hash: Optional[str],
+    expected_version: Optional[int],
+) -> str:
+    tracking_dir = Path(state.tracking_dir or _default_tracking_dir())
+    stamp = _utc_stamp().replace(":", "").replace("-", "")
+    path = tracking_dir / "quarantine" / f"{role}-{stamp}.json"
+    _write_json(
+        path,
+        {
+            "event": "stale_async_result",
+            "status": "quarantined",
+            "role": role,
+            "requested_status": status,
+            "evidence_path": evidence_path,
+            "state_version": state.version,
+            "expected_state_version": expected_version,
+            "current_state_hash": current_hash,
+            "expected_state_hash": expected_hash,
+            "next_safe_action": "Inspect quarantined artifact; rerun focused tests before accepting any late child result.",
+        },
+    )
+    return str(path)
+
+
+def mark_role_stalled(
+    session_id: str,
+    role: str,
+    *,
+    runtime_id: Optional[str] = None,
+    child_session_id: Optional[str] = None,
+    delegation_id: Optional[str] = None,
+    elapsed: Optional[float] = None,
+    current_phase: Optional[str] = None,
+    evidence_path: Optional[str] = None,
+    next_safe_action: str = "Harvest ledger/log/diff/current state before retry or rescue.",
+) -> Optional[WarroomGoalState]:
+    state = load_warroom_goal(session_id)
+    if state is None:
+        return None
+    record: Dict[str, Any] = dict(state.role_records.get(role) or {"role": role})
+    now = _utc_stamp()
+    record.update(
+        {
+            "role": role,
+            "status": "stalled",
+            "current_phase": current_phase or record.get("current_phase") or "stalled",
+            "runtime_id": runtime_id or record.get("runtime_id"),
+            "child_session_id": child_session_id or record.get("child_session_id"),
+            "delegation_id": delegation_id or record.get("delegation_id"),
+            "last_seen_at": record.get("last_seen_at") or now,
+            "last_seen_epoch": record.get("last_seen_epoch") or time.time(),
+            "evidence_path": evidence_path or record.get("evidence_path"),
+            "stale": True,
+            "stale_reason": "stalled timeout",
+        }
+    )
+    tracking_dir = Path(state.tracking_dir or _default_tracking_dir())
+    diag_path = tracking_dir / "diagnostics" / f"{role}-stalled-{now.replace(':', '').replace('-', '')}.json"
+    _write_json(
+        diag_path,
+        {
+            "event": "timeout_diagnostic",
+            "role": role,
+            "runtime_id": record.get("runtime_id"),
+            "child_session_id": record.get("child_session_id"),
+            "delegation_id": record.get("delegation_id"),
+            "elapsed": elapsed,
+            "last_seen_at": record.get("last_seen_at"),
+            "current_phase": record.get("current_phase"),
+            "evidence_path": record.get("evidence_path"),
+            "next_safe_action": next_safe_action,
+        },
+    )
+    record["diagnostic_path"] = str(diag_path)
+    state.role_records[role] = record
+    save_warroom_goal(session_id, state)
+    return state
 
 
 def _role_record(
@@ -1044,19 +1180,33 @@ def record_child_progress(
     now_epoch = time.time()
     matched_record["last_seen_at"] = _utc_stamp()
     matched_record["last_seen_epoch"] = now_epoch
-    matched_record["status"] = status or matched_record.get("status") or "active_child_work"
-    matched_record["current_phase"] = phase or matched_record.get("current_phase") or matched_record["status"]
-    matched_record["stale"] = False
-    matched_record["stale_reason"] = None
     if child_session_id:
         matched_record["child_session_id"] = child_session_id
     if delegation_id:
         matched_record["delegation_id"] = delegation_id
     if runtime_id and not matched_record.get("runtime_id"):
         matched_record["runtime_id"] = runtime_id
-    if matched_record.get("child_session_id") or matched_record.get("delegation_id"):
+
+    has_real_child = bool(matched_record.get("child_session_id") or matched_record.get("delegation_id"))
+    if has_real_child:
+        matched_record["status"] = status or matched_record.get("status") or "active_child_work"
         matched_record["runtime_kind"] = "real_child_session"
         matched_record["spawn_receipt_only"] = False
+        matched_record["stale"] = False
+        matched_record["stale_reason"] = None
+    else:
+        # A heartbeat keyed only by pid/runtime receipt is spawn proof, not
+        # delegated work. It may refresh observation metadata, but it must not
+        # promote the role to active_child_work/completed.
+        matched_record.setdefault("status", "spawn_receipt_only")
+        if matched_record.get("status") in {"active_child_work", "completed", "done"}:
+            matched_record["status"] = "spawn_receipt_only"
+        matched_record["runtime_kind"] = "spawn_receipt"
+        matched_record["spawn_receipt_only"] = True
+    matched_record["current_phase"] = phase or matched_record.get("current_phase") or matched_record["status"]
+    heartbeat_path = _write_role_heartbeat(state, matched_record)
+    if heartbeat_path:
+        matched_record["last_heartbeat_path"] = heartbeat_path
     save_warroom_goal(session_id, state)
     return state
 
@@ -1095,12 +1245,27 @@ def record_role_output(
     evidence_path: str,
     status: str = "done",
     verdict: Optional[str] = None,
+    expected_state_hash: Optional[str] = None,
+    expected_state_version: Optional[int] = None,
+    child_session_id: Optional[str] = None,
+    delegation_id: Optional[str] = None,
+    current_phase: Optional[str] = None,
 ) -> Optional[WarroomGoalState]:
     state = load_warroom_goal(session_id)
     if state is None:
         return None
-    record = dict(state.role_records.get(role) or {})
-    if role != "controller" and state.status in {"done", "halted"}:
+    record: Dict[str, Any] = dict(state.role_records.get(role) or {})
+    if child_session_id:
+        record["child_session_id"] = child_session_id
+    if delegation_id:
+        record["delegation_id"] = delegation_id
+    current_hash = warroom_state_hash(state)
+    stale_async = False
+    if expected_state_version is not None and expected_state_version != state.version:
+        stale_async = True
+    if expected_state_hash is not None and expected_state_hash != current_hash:
+        stale_async = True
+    if role != "controller" and (state.status in {"done", "halted"} or stale_async):
         decision = agt_action_gateway(
             action="async_result.accept",
             caller="hermes_cli.warroom_goal.record_role_output",
@@ -1109,18 +1274,32 @@ def record_role_output(
             state={"status": state.status, "workflow": state.workflow},
             metadata={
                 "role": role,
-                "state_hash": f"role-output:{role}:late",
-                "dispatch_state_hash": "role-output-before-terminal-state",
-                "current_state_hash": f"terminal:{state.status}",
+                "state_hash": expected_state_hash or f"role-output:{role}:late",
+                "dispatch_state_hash": expected_state_hash or "role-output-before-terminal-state",
+                "current_state_hash": current_hash,
             },
+        )
+        quarantine_path = _write_async_quarantine(
+            state,
+            role=role,
+            evidence_path=evidence_path,
+            status=status,
+            current_hash=current_hash,
+            expected_hash=expected_state_hash,
+            expected_version=expected_state_version,
         )
         record.update({
             "role": role,
             "status": "stale_async_result",
+            "current_phase": "quarantined",
+            "state_class": "stale_async_result",
+            "quarantine_status": "quarantined",
+            "quarantine_path": quarantine_path,
+            "quarantined_evidence_path": evidence_path,
             "stale": True,
-            "stale_reason": f"state already advanced to {state.status}",
+            "stale_reason": "state hash/version advanced before async result arrived" if stale_async else f"state already advanced to {state.status}",
             "last_seen_at": _utc_stamp(),
-            "evidence_path": evidence_path,
+            "last_seen_epoch": time.time(),
         })
         state.role_records[role] = record
         state.gate_evidence.setdefault("async_stale_quarantine", []).append(
@@ -1162,7 +1341,20 @@ def record_role_output(
         save_warroom_goal(session_id, state)
         return state
 
-    record.update({"role": role, "status": requested_status, "last_seen_at": _utc_stamp(), "evidence_path": evidence_path})
+    record.update({
+        "role": role,
+        "status": requested_status,
+        "current_phase": current_phase or requested_status,
+        "last_seen_at": _utc_stamp(),
+        "last_seen_epoch": time.time(),
+        "evidence_path": evidence_path,
+        "state_hash": current_hash,
+        "stale": False,
+        "stale_reason": None,
+    })
+    if record.get("child_session_id") or record.get("delegation_id"):
+        record["runtime_kind"] = "real_child_session"
+        record["spawn_receipt_only"] = False
     state.role_records[role] = record
     if role == "guardian":
         state.guardian_verdict_path = evidence_path

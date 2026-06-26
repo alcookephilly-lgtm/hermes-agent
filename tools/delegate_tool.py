@@ -1432,9 +1432,21 @@ def _dump_subagent_timeout_diagnostic(
         _w(f"  task_index:        {task_index}")
         _w(f"  subagent_id:       {subagent_id}")
         _w(f"  child_session_id:  {getattr(child, 'session_id', None)!r}")
+        _w(f"  delegation_id:     {getattr(child, '_delegation_id', None)!r}")
+        _w(f"  role:              {getattr(child, '_delegate_role', None)!r}")
         _w(f"  role_id:           {getattr(child, '_delegate_role', None)!r}")
+        _w(f"  runtime_id:        {getattr(child, '_delegate_runtime_id', None) or getattr(child, '_subagent_id', None)!r}")
         _w(f"  configured_timeout: {timeout_seconds}s")
+        _w(f"  elapsed:           {duration_seconds:.2f}s")
         _w(f"  actual_duration:   {duration_seconds:.2f}s")
+        try:
+            _diag_summary = child.get_activity_summary()
+        except Exception:
+            _diag_summary = {}
+        _w(f"  last_seen_at:      {_dt.datetime.now().isoformat()}")
+        _w(f"  current_phase:     {_diag_summary.get('current_tool') or _diag_summary.get('last_activity_desc') or 'unknown'}")
+        _w(f"  evidence_path:     {getattr(child, '_delegate_evidence_path', None)!r}")
+        _w("  next_safe_action:  Inspect this diagnostic plus the parent role ledger before retrying the role.")
         _w("")
 
         _w("## Goal")

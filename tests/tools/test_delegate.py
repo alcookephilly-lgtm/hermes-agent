@@ -11,9 +11,11 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -1945,6 +1947,50 @@ class TestDelegateHeartbeat(unittest.TestCase):
             f"Heartbeat stopped too early while child was inside a tool; "
             f"got {len(touch_calls)} touches over 0.4s at 0.05s interval",
         )
+
+    def test_timeout_diagnostic_includes_wave4_fields_after_prior_activity(self):
+        """Timeout diagnostics include role/runtime/phase fields even after API activity."""
+        from tools.delegate_tool import _dump_subagent_timeout_diagnostic
+
+        child = MagicMock()
+        child._subagent_id = "subagent-123"
+        child.session_id = "child-session-123"
+        child._delegate_role = "reviewer"
+        child._delegation_id = "delegation-123"
+        child._delegate_runtime_id = "runtime-123"
+        child._delegate_evidence_path = "/tmp/reviewer-evidence.json"
+        child.get_activity_summary.return_value = {
+            "api_call_count": 2,
+            "current_tool": "terminal",
+            "last_activity_desc": "running focused tests",
+            "max_iterations": 50,
+        }
+        child._session_messages = [
+            {"role": "assistant", "content": "working", "tool_calls": []},
+        ]
+
+        with tempfile.TemporaryDirectory() as home:
+            with patch.dict(os.environ, {"HERMES_HOME": home}):
+                path = _dump_subagent_timeout_diagnostic(
+                    child=child,
+                    task_index=0,
+                    timeout_seconds=3.0,
+                    duration_seconds=3.5,
+                    worker_thread=None,
+                    goal="wave4 timeout diagnostic",
+                )
+                self.assertIsNotNone(path)
+                assert path is not None
+                text = Path(path).read_text(encoding="utf-8")
+
+        self.assertIn("role:              'reviewer'", text)
+        self.assertIn("runtime_id:        'runtime-123'", text)
+        self.assertIn("child_session_id:  'child-session-123'", text)
+        self.assertIn("delegation_id:     'delegation-123'", text)
+        self.assertIn("elapsed:           3.50s", text)
+        self.assertIn("current_phase:     terminal", text)
+        self.assertIn("evidence_path:     '/tmp/reviewer-evidence.json'", text)
+        self.assertIn("next_safe_action:", text)
 
 
 
