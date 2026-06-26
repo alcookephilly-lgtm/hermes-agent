@@ -1894,6 +1894,23 @@ def terminal_tool(
                 "status": "error",
             }, ensure_ascii=False)
 
+        try:
+            remote_target = os.getenv("HERMES_REMOTE_TARGET", "").strip()
+            if remote_target == "vps" and re.search(r"(?<![\w./-])/(?:etc|opt|root)(?:/|\b)", command):
+                from agent.agt_gateway import agt_action_gateway
+                decision = agt_action_gateway(
+                    action="protected_target_path",
+                    caller="tools.terminal_tool.terminal_tool",
+                    policies=("remote_target_requires_ssh",),
+                    target=command,
+                    state={"remote_target": remote_target},
+                    metadata={"remote_target": remote_target, "command": command, "path": "/etc"},
+                )
+                if decision.blocked:
+                    return json.dumps({"output": "", "exit_code": -1, "error": decision.error_message(), "status": "error"}, ensure_ascii=False)
+        except Exception:
+            logger.debug("AGT terminal protected-path gate failed", exc_info=True)
+
         # Get configuration
         config = _get_env_config()
         env_type = config["env_type"]

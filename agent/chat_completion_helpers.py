@@ -306,6 +306,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # HERMES_CODEX_TTFB_TIMEOUT_SECONDS=0 to disable this watchdog entirely.
     _ttfb_enabled = _codex_watchdog_enabled
     _ttfb_timeout = _env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 120.0)
+    _large_context_ttfb_mode = False
+    _ttfb_heartbeat_interval = _env_float("HERMES_CODEX_TTFB_HEARTBEAT_SECONDS", 30.0)
+    _last_ttfb_heartbeat = 0.0
     if _ttfb_timeout <= 0:
         _ttfb_enabled = False
     elif _openai_codex_backend:
@@ -313,20 +316,31 @@ def interruptible_api_call(agent, api_kwargs: dict):
         _ttfb_strict = os.environ.get("HERMES_CODEX_TTFB_STRICT", "").strip().lower() in {
             "1", "true", "yes", "on"
         }
-        if (
+        _large_context_ttfb_mode = (
             not _ttfb_strict
             and _ttfb_disable_above > 0
             and _est_tokens_for_codex_watchdog >= _ttfb_disable_above
-        ):
-            _ttfb_enabled = False
+        )
+        if _large_context_ttfb_mode:
+            _large_ttfb_cap = _env_float(
+                "HERMES_CODEX_TTFB_LARGE_MAX_SILENCE_SECONDS", 300.0
+            )
+            if _large_ttfb_cap > 0:
+                _ttfb_timeout = max(_ttfb_timeout, _large_ttfb_cap)
             logger.info(
-                "Disabling openai-codex no-byte TTFB watchdog for large request "
-                "(context=~%s tokens >= %.0f). Waiting for backend response instead. "
-                "Set HERMES_CODEX_TTFB_STRICT=1 to force early reconnects.",
+                "openai-codex TTFB watchdog mode=large-context "
+                "context=~%s tokens threshold=%.0f max_silence=%.0fs. "
+                "Heartbeat enabled; timeout triggers compression/split fallback guidance.",
                 f"{_est_tokens_for_codex_watchdog:,}",
                 _ttfb_disable_above,
+                _ttfb_timeout,
             )
         else:
+            logger.info(
+                "openai-codex TTFB watchdog mode=strict context=~%s tokens timeout=%.0fs",
+                f"{_est_tokens_for_codex_watchdog:,}",
+                _ttfb_timeout,
+            )
             _ttfb_cap = _env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 120.0)
             if _ttfb_cap > 0 and _ttfb_timeout > _ttfb_cap:
                 logger.info(
@@ -372,6 +386,28 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
         _elapsed = time.time() - _call_start
 
+        if (
+            _ttfb_enabled
+            and _large_context_ttfb_mode
+            and getattr(agent, "_codex_stream_last_event_ts", None) is None
+            and _ttfb_heartbeat_interval > 0
+            and (_elapsed - _last_ttfb_heartbeat) >= _ttfb_heartbeat_interval
+        ):
+            _last_ttfb_heartbeat = _elapsed
+            logger.info(
+                "openai-codex TTFB heartbeat mode=large-context elapsed=%.0fs "
+                "max_silence=%.0fs model=%s context=~%s tokens",
+                _elapsed,
+                _ttfb_timeout,
+                api_kwargs.get("model", "unknown"),
+                f"{_est_tokens_for_codex_watchdog:,}",
+            )
+            agent._buffer_status(
+                f"⏳ Codex large-context TTFB mode: {int(_elapsed)}s silent "
+                f"(max {int(_ttfb_timeout)}s, model: {api_kwargs.get('model', 'unknown')}). "
+                "Still waiting; compression/split fallback is armed."
+            )
+
         # TTFB detector: the Codex stream has produced no event at all and
         # we're past the first-byte cutoff → the backend opened the
         # connection but isn't responding. Kill it so the retry loop can
@@ -389,27 +425,42 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     _silent_hint = _hint_fn(model=api_kwargs.get("model"))
                 except Exception:
                     _silent_hint = None
+            _mode_label = "large-context" if _large_context_ttfb_mode else "strict"
+            _fallback_tail = (
+                " Triggering compression/split fallback guidance."
+                if _large_context_ttfb_mode
+                else ""
+            )
             logger.warning(
-                "Codex stream produced no bytes within TTFB cutoff "
-                "(%.0fs > %.0fs, model=%s). Backend accepted the connection "
-                "but sent no stream events. Killing connection so the retry "
-                "loop can reconnect.",
-                _elapsed, _ttfb_timeout, api_kwargs.get("model", "unknown"),
+                "Codex stream produced no bytes within TTFB cutoff mode=%s "
+                "(%.0fs > %.0fs, model=%s, context=~%s tokens). Backend accepted "
+                "the connection but sent no stream events. Killing connection so "
+                "the retry loop can reconnect.%s",
+                _mode_label,
+                _elapsed,
+                _ttfb_timeout,
+                api_kwargs.get("model", "unknown"),
+                f"{_est_tokens_for_codex_watchdog:,}",
+                _fallback_tail,
             )
             if _silent_hint:
                 agent._buffer_status(
                     f"⚠️ No first byte from provider in {int(_elapsed)}s "
-                    f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
-                    f"Reconnecting. {_silent_hint}"
+                    f"(codex {_mode_label} TTFB, model: {api_kwargs.get('model', 'unknown')}). "
+                    f"Reconnecting. {_silent_hint}{_fallback_tail}"
                 )
             else:
                 agent._buffer_status(
                     f"⚠️ No first byte from provider in {int(_elapsed)}s "
-                    f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
-                    f"Reconnecting."
+                    f"(codex {_mode_label} TTFB, model: {api_kwargs.get('model', 'unknown')}). "
+                    f"Reconnecting.{_fallback_tail}"
                 )
             try:
-                _close_request_client_once("codex_ttfb_kill")
+                _close_request_client_once(
+                    "codex_ttfb_large_context_kill"
+                    if _large_context_ttfb_mode
+                    else "codex_ttfb_kill"
+                )
             except Exception:
                 pass
             agent._touch_activity(
@@ -421,12 +472,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 if _silent_hint:
                     result["error"] = TimeoutError(
                         f"Codex stream produced no bytes within {int(_elapsed)}s "
-                        f"(TTFB threshold: {int(_ttfb_timeout)}s). {_silent_hint}"
+                        f"(TTFB threshold: {int(_ttfb_timeout)}s). {_silent_hint}{_fallback_tail}"
                     )
                 else:
                     result["error"] = TimeoutError(
                         f"Codex stream produced no bytes within {int(_elapsed)}s "
-                        f"(TTFB threshold: {int(_ttfb_timeout)}s)"
+                        f"(TTFB threshold: {int(_ttfb_timeout)}s){_fallback_tail}"
                     )
             break
 

@@ -22,6 +22,33 @@ from agent.redact import redact_sensitive_text
 logger = logging.getLogger(__name__)
 
 
+def _agt_protected_path_error(tool_name: str, path: str) -> str | None:
+    remote_target = os.getenv("HERMES_REMOTE_TARGET", "").strip()
+    if remote_target != "vps":
+        return None
+    try:
+        resolved = str(Path(path).expanduser())
+    except Exception:
+        resolved = str(path or "")
+    if not any(resolved == root or resolved.startswith(root + "/") for root in ("/etc", "/opt", "/root")):
+        return None
+    try:
+        from agent.agt_gateway import agt_action_gateway
+        decision = agt_action_gateway(
+            action="protected_target_path",
+            caller=f"tools.file_tools.{tool_name}",
+            policies=("remote_target_requires_ssh",),
+            target=resolved,
+            state={"remote_target": remote_target},
+            metadata={"remote_target": remote_target, "path": resolved, "tool_name": tool_name},
+        )
+        if decision.blocked:
+            return decision.error_message()
+    except Exception:
+        logger.debug("AGT file protected-path gate failed", exc_info=True)
+    return None
+
+
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
 
 # ---------------------------------------------------------------------------
@@ -983,6 +1010,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         _resolved = _resolve_path_for_task(path, task_id)
 
+        agt_error = _agt_protected_path_error("read_file_tool", str(_resolved))
+        if agt_error:
+            return json.dumps({"error": agt_error}, ensure_ascii=False)
+
         robot_hand_error = _robot_hand_gate_error(
             native_tool="read_file",
             path=path,
@@ -1381,6 +1412,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
+    agt_error = _agt_protected_path_error("write_file_tool", path)
+    if agt_error:
+        return tool_error(agt_error)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -1401,6 +1435,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _resolved = str(_resolve_path_for_task(path, task_id))
         except Exception:
             _resolved = None
+
+        agt_error = _agt_protected_path_error("write_file_tool", _resolved or path)
+        if agt_error:
+            return tool_error(agt_error)
 
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)

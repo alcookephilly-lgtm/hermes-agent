@@ -39,6 +39,7 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
+from agent.agt_gateway import agt_action_gateway
 
 
 # Tools that children must never have access to
@@ -1131,11 +1132,57 @@ def _build_child_agent(
 
         child_thinking_cb = _child_thinking
 
-    # Resolve effective credentials: config override > parent inherit
-    effective_model = model or parent_agent.model
+    # Resolve effective credentials: config override > parent inherit.
+    parent_model = getattr(parent_agent, "model", None)
+    effective_model = model or parent_model or ""
     effective_provider = override_provider or getattr(parent_agent, "provider", None)
     effective_base_url = override_base_url or parent_agent.base_url
     effective_api_key = override_api_key or parent_api_key
+
+    override_reasons = []
+    if model and model != parent_model:
+        override_reasons.append("delegation.model")
+    if override_provider:
+        override_reasons.append("delegation.provider")
+    if override_base_url:
+        override_reasons.append("delegation.base_url")
+    if override_acp_command:
+        override_reasons.append("explicit acp_command override")
+    if override_reasons:
+        logger.info(
+            "delegate_task child runtime override: parent_model=%s child_model=%s "
+            "parent_provider=%s child_provider=%s reason=%s",
+            parent_model,
+            effective_model,
+            getattr(parent_agent, "provider", None),
+            effective_provider,
+            ",".join(override_reasons),
+        )
+    else:
+        logger.debug(
+            "delegate_task child inherited controller model: model=%s provider=%s",
+            effective_model,
+            effective_provider,
+        )
+    agt_decision = agt_action_gateway(
+        action="delegate_task.dispatch",
+        caller="tools.delegate_tool._build_child_agent",
+        policies=("model_inherit_controller_default",),
+        target=goal,
+        state={"controller_model": parent_model},
+        metadata={
+            "parent_model": parent_model,
+            "child_model": effective_model,
+            "parent_provider": getattr(parent_agent, "provider", None),
+            "child_provider": effective_provider,
+            "task_index": task_index,
+            "role": role,
+            "explicit_model_override": bool(model),
+        },
+        override_reason=",".join(override_reasons) if override_reasons else None,
+    )
+    if agt_decision.blocked:
+        raise RuntimeError(agt_decision.error_message())
     # Bug #20558 / PR #20563: api_mode must NOT be inherited when the child uses a
     # different provider than the parent — each provider has its own API surface
     # (e.g. MiniMax uses anthropic_messages, DeepSeek uses chat_completions).
@@ -1190,11 +1237,32 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
-    # Inherit the parent's fallback provider chain so subagents can recover
-    # from rate-limits and credential exhaustion exactly like the top-level
-    # agent does.  _fallback_chain is a list accepted by AIAgent's
-    # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    # Do not inherit hidden alternate-model fallback chains into workers. A
+    # worker may use another model only when the user/config/tool call explicitly
+    # selects it above; otherwise controller/main model is the worker model.
+    parent_fallback_raw = getattr(parent_agent, "_fallback_chain", None) or None
+    parent_fallback: Any = None
+    if parent_fallback_raw:
+        fallback_entries = (
+            parent_fallback_raw if isinstance(parent_fallback_raw, list) else [parent_fallback_raw]
+        )
+        fallback_models = []
+        for entry in fallback_entries:
+            if isinstance(entry, dict):
+                fallback_models.append(str(entry.get("model") or ""))
+            else:
+                fallback_models.append(str(entry or ""))
+        hidden_models = sorted({m for m in fallback_models if m and m != effective_model})
+        if hidden_models:
+            logger.warning(
+                "delegate_task hidden worker fallback quarantined: parent_model=%s "
+                "child_model=%s hidden_fallback_models=%s reason=prevent implicit model override",
+                parent_model,
+                effective_model,
+                hidden_models,
+            )
+        else:
+            parent_fallback = parent_fallback_raw
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -2340,7 +2408,7 @@ def delegate_task(
                 context=_t.get("context"),
                 toolsets=_t.get("toolsets") or toolsets,
                 role=_normalize_role(_t.get("role") or top_role),
-                model=creds["model"],
+                model=getattr(child, "model", None) or creds["model"] or getattr(parent_agent, "model", None),
                 session_key=_session_key,
                 runner=_async_runner,
                 interrupt_fn=_async_interrupt,

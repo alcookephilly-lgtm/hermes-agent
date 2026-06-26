@@ -2772,19 +2772,19 @@ class TestSubagentApprovalCallback(unittest.TestCase):
 
 
 class TestFallbackModelInheritance(unittest.TestCase):
-    """Subagents must inherit the parent's fallback provider chain."""
+    """Subagents inherit controller model and quarantine hidden alternate fallbacks."""
 
-    def test_child_inherits_fallback_chain(self):
-        """_build_child_agent passes parent._fallback_chain as fallback_model."""
+    def test_child_quarantines_hidden_alternate_model_fallback(self):
         parent = _make_mock_parent(depth=0)
-        fallback_entry = {"provider": "openrouter", "model": "gpt-4o-mini", "api_key": "sk-or-x"}
+        parent.model = "gpt-5.5"
+        fallback_entry = {"provider": "openrouter", "model": "gpt-5.4", "api_key": "sk-or-x"}
         parent._fallback_chain = [fallback_entry]
 
-        with patch("run_agent.AIAgent") as MockAgent:
+        with patch("run_agent.AIAgent") as MockAgent, patch("tools.delegate_tool.logger") as log:
             MockAgent.return_value = MagicMock()
             _build_child_agent(
                 task_index=0,
-                goal="test fallback inheritance",
+                goal="test hidden fallback quarantine",
                 context=None,
                 toolsets=None,
                 model=None,
@@ -2794,7 +2794,56 @@ class TestFallbackModelInheritance(unittest.TestCase):
             )
 
         _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["model"], "gpt-5.5")
+        self.assertIsNone(kwargs["fallback_model"])
+        self.assertTrue(log.warning.called)
+        self.assertIn("gpt-5.4", str(log.warning.call_args))
+
+    def test_child_preserves_same_model_fallback_chain(self):
+        parent = _make_mock_parent(depth=0)
+        parent.model = "gpt-5.5"
+        fallback_entry = {"provider": "openrouter", "model": "gpt-5.5", "api_key": "sk-or-x"}
+        parent._fallback_chain = [fallback_entry]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test same model fallback",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["model"], "gpt-5.5")
         self.assertEqual(kwargs["fallback_model"], [fallback_entry])
+
+    def test_explicit_model_override_works_and_logs_reason(self):
+        parent = _make_mock_parent(depth=0)
+        parent.model = "gpt-5.5"
+        parent._fallback_chain = []
+
+        with patch("run_agent.AIAgent") as MockAgent, patch("tools.delegate_tool.logger") as log:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test explicit override",
+                context=None,
+                toolsets=None,
+                model="gpt-5.4",
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["model"], "gpt-5.4")
+        self.assertTrue(log.info.called)
+        self.assertIn("delegation.model", str(log.info.call_args))
 
     def test_child_gets_no_fallback_when_parent_chain_empty(self):
         """When parent._fallback_chain is empty, fallback_model is None."""

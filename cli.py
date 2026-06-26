@@ -2697,6 +2697,10 @@ def _apply_bracketed_paste_timeout_patch() -> None:
 # that appears when the ESC byte was stripped by a prior filter.
 _DSR_CPR_ESC_RE = re.compile(r"\x1b\[\d+;\d+R")
 _DSR_CPR_VISIBLE_RE = re.compile(r"\^\[\[\d+;\d+R")
+# Torn CPR/DSR replies can lose ESC/``^[`` and the first row/semicolon
+# boundary, leaving pure prompt junk such as ``22R48;1R``.  Keep this
+# full-match only so normal text like ``see section 48;1R`` is preserved.
+_DSR_CPR_BARE_JUNK_RE = re.compile(r"(?:(?:\d+R)?\d+;\d+R)+")
 _SGR_MOUSE_ESC_RE = re.compile(r"\x1b\[<\d+;\d+;\d+[Mm]")
 _SGR_MOUSE_VISIBLE_RE = re.compile(r"\^\[\[<\d+;\d+;\d+[Mm]")
 # Some terminals/filters can drop ESC and literal "^[[", leaving only
@@ -2801,6 +2805,21 @@ def _strip_leaked_terminal_responses_with_meta(text: str) -> tuple[str, bool]:
     """
     if not text:
         return text, False
+
+    if _DSR_CPR_BARE_JUNK_RE.fullmatch(text.strip()):
+        try:
+            from agent.agt_gateway import agt_action_gateway
+            agt_action_gateway(
+                action="cli.user_message_ingest",
+                caller="cli._strip_leaked_terminal_responses_with_meta",
+                policies=("no_terminal_junk_as_user_intent",),
+                target="cli-input",
+                metadata={"terminal_junk": True, "raw": text},
+            )
+        except Exception:
+            logger.debug("AGT terminal junk audit failed", exc_info=True)
+        logger.info("Quarantined pure terminal CPR/DSR junk from CLI input")
+        return "", False
 
     has_esc = "\x1b[" in text
     has_visible = "^[" in text

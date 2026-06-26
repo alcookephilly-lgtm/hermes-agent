@@ -71,11 +71,11 @@ def test_ttfb_kills_when_no_stream_event(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
     monkeypatch.setattr(
         agent, "_abort_request_openai_client",
-        lambda c, reason=None: closes.append(reason),
+        lambda c, reason=None: closes.append(str(reason)),
     )
     monkeypatch.setattr(
         agent, "_close_request_openai_client",
-        lambda c, reason=None: closes.append(reason),
+        lambda c, reason=None: closes.append(str(reason)),
     )
 
     stop = {"flag": False}
@@ -102,6 +102,84 @@ def test_ttfb_kills_when_no_stream_event(tmp_path, monkeypatch):
         stop["flag"] = True
 
 
+def test_large_context_ttfb_heartbeats_then_max_silence_fallback(tmp_path, monkeypatch):
+    """Large contexts keep a longer TTFB cap, emit heartbeats, and still kill
+    after max silence with compression/split fallback guidance."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "0.5")
+    monkeypatch.setenv("HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS", "1")
+    monkeypatch.setenv("HERMES_CODEX_TTFB_LARGE_MAX_SILENCE_SECONDS", "2")
+    monkeypatch.setenv("HERMES_CODEX_TTFB_HEARTBEAT_SECONDS", "0.25")
+
+    closes: list[str] = []
+    statuses: list[str] = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(agent, "_buffer_status", lambda msg: statuses.append(msg))
+    monkeypatch.setattr(
+        agent,
+        "_abort_request_openai_client",
+        lambda c, reason=None: closes.append(str(reason)),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_close_request_openai_client",
+        lambda c, reason=None: closes.append(str(reason)),
+    )
+
+    stop = {"flag": False}
+
+    def fake_hang(api_kwargs, client=None, on_first_delta=None):
+        deadline = time.time() + 30
+        while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
+            time.sleep(0.02)
+        raise RuntimeError("connection closed")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_hang)
+
+    t0 = time.time()
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "x" * 20000})
+        elapsed = time.time() - t0
+        message = str(excinfo.value)
+        assert "compression/split fallback" in message
+        assert "codex_ttfb_large_context_kill" in closes
+        assert any("large-context TTFB mode" in s for s in statuses)
+        assert elapsed >= 2
+        assert elapsed < 15
+    finally:
+        stop["flag"] = True
+
+
+def test_large_context_ttfb_does_not_kill_slow_valid_prefill(tmp_path, monkeypatch):
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "0.5")
+    monkeypatch.setenv("HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS", "1")
+    monkeypatch.setenv("HERMES_CODEX_TTFB_LARGE_MAX_SILENCE_SECONDS", "3")
+    closes: list[str] = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda c, reason=None: closes.append(reason))
+
+    sentinel = SimpleNamespace(ok=True)
+
+    def fake_slow_prefill(api_kwargs, client=None, on_first_delta=None):
+        time.sleep(1.0)
+        agent._codex_stream_last_event_ts = time.time()
+        return sentinel
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_slow_prefill)
+
+    resp = h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "x" * 20000})
+    assert resp is sentinel
+    assert "codex_ttfb_large_context_kill" not in closes
+
+
 def test_ttfb_default_tolerates_slow_first_event(tmp_path, monkeypatch):
     """With no env var set, the no-byte TTFB default is generous (120s), so a
     request whose first stream event is merely slow (~2s of backend admission /
@@ -119,11 +197,11 @@ def test_ttfb_default_tolerates_slow_first_event(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
     monkeypatch.setattr(
         agent, "_abort_request_openai_client",
-        lambda c, reason=None: closes.append(reason),
+        lambda c, reason=None: closes.append(str(reason)),
     )
     monkeypatch.setattr(
         agent, "_close_request_openai_client",
-        lambda c, reason=None: closes.append(reason),
+        lambda c, reason=None: closes.append(str(reason)),
     )
 
     sentinel = SimpleNamespace(ok=True)
@@ -159,11 +237,11 @@ def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_emit_status", lambda msg: statuses.append(msg))
     monkeypatch.setattr(
         agent, "_abort_request_openai_client",
-        lambda c, reason=None: closes.append(reason),
+        lambda c, reason=None: closes.append(str(reason)),
     )
     monkeypatch.setattr(
         agent, "_close_request_openai_client",
-        lambda c, reason=None: closes.append(reason),
+        lambda c, reason=None: closes.append(str(reason)),
     )
 
     stop = {"flag": False}
@@ -204,11 +282,11 @@ def test_ttfb_high_env_is_capped_for_openai_codex(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
     monkeypatch.setattr(
         agent, "_abort_request_openai_client",
-        lambda c, reason=None: closes.append(reason),
+        lambda c, reason=None: closes.append(str(reason)),
     )
     monkeypatch.setattr(
         agent, "_close_request_openai_client",
-        lambda c, reason=None: closes.append(reason),
+        lambda c, reason=None: closes.append(str(reason)),
     )
 
     stop = {"flag": False}
@@ -246,11 +324,11 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
     monkeypatch.setattr(
         agent, "_abort_request_openai_client",
-        lambda c, reason=None: closes.append(reason),
+        lambda c, reason=None: closes.append(str(reason)),
     )
     monkeypatch.setattr(
         agent, "_close_request_openai_client",
-        lambda c, reason=None: closes.append(reason),
+        lambda c, reason=None: closes.append(str(reason)),
     )
 
     sentinel = SimpleNamespace(ok=True)
@@ -287,12 +365,12 @@ def test_event_idle_kills_after_first_event_then_silence(tmp_path, monkeypatch):
     monkeypatch.setattr(
         agent,
         "_abort_request_openai_client",
-        lambda c, reason=None: closes.append(reason),
+        lambda c, reason=None: closes.append(str(reason)),
     )
     monkeypatch.setattr(
         agent,
         "_close_request_openai_client",
-        lambda c, reason=None: closes.append(reason),
+        lambda c, reason=None: closes.append(str(reason)),
     )
 
     stop = {"flag": False}
@@ -330,11 +408,11 @@ def test_ttfb_disabled_via_env_zero(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
     monkeypatch.setattr(
         agent, "_abort_request_openai_client",
-        lambda c, reason=None: closes.append(reason),
+        lambda c, reason=None: closes.append(str(reason)),
     )
     monkeypatch.setattr(
         agent, "_close_request_openai_client",
-        lambda c, reason=None: closes.append(reason),
+        lambda c, reason=None: closes.append(str(reason)),
     )
 
     sentinel = SimpleNamespace(ok=True)

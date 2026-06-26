@@ -21,6 +21,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agent.agt_gateway import agt_action_gateway
+
 FAST_TRIGGER = "Use adversary skill for:"
 STRICT_TRIGGER = "Use plan adversary skill for:"
 GLOBAL_TRIGGER = "Global slash /goal:"
@@ -132,10 +134,17 @@ def _role_delegate_goal(state: "WarroomGoalState", role: str, role_card_path: st
         f"Role: {role}\n"
         f"Workflow: {state.workflow}\n"
         f"Parent session: {state.session_id}\n"
+        f"Controller model: {state.controller_model or 'unknown'}\n"
         f"Tracking dir: {state.tracking_dir or ''}\n"
         f"Allowed mutation root: {state.allowed_mutation_root or ''}\n"
         f"Evidence path: {evidence_path}\n\n"
-        "Follow the role card exactly. If you perform or verify work, write concise evidence to the evidence path.\n"
+        + (
+            "Remote target guard: target=vps. Do not inspect local /etc, /opt, or /root "
+            "as target files; use ssh vps for remote target reads.\n\n"
+            if state.remote_target == "vps"
+            else ""
+        )
+        + "Follow the role card exactly. If you perform or verify work, write concise evidence to the evidence path.\n"
         "Do not claim final completion; Guardian/final gate owns closure.\n\n"
         f"Goal:\n{state.original_goal}\n\n"
         f"Role card ({role_card_path}):\n{role_card_text}"
@@ -170,6 +179,7 @@ def _native_background_delegate_adapter(parent_agent: Any):
             "adapter": "native_delegate_background",
             "delegation_id": delegation_id,
             "runtime_id": delegation_id,
+            "model": getattr(parent_agent, "model", None),
             "exit_code": 0,
             "stdout": raw,
             "json_payload": payload,
@@ -272,6 +282,8 @@ class WarroomGoalState:
     created_at: float = 0.0
     updated_at: float = 0.0
     controller_active: bool = True
+    controller_model: Optional[str] = None
+    remote_target: Optional[str] = None
     current_role: Optional[str] = "controller"
     required_roles: List[str] = field(default_factory=list)
     required_action: Optional[str] = "spawn_roles"
@@ -557,6 +569,14 @@ def save_warroom_goal(session_id: str, state: WarroomGoalState) -> None:
     db = _get_session_db()
     if db is None:
         return
+    agt_action_gateway(
+        action="proof_state.write",
+        caller="hermes_cli.warroom_goal.save_warroom_goal",
+        policies=("parent_owned_proof_write",),
+        target=_meta_key(session_id),
+        state={"current_role": state.current_role, "status": state.status},
+        metadata={"role": "controller", "proof_or_state_write": True},
+    )
     try:
         db.set_meta(_meta_key(session_id), state.to_json())
     except Exception:
@@ -652,6 +672,7 @@ def _role_policy_metadata(role: str) -> Dict[str, Any]:
 
 def _annotate_role_record(record: Dict[str, Any], *, state: WarroomGoalState, role: str, role_card_path: str) -> Dict[str, Any]:
     record.update(_role_policy_metadata(role))
+    record.setdefault("model", state.controller_model)
     shared_context_pack_path = _shared_context_pack_path(state.tracking_dir, role_card_path)
     if shared_context_pack_path:
         record["shared_context_pack_path"] = shared_context_pack_path
@@ -814,6 +835,21 @@ def _start_roles_for_state(
                 runtime_kind: Optional[str] = None
                 current_phase: Optional[str] = None
                 spawn_receipt_only: Optional[bool] = None
+                role_dispatch_decision = agt_action_gateway(
+                    action="warroom.role_dispatch",
+                    caller="hermes_cli.warroom_goal._start_roles_for_state",
+                    policies=("model_inherit_controller_default",),
+                    target=role,
+                    state={"controller_model": state.controller_model, "workflow": state.workflow},
+                    metadata={
+                        "role": role,
+                        "parent_model": state.controller_model,
+                        "child_model": state.controller_model,
+                        "role_card_path": role_card_path,
+                    },
+                )
+                if role_dispatch_decision.blocked:
+                    raise RuntimeError(role_dispatch_decision.error_message())
                 if adapter is not None:
                     result = adapter(role=role, role_card_path=role_card_path, evidence_path=evidence_path, state=state)
                     adapter_name = str(result.get("adapter") or "native_delegate")
@@ -841,6 +877,21 @@ def _start_roles_for_state(
                     spawn_receipt_only = True
                 else:
                     raise RuntimeError("no native_delegate or local_process adapter available")
+                proof_decision = agt_action_gateway(
+                    action="warroom.role_execution_proof",
+                    caller="hermes_cli.warroom_goal._start_roles_for_state",
+                    policies=("no_receipt_only_role_start_as_execution_proof",),
+                    target=role,
+                    state={"workflow": state.workflow, "status": state.status},
+                    metadata={
+                        "role": role,
+                        "runtime_kind": runtime_kind,
+                        "evidence_type": runtime_kind,
+                        "execution_proof": True,
+                    },
+                )
+                if proof_decision.blocked:
+                    state.gate_evidence.setdefault("receipt_only_verdict", []).append(proof_decision.error_message())
                 record = _role_record(
                     role=role,
                     status="active_child_work" if runtime_kind == "real_child_session" else "spawn_receipt_only",
@@ -855,6 +906,8 @@ def _start_roles_for_state(
                     current_phase=current_phase,
                     spawn_receipt_only=spawn_receipt_only,
                 )
+                if isinstance(result, dict) and result.get("model"):
+                    record["model"] = str(result.get("model"))
                 record = _annotate_role_record(record, state=state, role=role, role_card_path=role_card_path)
                 if not Path(evidence_path).exists():
                     _write_json(Path(evidence_path), {"record": record, "event": "role_spawned"})
@@ -1037,6 +1090,34 @@ def record_role_output(
     if state is None:
         return None
     record = dict(state.role_records.get(role) or {})
+    if role != "controller" and state.status in {"done", "halted"}:
+        decision = agt_action_gateway(
+            action="async_result.accept",
+            caller="hermes_cli.warroom_goal.record_role_output",
+            policies=("stale_async_quarantine",),
+            target=role,
+            state={"status": state.status, "workflow": state.workflow},
+            metadata={
+                "role": role,
+                "state_hash": f"role-output:{role}:late",
+                "dispatch_state_hash": "role-output-before-terminal-state",
+                "current_state_hash": f"terminal:{state.status}",
+            },
+        )
+        record.update({
+            "role": role,
+            "status": "stale_async_result",
+            "stale": True,
+            "stale_reason": f"state already advanced to {state.status}",
+            "last_seen_at": _utc_stamp(),
+            "evidence_path": evidence_path,
+        })
+        state.role_records[role] = record
+        state.gate_evidence.setdefault("async_stale_quarantine", []).append(
+            f"{role}: stale after state={state.status}; {decision.error_message()}"
+        )
+        save_warroom_goal(session_id, state)
+        return state
     record.update({"role": role, "status": status, "last_seen_at": _utc_stamp(), "evidence_path": evidence_path})
     state.role_records[role] = record
     if role == "guardian":
@@ -1080,6 +1161,44 @@ def _path_inside(path: str, root: str) -> bool:
         return p == r or r in p.parents
     except Exception:
         return False
+
+
+def _detect_remote_target(text: str) -> Optional[str]:
+    lowered = (text or "").lower()
+    if re.search(r"\b(remote target|target)\s*[:=]?\s*vps\b", lowered) or re.search(r"\bvps\b", lowered):
+        return "vps"
+    return None
+
+
+def _is_protected_local_target_path(path: str) -> bool:
+    try:
+        resolved = str(Path(path).expanduser().resolve())
+    except Exception:
+        resolved = str(path or "")
+    return resolved == "/etc" or resolved.startswith("/etc/") or resolved == "/opt" or resolved.startswith("/opt/") or resolved == "/root" or resolved.startswith("/root/")
+
+
+def _remote_target_local_path_block(state: WarroomGoalState, tool_name: str, args: Dict[str, Any]) -> Optional[str]:
+    if state.remote_target != "vps":
+        return None
+    if tool_name in {"read_file", "write_file", "patch", "search_files"}:
+        path = str(args.get("path") or "")
+        if path and _is_protected_local_target_path(path):
+            return "WARROOM V3 blocked: remote target is vps; local /etc, /opt, and /root are not target files. Use ssh vps."
+    if tool_name == "terminal":
+        command = str(args.get("command") or "")
+        if "ssh vps" in command or "ssh root@srv1336035.hstgr.cloud" in command:
+            return None
+        if re.search(r"(?<![\w./-])/(?:etc|opt|root)(?:/|\b)", command):
+            return "WARROOM V3 blocked: remote target is vps; terminal access to /etc, /opt, or /root must go through ssh vps."
+    return None
+
+
+def _parent_owned_proof_state_path(state: WarroomGoalState, path: str) -> bool:
+    if not path or not state.tracking_dir or not _path_inside(path, state.tracking_dir):
+        return False
+    name = Path(path).name.lower()
+    return any(token in name for token in ("proof", "state", "guardian", "verdict", "role-spawn-evidence"))
 
 
 def _controller_tracking_doc_allowed(state: WarroomGoalState, tool_name: str, args: Dict[str, Any]) -> bool:
@@ -1379,8 +1498,11 @@ def create_warroom_goal(
     now = time.time()
     tracking = tracking_dir or _default_tracking_dir()
     allowed_root = allowed_mutation_root or os.getenv("TERMINAL_CWD") or str(Path.cwd())
+    controller_model = str(getattr(parent_agent, "model", "") or "") or None
+    remote_target = _detect_remote_target(detection.body)
     graphify_gate = _evaluate_graphify_gate(detection.body, allowed_root=allowed_root, now=now)
     roles = list(FAST_ROLES if detection.workflow == "fast_adversary" else STRICT_ROLES)
+
     cards = _role_cards_for(tracking)
     role_cards_ok = all(Path(cards[role]).exists() for role in roles)
     gates = {
@@ -1420,6 +1542,8 @@ def create_warroom_goal(
         created_at=now,
         updated_at=now,
         controller_active=True,
+        controller_model=controller_model,
+        remote_target=remote_target,
         current_role="controller",
         required_roles=roles,
         required_action=required_action,
@@ -1616,6 +1740,16 @@ def enforce_tool_policy(session_id: str, tool_name: str, args: Dict[str, Any]) -
     if state.status in {"halted", "gap"}:
         if _read_only_recovery_tool_allowed(tool_name, args):
             return None
+        if _tool_mutates(tool_name, args) and state.current_role not in {"builder", "controller", None}:
+            agt_action_gateway(
+                action="code_mutation",
+                caller="hermes_cli.warroom_goal.enforce_tool_policy",
+                policies=("builder_only_code_mutation",),
+                target=str(args.get("path") or args.get("command") or ""),
+                state={"current_role": state.current_role, "status": state.status},
+                metadata={"role": state.current_role, "code_mutation": True, "tool_name": tool_name},
+            )
+            return f"WARROOM V3 blocked: role {state.current_role or 'none'} cannot mutate code. Builder is the only mutation role."
         return f"WARROOM V3 blocked: workflow is {state.status} ({state.halt_reason or state.last_gap or 'no reason recorded'})."
     parser_block_reason = _parser_block_reason(state)
     if parser_block_reason:
@@ -1626,9 +1760,37 @@ def enforce_tool_policy(session_id: str, tool_name: str, args: Dict[str, Any]) -
     if state.status in {"halted", "gap"}:
         if _read_only_recovery_tool_allowed(tool_name, args):
             return None
+        if _tool_mutates(tool_name, args) and state.current_role not in {"builder", "controller", None}:
+            agt_action_gateway(
+                action="code_mutation",
+                caller="hermes_cli.warroom_goal.enforce_tool_policy",
+                policies=("builder_only_code_mutation",),
+                target=str(args.get("path") or args.get("command") or ""),
+                state={"current_role": state.current_role, "status": state.status},
+                metadata={"role": state.current_role, "code_mutation": True, "tool_name": tool_name},
+            )
+            return f"WARROOM V3 blocked: role {state.current_role or 'none'} cannot mutate code. Builder is the only mutation role."
         return f"WARROOM V3 blocked: workflow is {state.status} ({state.halt_reason or state.last_gap or 'no reason recorded'})."
     if state.required_action == "spawn_roles":
         return "WARROOM V3 blocked: required role spawn action is pending; normal chat/tool fallback denied."
+
+    remote_block = _remote_target_local_path_block(state, tool_name, args)
+    if remote_block:
+        agt_action_gateway(
+            action="protected_target_path",
+            caller="hermes_cli.warroom_goal.enforce_tool_policy",
+            policies=("remote_target_requires_ssh",),
+            target=str(args.get("path") or args.get("command") or ""),
+            state={"remote_target": state.remote_target, "current_role": state.current_role},
+            metadata={
+                "remote_target": state.remote_target,
+                "role": state.current_role,
+                "tool_name": tool_name,
+                "path": str(args.get("path") or ""),
+                "command": str(args.get("command") or ""),
+            },
+        )
+        return remote_block
 
     mutating = _tool_mutates(tool_name, args)
     # Terminal can be read-only proof work for Controller. Only mutating shell
@@ -1669,6 +1831,16 @@ def enforce_tool_policy(session_id: str, tool_name: str, args: Dict[str, Any]) -
         return "WARROOM V3 blocked: execute_code is not allowed during Warroom hardwire; use file/patch tools under Builder policy."
 
     path = _path_arg(tool_name, args)
+    if path and _parent_owned_proof_state_path(state, path) and state.current_role != "controller":
+        agt_action_gateway(
+            action="proof_state.write",
+            caller="hermes_cli.warroom_goal.enforce_tool_policy",
+            policies=("parent_owned_proof_write",),
+            target=path,
+            state={"current_role": state.current_role, "tracking_dir": state.tracking_dir},
+            metadata={"role": state.current_role, "proof_or_state_write": True, "tool_name": tool_name},
+        )
+        return "WARROOM V3 blocked: final proof/state writes are controller-owned; child roles may return evidence only."
     if path:
         for root in state.denied_mutation_roots:
             if _path_inside(path, root):
@@ -1742,7 +1914,21 @@ def guard_final_response(session_id: str, response: str, *, closure: bool = Fals
         return "WARROOM V3 FINAL BLOCKED: required role spawn action is pending. GAP: normal chat fallback denied until roles spawn or explicit GAP is recorded."
     if has_final_claim:
         proof = state.proof_packet_path
-        if not proof or not Path(proof).exists() or not state.final_claim_allowed:
+        proof_exists = bool(proof and Path(proof).exists())
+        final_decision = agt_action_gateway(
+            action="final_completion_claim",
+            caller="hermes_cli.warroom_goal.guard_final_response",
+            policies=("proof.required_for_done", "no_child_self_report_as_proof"),
+            target=session_id,
+            state={"status": state.status, "workflow": state.workflow},
+            metadata={
+                "final_completion_claim": True,
+                "proof_packet_exists": proof_exists,
+                "guardian_pass": bool(state.final_claim_allowed),
+                "child_self_report": False,
+            },
+        )
+        if final_decision.blocked:
             return (
                 "WARROOM V3 FINAL BLOCKED: final done/fixed/complete claim requires proof packet "
                 "and Guardian PASS.\nGAP: proof packet/final_claim_allowed missing."

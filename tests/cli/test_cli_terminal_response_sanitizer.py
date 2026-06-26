@@ -79,3 +79,11 @@ class TestStripLeakedTerminalResponses:
     def test_does_not_strip_regular_angle_bracket_text(self):
         text = "render <div class='hero'> literal"
         assert _strip_leaked_terminal_responses(text) == text
+
+    def test_quarantines_pure_torn_cpr_junk(self):
+        assert _strip_leaked_terminal_responses("22R48;1R") == ""
+        assert _strip_leaked_terminal_responses("48;1R") == ""
+
+    def test_preserves_normal_text_containing_torn_cpr_shape(self):
+        text = "see section 48;1R for details"
+        assert _strip_leaked_terminal_responses(text) == text

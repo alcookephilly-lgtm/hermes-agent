@@ -74,19 +74,38 @@ class TestMetadata:
 class TestAvailability:
     def test_unavailable_without_codex_token(self, monkeypatch):
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: None)
+        monkeypatch.setattr(codex_plugin, "_has_codex_oauth_material", lambda: False)
         assert codex_plugin.OpenAICodexImageGenProvider().is_available() is False
 
     def test_available_with_codex_token(self, monkeypatch):
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+        monkeypatch.setattr(codex_plugin, "_has_codex_oauth_material", lambda: True)
+        assert codex_plugin.OpenAICodexImageGenProvider().is_available() is True
+
+    def test_available_with_refresh_token_only(self, monkeypatch):
+        from hermes_cli import auth as auth_mod
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(auth_mod, "_read_codex_tokens", lambda: {
+            "tokens": {"refresh_token": "refresh-token"}
+        })
+        assert codex_plugin.OpenAICodexImageGenProvider().is_available() is True
+
+    def test_availability_does_not_refresh_codex_token(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(codex_plugin, "_has_codex_oauth_material", lambda: True)
+
+        def fail_refresh():
+            raise AssertionError("availability must not refresh Codex OAuth")
+
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", fail_refresh)
         assert codex_plugin.OpenAICodexImageGenProvider().is_available() is True
 
     def test_openai_api_key_alone_is_not_enough(self, monkeypatch):
         # Codex plugin is intentionally orthogonal to the API-key plugin —
         # the API key alone must NOT make it appear available.
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: None)
+        monkeypatch.setattr(codex_plugin, "_has_codex_oauth_material", lambda: False)
         assert codex_plugin.OpenAICodexImageGenProvider().is_available() is False
 
 

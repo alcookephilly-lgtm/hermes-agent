@@ -19,8 +19,10 @@ Output is saved as PNG under ``$HERMES_HOME/cache/images/``.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.image_gen_provider import (
@@ -141,6 +143,52 @@ def _read_codex_access_token() -> Optional[str]:
     except Exception as exc:
         logger.debug("Could not resolve Codex access token: %s", exc)
         return None
+
+
+def _codex_token_still_usable(token: Any) -> bool:
+    """Return True for a non-empty token that is not a known-expired JWT."""
+    if not isinstance(token, str) or not token.strip():
+        return False
+    if "." not in token:
+        return True
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return True
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8"))
+        exp = claims.get("exp")
+        return not exp or time.time() < float(exp)
+    except Exception:
+        return True
+
+
+def _has_codex_oauth_material() -> bool:
+    """Check local OAuth material without refreshing or rotating tokens."""
+    try:
+        from agent.auxiliary_client import _peek_pool_entry
+
+        entry = _peek_pool_entry("openai-codex")
+        if entry is not None:
+            if _codex_token_still_usable(getattr(entry, "access_token", None)):
+                return True
+            if isinstance(getattr(entry, "refresh_token", None), str) and entry.refresh_token.strip():
+                return True
+    except Exception as exc:
+        logger.debug("Could not peek Codex credential pool: %s", exc)
+
+    try:
+        from hermes_cli.auth import _read_codex_tokens
+
+        data = _read_codex_tokens()
+        tokens = data.get("tokens", {}) if isinstance(data, dict) else {}
+        if _codex_token_still_usable(tokens.get("access_token")):
+            return True
+        refresh_token = tokens.get("refresh_token")
+        return isinstance(refresh_token, str) and bool(refresh_token.strip())
+    except Exception as exc:
+        logger.debug("Could not inspect Codex auth material: %s", exc)
+        return False
 
 
 def _build_responses_payload(*, prompt: str, size: str, quality: str) -> Dict[str, Any]:
@@ -292,7 +340,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
         return "OpenAI (Codex auth)"
 
     def is_available(self) -> bool:
-        if not _read_codex_access_token():
+        if not _has_codex_oauth_material():
             return False
         try:
             import httpx  # noqa: F401

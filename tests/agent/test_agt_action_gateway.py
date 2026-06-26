@@ -1,0 +1,149 @@
+import json
+from pathlib import Path
+
+from agent.agt_gateway import agt_action_gateway
+
+
+BOUNDARIES = [
+    "delegate_task.dispatch",
+    "warroom.role_dispatch",
+    "async_result.accept",
+    "cli.user_message_ingest",
+    "protected_target_path",
+    "proof_state.write",
+    "final_completion_claim",
+]
+
+
+def _events(home: Path):
+    path = home / "logs" / "agt_action_gateway.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_agt_gateway_logs_allow_for_all_wave1_boundaries(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    for action in BOUNDARIES:
+        decision = agt_action_gateway(
+            action=action,
+            caller="tests.agent.test_agt_action_gateway",
+            policies=("model_inherit_controller_default",),
+            target=f"target:{action}",
+            state={"controller_model": "gpt-5.5"},
+            metadata={"parent_model": "gpt-5.5", "child_model": "gpt-5.5"},
+        )
+        assert decision.allowed
+
+    events = _events(tmp_path)
+    assert [event["action"] for event in events] == BOUNDARIES
+    for event in events:
+        assert event["decision"] == "allow"
+        assert event["policy"] == "model_inherit_controller_default"
+        assert event["caller"] == "tests.agent.test_agt_action_gateway"
+        assert event["reason"] == "policy allow"
+        assert event["state_hash"]
+        assert event["target"].startswith("target:")
+
+
+def test_deny_decision_stops_action_before_execution(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    executed = False
+
+    decision = agt_action_gateway(
+        action="protected_target_path",
+        caller="test",
+        policies=("remote_target_requires_ssh",),
+        target="/etc/cron.d/mls-vulture-vps-live",
+        state={"remote_target": "vps"},
+        metadata={"remote_target": "vps", "path": "/etc/cron.d/mls-vulture-vps-live", "command": "cat /etc/cron.d/mls-vulture-vps-live"},
+    )
+    if decision.allowed:
+        executed = True
+
+    assert decision.decision == "deny"
+    assert executed is False
+    assert _events(tmp_path)[-1]["reason"] == "remote target vps requires ssh vps for protected target paths"
+
+
+def test_quarantine_decision_logs_and_blocks(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    accepted = False
+
+    decision = agt_action_gateway(
+        action="async_result.accept",
+        caller="test",
+        policies=("stale_async_quarantine",),
+        target="deleg_old",
+        metadata={"dispatch_state_hash": "old", "current_state_hash": "new"},
+    )
+    if decision.allowed:
+        accepted = True
+
+    assert decision.decision == "quarantine"
+    assert accepted is False
+    assert _events(tmp_path)[-1]["policy"] == "stale_async_quarantine"
+
+
+def test_explicit_override_allows_and_logs_reason(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    decision = agt_action_gateway(
+        action="delegate_task.dispatch",
+        caller="test",
+        policies=("model_inherit_controller_default",),
+        target="child",
+        metadata={"parent_model": "gpt-5.5", "child_model": "gpt-5.4", "explicit_model_override": True},
+        override_reason="delegation.model",
+    )
+
+    assert decision.allowed
+    event = _events(tmp_path)[-1]
+    assert event["override_reason"] == "delegation.model"
+    assert event["reason"] == "explicit override allowed"
+
+
+def test_receipt_only_role_start_cannot_count_as_execution_proof(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    decision = agt_action_gateway(
+        action="warroom.role_execution_proof",
+        caller="test",
+        policies=("no_receipt_only_role_start_as_execution_proof",),
+        target="builder",
+        metadata={"runtime_kind": "spawn_receipt", "evidence_type": "spawn_receipt", "execution_proof": True},
+    )
+
+    assert decision.decision == "deny"
+    assert "receipt-only role start" in decision.reason
+
+
+def test_child_self_report_cannot_satisfy_done_proof(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    decision = agt_action_gateway(
+        action="final_completion_claim",
+        caller="test",
+        policies=("proof.required_for_done", "no_child_self_report_as_proof"),
+        target="sid",
+        metadata={"child_self_report": True, "satisfies_proof": True},
+    )
+
+    assert decision.decision == "deny"
+    assert decision.policy == "no_child_self_report_as_proof"
+
+
+def test_terminal_and_file_protected_path_call_sites_block_before_execution(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_REMOTE_TARGET", "vps")
+
+    from tools.terminal_tool import terminal_tool
+    from tools.file_tools import read_file_tool, write_file_tool
+
+    terminal_result = json.loads(terminal_tool("cat /etc/passwd", timeout=1))
+    read_result = json.loads(read_file_tool("/etc/passwd"))
+    write_result = json.loads(write_file_tool("/etc/blocked", "x"))
+
+    assert terminal_result["exit_code"] == -1
+    assert "remote_target_requires_ssh" in terminal_result["error"]
+    assert "remote_target_requires_ssh" in read_result["error"]
+    assert "remote_target_requires_ssh" in write_result["error"]

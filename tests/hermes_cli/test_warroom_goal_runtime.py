@@ -946,6 +946,107 @@ def test_strict_plan_starts_plan_roles_then_build_roles_after_gates(hermes_home,
     assert "real delegated role runtime missing" in (advanced.last_gap or "")
 
 
+def test_warroom_roles_record_controller_model_for_plan_and_adversary(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal
+
+    class Parent:
+        model = "gpt-5.5"
+
+    plan = create_warroom_goal(
+        "sid-plan-model",
+        "Use plan adversary skill for: build hardwire\n\nAcceptance:\n- proof\n\nConstraints:\n- worktree only\n\nVerify with:\npytest",
+        tracking_dir=str(tmp_path / "plan"),
+        allowed_mutation_root=str(tmp_path),
+        parent_agent=Parent(),
+    )
+    adversary = create_warroom_goal(
+        "sid-adversary-model",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path / "adv"),
+        allowed_mutation_root=str(tmp_path),
+        parent_agent=Parent(),
+    )
+
+    assert plan.controller_model == "gpt-5.5"
+    assert adversary.controller_model == "gpt-5.5"
+    assert {r["model"] for r in plan.role_records.values()} == {"gpt-5.5"}
+    assert {r["model"] for r in adversary.role_records.values()} == {"gpt-5.5"}
+
+
+def test_late_async_role_output_is_quarantined_after_state_advanced(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, record_role_output, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-stale-async",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.status = "done"
+    state.final_claim_allowed = True
+    save_warroom_goal("sid-stale-async", state)
+
+    updated = record_role_output(
+        "sid-stale-async",
+        "adversary",
+        evidence_path=str(tmp_path / "late-adversary.txt"),
+        status="done",
+        verdict="PASS",
+    )
+
+    assert updated is not None
+    assert updated.status == "done"
+    assert updated.final_claim_allowed is True
+    assert updated.role_records["adversary"]["status"] == "stale_async_result"
+    assert updated.role_records["adversary"]["stale"] is True
+    assert "async_stale_quarantine" in updated.gate_evidence
+
+
+def test_remote_vps_target_blocks_local_target_paths(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-remote-vps",
+        "Use adversary skill for: build hardwire\nRemote target: vps",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    _unlock_runtime_for_policy_test(state)
+    state.current_role = "builder"
+    save_warroom_goal("sid-remote-vps", state)
+
+    assert state.remote_target == "vps"
+    blocked_read = enforce_tool_policy("sid-remote-vps", "read_file", {"path": "/etc/passwd"})
+    blocked_shell = enforce_tool_policy("sid-remote-vps", "terminal", {"command": "cat /opt/app/config.yaml"})
+    allowed_ssh = enforce_tool_policy("sid-remote-vps", "terminal", {"command": "ssh vps 'cat /etc/passwd'", "workdir": str(tmp_path)})
+
+    assert blocked_read and "ssh vps" in blocked_read
+    assert blocked_shell and "ssh vps" in blocked_shell
+    assert allowed_ssh is None
+
+
+def test_child_role_cannot_write_parent_owned_proof_state(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-parent-proof",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    _unlock_runtime_for_policy_test(state)
+    state.current_role = "builder"
+    save_warroom_goal("sid-parent-proof", state)
+
+    blocked = enforce_tool_policy("sid-parent-proof", "write_file", {"path": str(tmp_path / "final-proof-packet.md")})
+    assert blocked and "controller-owned" in blocked
+
+    state.current_role = "controller"
+    save_warroom_goal("sid-parent-proof", state)
+    allowed = enforce_tool_policy("sid-parent-proof", "write_file", {"path": str(tmp_path / "final-proof-packet.md")})
+    assert allowed is None
+
+
 def test_builder_self_report_cannot_unlock_guardian_final_gate(hermes_home, tmp_path):
     from hermes_cli.warroom_goal import create_warroom_goal, guard_final_response, record_role_output, save_warroom_goal
 

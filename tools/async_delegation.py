@@ -45,6 +45,8 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures.thread import _threads_queues, _worker
 from typing import Any, Callable, Dict, List, Optional
 
+from agent.agt_gateway import agt_action_gateway
+
 logger = logging.getLogger(__name__)
 
 
@@ -314,6 +316,22 @@ def _push_completion_event(
     error = result.get("error")
     dispatched_at = record.get("dispatched_at") or time.time()
     completed_at = record.get("completed_at") or time.time()
+    decision = agt_action_gateway(
+        action="async_result.accept",
+        caller="tools.async_delegation._push_completion_event",
+        policies=("stale_async_quarantine", "no_child_self_report_as_proof"),
+        target=str(record.get("delegation_id") or ""),
+        state={"status": status, "role": record.get("role")},
+        metadata={
+            "dispatch_state_hash": record.get("state_hash"),
+            "current_state_hash": record.get("current_state_hash"),
+            "child_self_report": True,
+            "satisfies_proof": bool(result.get("satisfies_proof")),
+        },
+    )
+    if decision.blocked:
+        logger.warning("Async delegation %s blocked by AGT: %s", record.get("delegation_id"), decision.error_message())
+        return
 
     evt = {
         "type": "async_delegation",
