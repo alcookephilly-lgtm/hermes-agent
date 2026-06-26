@@ -2222,11 +2222,14 @@ def enforce_tool_policy(session_id: str, tool_name: str, args: Dict[str, Any]) -
     if remote_block:
         return remote_block
 
+    mutating = _tool_mutates(tool_name, args)
+    if mutating and state.current_role not in {"builder", "controller", None}:
+        return f"WARROOM V3 blocked: role {state.current_role or 'none'} cannot mutate code. Builder is the only mutation role."
+
     robot_hand_block = _robot_hand_discovery_decision(state, tool_name, args)
     if robot_hand_block:
         return robot_hand_block
 
-    mutating = _tool_mutates(tool_name, args)
     if mutating:
         codegraph_block = _codegraph_before_edit_decision(state, tool_name, args)
         if codegraph_block:

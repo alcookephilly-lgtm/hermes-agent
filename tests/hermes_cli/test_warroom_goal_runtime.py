@@ -1956,6 +1956,7 @@ def test_core_run_conversation_slash_goal_reaches_runtime_without_user_nudge(her
 
 def test_acp_goal_command_uses_global_hardwire_without_goalmanager(hermes_home, tmp_path, monkeypatch):
     pytest.importorskip("acp")
+    pytest.importorskip("acp.schema")
     from types import SimpleNamespace
     from acp_adapter.server import HermesACPAgent
     from hermes_cli.goals import GoalManager

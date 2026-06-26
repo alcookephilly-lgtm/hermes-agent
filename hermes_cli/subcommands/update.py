@@ -67,4 +67,16 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         default=False,
         help="Windows: proceed with the update even when another hermes.exe is detected. The concurrent process will likely cause WinError 32 warnings and may leave a reboot-deferred .exe replacement.",
     )
+    update_parser.add_argument(
+        "--approve-hardwire-overwrite",
+        default=None,
+        metavar="PHRASE",
+        help="Explicit AGT hardwire overwrite approval phrase. Must equal AL_APPROVES_OVERWRITE_AGT_HARDWIRES.",
+    )
+    update_parser.add_argument(
+        "--hardwire-overwrite-reason",
+        default=None,
+        metavar="TEXT",
+        help="Reason logged when approving AGT hardwire overwrite during update.",
+    )
     update_parser.set_defaults(func=cmd_update)

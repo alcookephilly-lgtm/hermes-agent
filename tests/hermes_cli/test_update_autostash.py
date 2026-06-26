@@ -804,6 +804,11 @@ def _setup_setting_test(monkeypatch, tmp_path, mode):
         hermes_config, "load_config",
         lambda *a, **kw: {"updates": {"non_interactive_local_changes": mode}},
     )
+    monkeypatch.setattr(
+        hermes_main,
+        "_non_interactive_update_discard_enabled",
+        lambda: mode == "discard",
+    )
     side_effect, recorded = _make_update_side_effect()
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
     return restore_calls, discard_calls, recorded

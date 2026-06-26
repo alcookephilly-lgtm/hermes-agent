@@ -790,6 +790,34 @@ class CheckpointManager:
         # Take a pre-rollback snapshot so you can undo the undo.
         self._take(abs_dir, f"pre-rollback snapshot (restoring to {commit_hash[:8]})")
 
+        try:
+            from hermes_cli.agt_hardwire_manifest import guard_restore_hardwires
+
+            hardwire_guard = guard_restore_hardwires(
+                abs_dir,
+                file_path or ".",
+                command=f"checkpoint restore {commit_hash[:8]} -- {file_path or '.'}",
+                caller="tools.checkpoint_manager.CheckpointManager.restore",
+                approval_phrase=os.environ.get("HERMES_AGT_HARDWIRE_OVERWRITE_APPROVAL"),
+                approval_reason=os.environ.get("HERMES_AGT_HARDWIRE_OVERWRITE_REASON"),
+            )
+            if not hardwire_guard.allowed:
+                return {
+                    "success": False,
+                    "error": "AGT hardwire overwrite blocked before restore",
+                    "protected_files": [risk.path for risk in hardwire_guard.files],
+                    "audit": str(hardwire_guard.audit_path) if hardwire_guard.audit_path else None,
+                }
+        except Exception as exc:
+            if (Path(abs_dir) / "agent" / "agt_gateway.py").exists():
+                return {
+                    "success": False,
+                    "error": f"AGT hardwire restore guard unavailable: {exc}",
+                    "protected_files": [],
+                    "audit": None,
+                }
+            logger.debug("AGT hardwire restore guard skipped: %s", exc)
+
         dir_hash = _project_hash(abs_dir)
         index_file = _index_path(store, dir_hash)
 

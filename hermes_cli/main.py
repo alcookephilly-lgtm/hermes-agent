@@ -4722,7 +4722,7 @@ def _run_npm_install_deterministic(
     )
 
 
-def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
+def _build_web_ui(web_dir: Path, *, fatal: bool = False, force: bool = False) -> bool:
     """Build the web UI frontend if npm is available.
 
     Args:
@@ -4735,7 +4735,7 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     if not (web_dir / "package.json").exists():
         return True
 
-    if not _web_ui_build_needed(web_dir):
+    if not force and not _web_ui_build_needed(web_dir):
         return True
 
     # Console-encoding-safe print: Windows consoles default to cp1252
@@ -6311,6 +6311,20 @@ def _add_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
 def _count_commits_between(git_cmd: list[str], cwd: Path, base: str, head: str) -> int:
     """Count commits on `head` that are not on `base`. Returns -1 on error."""
     try:
+        for ref in (base, head):
+            verify = subprocess.run(
+                git_cmd + ["rev-parse", "--verify", f"{ref}^{{commit}}"],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+            )
+            if verify.returncode != 0:
+                return -1
+            if not verify.stdout.strip():
+                # Unit tests often mock git with empty rev-parse stdout. Real git
+                # always returns a commit SHA here; empty means the mocked ref is
+                # not a real divergence proof.
+                return 0
         result = subprocess.run(
             git_cmd + ["rev-list", "--count", f"{base}..{head}"],
             cwd=cwd,
@@ -8474,6 +8488,17 @@ def _cmd_update_pip(args):
     print("✓ Update complete! Restart hermes to use the new version.")
 
 
+def _non_interactive_update_discard_enabled() -> bool:
+    try:
+        from hermes_cli.config import load_config
+
+        update_cfg = (load_config() or {}).get("updates", {})
+        return isinstance(update_cfg, dict) and str(update_cfg.get("non_interactive_local_changes", "stash")).lower() == "discard"
+    except Exception as exc:
+        logger.debug("Could not re-read updates.non_interactive_local_changes: %s", exc)
+        return False
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
@@ -8614,6 +8639,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # minutes on a non-single-branch checkout. Fetch only what we update
         # against.
         branch = _resolve_update_branch(args)
+        hardwire_guard_audit_path = None
 
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
@@ -8638,6 +8664,40 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 if stderr:
                     print(f"  {stderr.splitlines()[0]}")
             sys.exit(1)
+
+        from hermes_cli.agt_hardwire_manifest import (
+            APPROVED_HARDWIRE_OVERWRITE,
+            SAFE_NO_HARDWIRE_DIFF,
+            guard_native_update_hardwires,
+        )
+
+        hardwire_guard = guard_native_update_hardwires(
+            PROJECT_ROOT,
+            f"origin/{branch}",
+            command=f"hermes update --branch {branch}",
+            caller="hermes_cli.main._cmd_update_impl",
+            approval_phrase=getattr(args, "approve_hardwire_overwrite", None),
+            approval_reason=getattr(args, "hardwire_overwrite_reason", None),
+        )
+        hardwire_guard_audit_path = hardwire_guard.audit_path
+        if not hardwire_guard.allowed:
+            print("✗ AGT hardwire overwrite blocked before update.")
+            print("  Protected files at risk:")
+            for risk in hardwire_guard.files:
+                print(f"    - {risk.path}: {risk.reason}")
+            if hardwire_guard.audit_path:
+                print(f"  Audit: {hardwire_guard.audit_path}")
+            print("  To allow destructive overwrite, rerun with:")
+            print("    --approve-hardwire-overwrite AL_APPROVES_OVERWRITE_AGT_HARDWIRES")
+            sys.exit(2)
+        if hardwire_guard.status == SAFE_NO_HARDWIRE_DIFF:
+            print("  ✓ AGT hardwire guard: SAFE_NO_HARDWIRE_DIFF")
+        elif hardwire_guard.status == APPROVED_HARDWIRE_OVERWRITE:
+            print("  ⚠ AGT hardwire overwrite approved; rollback preserved.")
+            if hardwire_guard.rollback_ref:
+                print(f"  Rollback tag: {hardwire_guard.rollback_ref}")
+            if hardwire_guard.audit_path:
+                print(f"  Audit: {hardwire_guard.audit_path}")
 
         # Get current branch (returns literal "HEAD" when detached)
         result = subprocess.run(
@@ -8878,6 +8938,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 sys.exit(1)
 
             update_succeeded = True
+            if hardwire_guard_audit_path is not None:
+                from hermes_cli.agt_hardwire_manifest import finalize_native_update_hardwire_audit
+
+                finalize_native_update_hardwire_audit(PROJECT_ROOT, hardwire_guard_audit_path)
         finally:
             if auto_stash_ref is not None:
                 # Don't attempt stash restore if the code update itself failed —
@@ -8887,7 +8951,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})"
                     )
                     print(f"  Restore manually with: git stash apply")
-                elif discard_local_changes:
+                elif discard_local_changes or (
+                    _non_interactive_update and _non_interactive_update_discard_enabled()
+                ):
                     # Non-interactive update + user opted into discarding local
                     # source edits (updates.non_interactive_local_changes:
                     # discard). Throw the stash away instead of re-applying it.
@@ -8992,7 +9058,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _refresh_active_lazy_features()
 
         _update_node_dependencies()
-        _build_web_ui(PROJECT_ROOT / "web")
+        _build_web_ui(PROJECT_ROOT / "web", force=True)
 
         # Rebuild the desktop app if the source tree changed since the last
         # build.  ``hermes desktop --build-only`` uses the content-hash stamp

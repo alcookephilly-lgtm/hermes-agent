@@ -1,0 +1,124 @@
+{
+  "approval_phrase": "AL_APPROVES_OVERWRITE_AGT_HARDWIRES",
+  "generated_from_head": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
+  "protected_files": [
+    {
+      "commit_source": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
+      "git_blob_sha": "4a27fe52c0f8ecb3266e8f3ff8cc80e08e36018b",
+      "path": "agent/agt_gateway.py",
+      "reason": "AGT action gateway policy rail: adversary-skill and plan-adversary-skill enforcement core",
+      "sha256": "3ce1f5a6068c4f0ea7c19381569d8dd061d59eb797676e927139dc636f2a78a4",
+      "wave_introduced": "wave1",
+      "wave_last_touched": "wave6"
+    },
+    {
+      "commit_source": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
+      "git_blob_sha": "3db86d33ca93c84b890cfa6804315b74a9b1b967",
+      "path": "agent/chat_completion_helpers.py",
+      "reason": "AGT final claim/proof hardwire helpers",
+      "sha256": "c9bc8f1d23c30899ac9bfdcce628dc98912643c53f75c12b97e91d71ca614ba4",
+      "wave_introduced": "wave2",
+      "wave_last_touched": "wave5"
+    },
+    {
+      "commit_source": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
+      "git_blob_sha": "08bb83882d9d53e9c2d00f8cbf7749c1656dd75f",
+      "path": "cli.py",
+      "reason": "CLI terminal ingestion and sanitizer hardwire path",
+      "sha256": "f6c089d3286367b30b82ca2666c640bc52c0ade8c9b7866904409b76a77b6970",
+      "wave_introduced": "wave2",
+      "wave_last_touched": "wave6"
+    },
+    {
+      "commit_source": "wave7-working-tree",
+      "git_blob_sha": "1fb48766da3cccf53feadf5318fc5621135c9d42",
+      "path": "hermes_cli/warroom_goal.py",
+      "reason": "Warroom runtime hardwire shared by adversary-skill and plan-adversary-skill",
+      "sha256": "386b90628c035fcc38d0dcab5f83a696e4dc476dc8f0c80c31b492a90cfa2182",
+      "wave_introduced": "wave1",
+      "wave_last_touched": "wave7"
+    },
+    {
+      "commit_source": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
+      "git_blob_sha": "b179ba951767ce1f76fd02f323bc39b8b27e2849",
+      "path": "tools/delegate_tool.py",
+      "reason": "Delegate/subagent dispatch hardwire path",
+      "sha256": "2c2284979800eb7386f8e9daa3ea9d38f36d9a48055e8900fca1030cbbdc46fc",
+      "wave_introduced": "wave1",
+      "wave_last_touched": "wave4"
+    },
+    {
+      "commit_source": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
+      "git_blob_sha": "fd0b6489a9fd82897836a866ea9ff28a1ef1490b",
+      "path": "tests/agent/test_agt_action_gateway.py",
+      "reason": "AGT action gateway regression tests",
+      "sha256": "71947a8da53ef0cadd28eb6c5ee20bbbf1600065bb9d5a02df514f44db210c10",
+      "wave_introduced": "wave1",
+      "wave_last_touched": "wave6"
+    },
+    {
+      "commit_source": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
+      "git_blob_sha": "bc49e5f33d9afbcec0d1b09c6e8b58a5ecd1784d",
+      "path": "tests/agent/test_codex_ttfb_watchdog.py",
+      "reason": "TTFB/context pressure hardwire regression tests",
+      "sha256": "e85bfbce70e9f79e7fdad3afa891ff44689f4a0a2957b63015418ccba7c35005",
+      "wave_introduced": "wave5",
+      "wave_last_touched": "wave5"
+    },
+    {
+      "commit_source": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
+      "git_blob_sha": "72a0b5271d9aecac59c9ca3dc267fdd4739b11c6",
+      "path": "tests/cli/test_cli_terminal_response_sanitizer.py",
+      "reason": "CLI terminal junk sanitizer hardwire regression tests",
+      "sha256": "1db7e803bd82acd7cebd0ba9a19397a3443a224f1426deeac54f5ecd2bfb2a8d",
+      "wave_introduced": "wave2",
+      "wave_last_touched": "wave2"
+    },
+    {
+      "commit_source": "wave7-working-tree",
+      "git_blob_sha": "022cc842d36c5efcfffbabf1736772a95a44258a",
+      "path": "tests/hermes_cli/test_warroom_goal_runtime.py",
+      "reason": "Warroom runtime tests for adversary-skill and plan-adversary-skill hardwires",
+      "sha256": "e9c83b1e2cb27d0927867b60a76d1bb996828e5e4678a11adbbf74b272015770",
+      "wave_introduced": "wave1",
+      "wave_last_touched": "wave7"
+    },
+    {
+      "commit_source": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
+      "git_blob_sha": "29c80d26aff072185b0fc03b78c29583a77e8b48",
+      "path": "tests/tools/test_delegate.py",
+      "reason": "Delegate/subagent hardwire regression tests",
+      "sha256": "6d77435a8dc2324109f89607811016e23c340544a5c04898e5a4a70b7ccfe66b",
+      "wave_introduced": "wave1",
+      "wave_last_touched": "wave4"
+    },
+    {
+      "commit_source": "wave7-working-tree",
+      "git_blob_sha": "900c90820cb4c5177326a95c7113eb82d555c73e",
+      "path": "hermes_cli/main.py",
+      "reason": "Native update git pull/reset/checkout guard wiring",
+      "sha256": "61dd6a313b938bb0a7479032bc2f988e23a682edde037b8b8a92b13c060b62fb",
+      "wave_introduced": "wave7",
+      "wave_last_touched": "wave7"
+    },
+    {
+      "commit_source": "wave7-working-tree",
+      "git_blob_sha": "fa193d3803b6800632a540e69d061487333033cf",
+      "path": "hermes_cli/subcommands/update.py",
+      "reason": "Native update approval phrase CLI wiring",
+      "sha256": "6b682b8570ba2344dc13b794ffd051e8e8754e30d071a21eabac2774c6be1dce",
+      "wave_introduced": "wave7",
+      "wave_last_touched": "wave7"
+    },
+    {
+      "commit_source": "wave7-working-tree",
+      "git_blob_sha": "8cee1a4003e4afb71523365554923dbd347ece11",
+      "path": "tools/checkpoint_manager.py",
+      "reason": "Restore/rollback hardwire overwrite guard wiring",
+      "sha256": "845f2240e83890b10e9f882a67b27293425eed1ad89a8c71bcb92d60e4790923",
+      "wave_introduced": "wave7",
+      "wave_last_touched": "wave7"
+    }
+  ],
+  "schema": "agt-hardwire-manifest.v1"
+}
