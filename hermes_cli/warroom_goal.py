@@ -52,6 +52,10 @@ def _sha256_file_optional(path: Path) -> Optional[str]:
         return None
 
 
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+
+
 def _git_output(args: List[str], cwd: Path) -> Optional[str]:
     try:
         proc = subprocess.run(
@@ -1054,6 +1058,17 @@ def _start_roles_for_state(
                 )
                 if isinstance(result, dict) and result.get("model"):
                     record["model"] = str(result.get("model"))
+                if isinstance(result, dict):
+                    stdout_text = str(result.get("stdout") or result.get("output") or "")
+                    stderr_text = str(result.get("stderr") or "")
+                    record["tracked_terminal_exit_code"] = exit_code
+                    record["tracked_terminal_stdout_bytes"] = len(stdout_text.encode("utf-8", errors="replace"))
+                    record["tracked_terminal_stdout_sha256"] = _sha256_text(stdout_text)
+                    if stdout_text:
+                        record["tracked_terminal_stdout"] = stdout_text
+                    if stderr_text:
+                        record["tracked_terminal_stderr"] = stderr_text
+                        record["tracked_terminal_stderr_sha256"] = _sha256_text(stderr_text)
                 record = _annotate_role_record(record, state=state, role=role, role_card_path=role_card_path)
                 if not Path(evidence_path).exists():
                     _write_json(Path(evidence_path), {"record": record, "event": "role_spawned"})

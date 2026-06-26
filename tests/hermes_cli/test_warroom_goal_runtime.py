@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import json
 import os
 import time
@@ -1517,6 +1518,37 @@ def test_rc0_empty_transport_is_incomplete_not_success(hermes_home, tmp_path):
     assert blocked.status == "gap"
     assert blocked.gates["role_spawn"] == "gap"
     assert "INCOMPLETE_TRANSPORT" in blocked.role_records["reviewer"]["error"]
+
+
+def test_tracked_terminal_proof_persists_stdout_and_exit_code(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, start_warroom_roles
+
+    create_warroom_goal(
+        "sid-tracked-terminal-proof",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+
+    stdout = "pytest stdout\n1 passed\n"
+
+    def tracked_transport(**kwargs):
+        return {
+            "adapter": "native_delegate",
+            "exit_code": 0,
+            "stdout": stdout,
+            "delegation_id": "delegation-tracked-proof",
+            "child_session_id": "child-tracked-proof",
+        }
+
+    state = start_warroom_roles("sid-tracked-terminal-proof", ["reviewer"], adapter=tracked_transport, use_local_process=False)
+    assert state is not None
+    record = state.role_records["reviewer"]
+    assert record["status"] == "active_child_work"
+    assert record["tracked_terminal_exit_code"] == 0
+    assert record["tracked_terminal_stdout"] == stdout
+    assert record["tracked_terminal_stdout_bytes"] == len(stdout.encode("utf-8"))
+    assert record["tracked_terminal_stdout_sha256"] == hashlib.sha256(stdout.encode("utf-8")).hexdigest()
 
 
 def test_noncritical_halts_auto_continue_and_mission_critical_halts(hermes_home, tmp_path):

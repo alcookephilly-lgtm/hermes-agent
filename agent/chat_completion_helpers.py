@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import hashlib
 import threading
 import time
 import uuid
@@ -120,6 +121,46 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _codex_context_pressure_evidence(
+    agent,
+    api_kwargs: dict,
+    *,
+    estimated_tokens: int,
+    threshold_tokens: float,
+    max_silence_seconds: float,
+) -> Dict[str, str]:
+    """Write large-context TTFB evidence without persisting prompt text."""
+    payload = json.dumps(api_kwargs, sort_keys=True, default=str, ensure_ascii=False)
+    payload_bytes = payload.encode("utf-8", errors="replace")
+    payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+    evidence = {
+        "event": "CODEX_CONTEXT_PRESSURE_EVIDENCE",
+        "mode": "TTFB_LARGE_CONTEXT_BACKOFF",
+        "model": str(api_kwargs.get("model", "unknown")),
+        "estimated_context_tokens": estimated_tokens,
+        "threshold_tokens": threshold_tokens,
+        "max_silence_seconds": max_silence_seconds,
+        "request_sha256": payload_sha256,
+        "request_bytes": len(payload_bytes),
+    }
+    try:
+        from hermes_constants import get_hermes_home
+
+        logs_dir = get_hermes_home() / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        path = logs_dir / f"codex-context-pressure-{uuid.uuid4().hex[:12]}.json"
+        path.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        result = {"path": str(path), "sha256": payload_sha256}
+        try:
+            agent._codex_context_pressure_evidence = result
+        except Exception:
+            pass
+        return result
+    except Exception as exc:
+        logger.warning("CODEX_CONTEXT_PRESSURE_EVIDENCE_WRITE_FAILED error=%s", exc)
+        return {"path": "", "sha256": payload_sha256}
 
 
 def interruptible_api_call(agent, api_kwargs: dict):
@@ -307,6 +348,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _ttfb_enabled = _codex_watchdog_enabled
     _ttfb_timeout = _env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 120.0)
     _large_context_ttfb_mode = False
+    _context_pressure_evidence: Dict[str, str] = {"path": "", "sha256": ""}
     _ttfb_heartbeat_interval = _env_float("HERMES_CODEX_TTFB_HEARTBEAT_SECONDS", 30.0)
     _last_ttfb_heartbeat = 0.0
     if _ttfb_timeout <= 0:
@@ -327,17 +369,27 @@ def interruptible_api_call(agent, api_kwargs: dict):
             )
             if _large_ttfb_cap > 0:
                 _ttfb_timeout = max(_ttfb_timeout, _large_ttfb_cap)
+            _context_pressure_evidence = _codex_context_pressure_evidence(
+                agent,
+                api_kwargs,
+                estimated_tokens=_est_tokens_for_codex_watchdog,
+                threshold_tokens=_ttfb_disable_above,
+                max_silence_seconds=_ttfb_timeout,
+            )
             logger.info(
-                "openai-codex TTFB watchdog mode=large-context "
-                "context=~%s tokens threshold=%.0f max_silence=%.0fs. "
-                "Heartbeat enabled; timeout triggers compression/split fallback guidance.",
+                "TTFB_LARGE_CONTEXT_BACKOFF openai-codex context=~%s tokens "
+                "threshold=%.0f max_silence=%.0fs evidence_path=%s evidence_sha256=%s. "
+                "Heartbeat enabled; timeout triggers COMPRESSION_OR_SPLIT_TRIGGERED guidance.",
                 f"{_est_tokens_for_codex_watchdog:,}",
                 _ttfb_disable_above,
                 _ttfb_timeout,
+                _context_pressure_evidence.get("path") or "unwritten",
+                _context_pressure_evidence.get("sha256") or "unknown",
             )
         else:
+            _context_pressure_evidence = {"path": "", "sha256": ""}
             logger.info(
-                "openai-codex TTFB watchdog mode=strict context=~%s tokens timeout=%.0fs",
+                "TTFB_STRICT_ACTIVE openai-codex context=~%s tokens timeout=%.0fs",
                 f"{_est_tokens_for_codex_watchdog:,}",
                 _ttfb_timeout,
             )
@@ -395,17 +447,21 @@ def interruptible_api_call(agent, api_kwargs: dict):
         ):
             _last_ttfb_heartbeat = _elapsed
             logger.info(
-                "openai-codex TTFB heartbeat mode=large-context elapsed=%.0fs "
-                "max_silence=%.0fs model=%s context=~%s tokens",
+                "TTFB_LARGE_CONTEXT_BACKOFF heartbeat elapsed=%.0fs "
+                "max_silence=%.0fs model=%s context=~%s tokens evidence_path=%s evidence_sha256=%s",
                 _elapsed,
                 _ttfb_timeout,
                 api_kwargs.get("model", "unknown"),
                 f"{_est_tokens_for_codex_watchdog:,}",
+                _context_pressure_evidence.get("path") or "unwritten",
+                _context_pressure_evidence.get("sha256") or "unknown",
             )
             agent._buffer_status(
-                f"⏳ Codex large-context TTFB mode: {int(_elapsed)}s silent "
+                f"⏳ TTFB_LARGE_CONTEXT_BACKOFF: Codex large-context wait {int(_elapsed)}s silent "
                 f"(max {int(_ttfb_timeout)}s, model: {api_kwargs.get('model', 'unknown')}). "
-                "Still waiting; compression/split fallback is armed."
+                f"Evidence: {_context_pressure_evidence.get('path') or 'unwritten'} "
+                f"sha256={_context_pressure_evidence.get('sha256') or 'unknown'}. "
+                "Still waiting; COMPRESSION_OR_SPLIT_TRIGGERED fallback is armed."
             )
 
         # TTFB detector: the Codex stream has produced no event at all and
@@ -427,15 +483,18 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     _silent_hint = None
             _mode_label = "large-context" if _large_context_ttfb_mode else "strict"
             _fallback_tail = (
-                " Triggering compression/split fallback guidance."
+                " TTFB_MAX_SILENCE_EXCEEDED; COMPRESSION_OR_SPLIT_TRIGGERED. "
+                f"Evidence: {_context_pressure_evidence.get('path') or 'unwritten'} "
+                f"sha256={_context_pressure_evidence.get('sha256') or 'unknown'}."
                 if _large_context_ttfb_mode
                 else ""
             )
             logger.warning(
-                "Codex stream produced no bytes within TTFB cutoff mode=%s "
+                "%s Codex stream produced no bytes within TTFB cutoff mode=%s "
                 "(%.0fs > %.0fs, model=%s, context=~%s tokens). Backend accepted "
                 "the connection but sent no stream events. Killing connection so "
                 "the retry loop can reconnect.%s",
+                "TTFB_MAX_SILENCE_EXCEEDED" if _large_context_ttfb_mode else "TTFB_STRICT_ACTIVE",
                 _mode_label,
                 _elapsed,
                 _ttfb_timeout,
