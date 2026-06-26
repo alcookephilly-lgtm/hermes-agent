@@ -1128,7 +1128,41 @@ def record_role_output(
         )
         save_warroom_goal(session_id, state)
         return state
-    record.update({"role": role, "status": status, "last_seen_at": _utc_stamp(), "evidence_path": evidence_path})
+    requested_status = str(status or "").strip() or "done"
+    receipt_only = bool(record.get("spawn_receipt_only")) or str(record.get("runtime_kind") or "") in {
+        "spawn_receipt",
+        "local_process",
+    }
+    has_real_runtime = bool(record.get("child_session_id") or record.get("delegation_id"))
+    if role != "controller" and receipt_only and not has_real_runtime and requested_status in {"active_child_work", "completed"}:
+        decision = agt_action_gateway(
+            action="warroom.role_execution_proof",
+            caller="hermes_cli.warroom_goal.record_role_output",
+            policies=("no_receipt_only_role_start_as_execution_proof",),
+            target=role,
+            state={"workflow": state.workflow, "status": state.status},
+            metadata={
+                "role": role,
+                "runtime_kind": record.get("runtime_kind") or "spawn_receipt",
+                "evidence_type": record.get("runtime_kind") or "spawn_receipt",
+                "execution_proof": True,
+                "requested_status": requested_status,
+            },
+        )
+        record.update({
+            "role": role,
+            "status": "spawn_receipt_only",
+            "current_phase": "spawn_receipt_only",
+            "spawn_receipt_only": True,
+            "last_seen_at": _utc_stamp(),
+            "evidence_path": evidence_path,
+        })
+        state.role_records[role] = record
+        state.gate_evidence.setdefault("receipt_only_verdict", []).append(decision.error_message())
+        save_warroom_goal(session_id, state)
+        return state
+
+    record.update({"role": role, "status": requested_status, "last_seen_at": _utc_stamp(), "evidence_path": evidence_path})
     state.role_records[role] = record
     if role == "guardian":
         state.guardian_verdict_path = evidence_path

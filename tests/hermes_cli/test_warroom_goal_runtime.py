@@ -1004,6 +1004,38 @@ def test_late_async_role_output_is_quarantined_after_state_advanced(hermes_home,
     assert "async_stale_quarantine" in updated.gate_evidence
 
 
+def test_receipt_only_role_output_cannot_mark_active_or_completed(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, record_role_output
+
+    state = create_warroom_goal(
+        "sid-receipt-output-block",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    assert state.role_records["builder"]["spawn_receipt_only"] is True
+
+    active = record_role_output(
+        "sid-receipt-output-block",
+        "builder",
+        evidence_path=str(tmp_path / "builder-active.txt"),
+        status="active_child_work",
+    )
+    assert active is not None
+    assert active.role_records["builder"]["status"] == "spawn_receipt_only"
+    assert active.role_records["builder"]["current_phase"] == "spawn_receipt_only"
+
+    completed = record_role_output(
+        "sid-receipt-output-block",
+        "builder",
+        evidence_path=str(tmp_path / "builder-completed.txt"),
+        status="completed",
+    )
+    assert completed is not None
+    assert completed.role_records["builder"]["status"] == "spawn_receipt_only"
+    assert "receipt_only_verdict" in completed.gate_evidence
+
+
 def test_remote_vps_target_blocks_local_target_paths(hermes_home, tmp_path):
     from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, save_warroom_goal
 
