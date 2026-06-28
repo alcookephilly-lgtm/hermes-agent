@@ -246,6 +246,80 @@ def test_robot_hand_gateway_blocks_raw_fallback_until_current_or_gap(monkeypatch
     assert "explicit robot-hand gap" in allowed_gap.reason
 
 
+def test_denial_error_message_includes_route_hints(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    denied = agt_action_gateway(
+        action="raw_discovery_fallback",
+        caller="test",
+        policies=("robot_hand_discovery_required",),
+        target="GRAPH_REPORT.md",
+        metadata={
+            "raw_discovery": True,
+            "robot_hand_current": False,
+            "route_hint": "use robot hand",
+            "correct_tool_path": "mcp2cli @smart-read sc-read",
+            "retry_command_template": "mcp2cli '@smart-read' sc-read --file-path file --mode full",
+        },
+    )
+
+    message = denied.error_message()
+    assert "route_hint=use robot hand" in message
+    assert "correct_tool_path=mcp2cli @smart-read sc-read" in message
+    assert "retry_command_template=mcp2cli '@smart-read' sc-read" in message
+
+
+def test_graphify_robot_hand_denial_reroutes_to_smart_read(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    denied = agt_action_gateway(
+        action="raw_discovery_fallback",
+        caller="test",
+        policies=("robot_hand_discovery_required",),
+        target="/mnt/c/Users/paulcooke1976/claude-config/graphify-out/GRAPH_REPORT.md",
+        metadata={
+            "raw_discovery": True,
+            "robot_hand_current": False,
+            "attempted_path": "/mnt/c/Users/paulcooke1976/claude-config/graphify-out/GRAPH_REPORT.md",
+        },
+    )
+
+    message = denied.error_message()
+    assert "route_hint=" in message
+    assert "correct_tool_path=mcp2cli @smart-read sc-read" in message
+    assert (
+        "mcp2cli '@smart-read' sc-read --file-path /mnt/c/Users/paulcooke1976/claude-config/graphify-out/GRAPH_REPORT.md --mode full --offset 1 --limit 80"
+        in message
+    )
+
+
+def test_ponytail_gateway_blocks_wrong_tool_path_and_missing_proof(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    wrong = agt_action_gateway(
+        action="ponytail.route",
+        caller="test",
+        policies=("ponytail_wrong_tool_path",),
+        metadata={
+            "ponytail_wrong_tool_path": True,
+            "correct_tool_path": "/home/alcoo/.local/bin/cli-anything-ponytail-mcp",
+            "retry_command_template": "cli-anything-ponytail-mcp review --target <path>",
+        },
+    )
+    assert wrong.decision == "deny"
+    assert "PONYTAIL_WRONG_TOOL_PATH" in wrong.error_message()
+    assert "cli-anything-ponytail-mcp review --target <path>" in wrong.error_message()
+
+    missing = agt_action_gateway(
+        action="code_mutation.ponytail_gate",
+        caller="test",
+        policies=("ponytail_required_for_code_write",),
+        metadata={"code_mutation": True, "ponytail_available": True, "ponytail_proof_present": False},
+    )
+    assert missing.decision == "deny"
+    assert "PONYTAIL_GAP" in missing.error_message()
+
+
 def test_codegraph_stale_gateway_blocks_edit_until_synced(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 

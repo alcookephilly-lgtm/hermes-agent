@@ -55,6 +55,7 @@ def _unlock_runtime_for_policy_test(state):
     state.required_action = None
     state.role_spawn_gap = None
     state.last_gap = None
+    state.gate_evidence.setdefault("ponytail", ["PONYTAIL_REVIEW:test fixture"])
     return state
 
 
@@ -844,11 +845,18 @@ def test_wave4_stale_async_result_is_quarantined_and_cannot_overwrite_final_stat
     assert updated is not None
 
     record = updated.role_records["reviewer"]
-    assert record["status"] == "stale_async_result"
+    assert record["status"] == "STALE_SUPERSEDED_BY_CURRENT_VERIFICATION"
     assert record["current_phase"] == "quarantined"
     assert record["quarantine_status"] == "quarantined"
-    assert record["state_class"] == "stale_async_result"
-    assert Path(record["quarantine_path"]).exists()
+    assert record["state_class"] == "STALE_SUPERSEDED_BY_CURRENT_VERIFICATION"
+    quarantine = json.loads(Path(record["quarantine_path"]).read_text(encoding="utf-8"))
+    assert quarantine["status"] == "STALE_SUPERSEDED_BY_CURRENT_VERIFICATION"
+    assert quarantine["state_class"] == "STALE_SUPERSEDED_BY_CURRENT_VERIFICATION"
+    assert quarantine["role"] == "reviewer"
+    assert quarantine["evidence_path"] == str(late)
+    assert quarantine["target_scope"] == str(tmp_path)
+    assert "current_state_hash" in quarantine
+    assert "rescue/requeue" in quarantine["next_safe_action"]
     assert record["quarantined_evidence_path"] == str(late)
     fresh = load_warroom_goal("sid-wave4-stale-async")
     assert fresh is not None
@@ -1015,7 +1023,7 @@ def test_wave4_adversary_and_plan_paths_share_stale_heartbeat_logic(hermes_home,
         child_session_id=f"child-{session_id}",
     )
     assert quarantined is not None
-    assert quarantined.role_records["reviewer"]["status"] == "stale_async_result"
+    assert quarantined.role_records["reviewer"]["status"] == "STALE_SUPERSEDED_BY_CURRENT_VERIFICATION"
     assert quarantined.role_records["reviewer"]["current_phase"] == "quarantined"
     assert quarantined.role_records["reviewer"]["quarantine_status"] == "quarantined"
 
@@ -1241,7 +1249,8 @@ def test_late_async_role_output_is_quarantined_after_state_advanced(hermes_home,
     assert updated is not None
     assert updated.status == "done"
     assert updated.final_claim_allowed is True
-    assert updated.role_records["adversary"]["status"] == "stale_async_result"
+    assert updated.role_records["adversary"]["status"] == "STALE_SUPERSEDED_BY_CURRENT_VERIFICATION"
+    assert updated.role_records["adversary"]["state_class"] == "STALE_SUPERSEDED_BY_CURRENT_VERIFICATION"
     assert updated.role_records["adversary"]["stale"] is True
     assert "async_stale_quarantine" in updated.gate_evidence
 
@@ -1429,6 +1438,7 @@ def test_stale_jcodemunch_and_codegraph_do_not_silently_pass(hermes_home, tmp_pa
 
     state.gate_evidence["robot_hand"] = ["JCODEMUNCH_STALE_GAP:index unavailable; fallback audited"]
     state.gate_evidence["codegraph"] = ["CODEGRAPH_STALE:status says stale", "CODEGRAPH_SYNCED:status up to date"]
+    state.gate_evidence["ponytail"] = ["PONYTAIL_AUDIT:test fixture"]
     save_warroom_goal("sid-stale-index", state)
     assert enforce_tool_policy("sid-stale-index", "search_files", {"path": "/repo", "pattern": "foo"}) is None
     assert enforce_tool_policy("sid-stale-index", "write_file", {"path": str(target), "content": "x = 3\n"}) is None
@@ -1701,6 +1711,7 @@ def test_tracked_terminal_proof_persists_stdout_and_exit_code(hermes_home, tmp_p
     def tracked_transport(**kwargs):
         return {
             "adapter": "native_delegate",
+            "model": "gpt-5.5",
             "exit_code": 0,
             "stdout": stdout,
             "delegation_id": "delegation-tracked-proof",

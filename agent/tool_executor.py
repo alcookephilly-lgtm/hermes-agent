@@ -501,6 +501,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # ContextVars are propagated by propagate_context_to_thread() at the
         # submit site below (GHSA-qg5c-hvr5-hjgr, #13617).
         start = time.time()
+        _warroom_side_effect_snapshot = None
+        try:
+            from hermes_cli.warroom_goal import controller_side_effect_snapshot
+            _warroom_side_effect_snapshot = controller_side_effect_snapshot(
+                getattr(agent, "session_id", "") or "",
+                function_name,
+                function_args,
+            )
+        except Exception:
+            _warroom_side_effect_snapshot = None
         try:
             try:
                 result = agent._invoke_tool(
@@ -534,6 +544,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+            try:
+                from hermes_cli.warroom_goal import controller_side_effect_check
+                result = controller_side_effect_check(
+                    getattr(agent, "session_id", "") or "",
+                    _warroom_side_effect_snapshot,
+                    result,
+                )
+            except Exception:
+                pass
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
             if is_error:
@@ -952,6 +971,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 pass  # never block tool execution
 
         tool_start_time = time.time()
+        _warroom_side_effect_snapshot = None
+        if not _execution_blocked:
+            try:
+                from hermes_cli.warroom_goal import controller_side_effect_snapshot
+                _warroom_side_effect_snapshot = controller_side_effect_snapshot(
+                    getattr(agent, "session_id", "") or "",
+                    function_name,
+                    function_args,
+                )
+            except Exception:
+                _warroom_side_effect_snapshot = None
 
         if _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
@@ -1296,6 +1326,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
+
+        if not _execution_blocked:
+            try:
+                from hermes_cli.warroom_goal import controller_side_effect_check
+                function_result = controller_side_effect_check(
+                    getattr(agent, "session_id", "") or "",
+                    _warroom_side_effect_snapshot,
+                    function_result,
+                )
+            except Exception:
+                pass
 
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (

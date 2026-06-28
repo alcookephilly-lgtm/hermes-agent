@@ -31,6 +31,9 @@ AGT_POLICIES = frozenset(
         "remote_mutation_requires_approval",
         "robot_hand_discovery_required",
         "codegraph_current_before_edit",
+        "ponytail_required_for_code_write",
+        "ponytail_wrong_tool_path",
+        "controller_side_effect_gate",
         "model_inherit_controller_default",
         "stale_async_quarantine",
     }
@@ -74,7 +77,12 @@ class AGTDecision:
 
     def error_message(self) -> str:
         prefix = "AGT QUARANTINED" if self.decision == "quarantine" else "AGT DENIED"
-        return f"{prefix}: policy={self.policy} action={self.action} reason={self.reason}"
+        message = f"{prefix}: policy={self.policy} action={self.action} reason={self.reason}"
+        for key in ("route_hint", "correct_tool_path", "retry_command_template"):
+            value = self.metadata.get(key)
+            if value:
+                message += f" {key}={value}"
+        return message
 
 
 def _json_safe(value: Any) -> Any:
@@ -208,6 +216,14 @@ def agt_action_gateway(
             has_current = bool(meta.get("robot_hand_current"))
             named_gap = str(meta.get("robot_hand_gap") or "")
             stale_without_gap = bool(meta.get("robot_hand_stale")) and not named_gap
+            target_text = " ".join(str(meta.get(k) or "") for k in ("attempted_path", "attempted_command", "path", "command"))
+            if "graphify-out" in target_text.lower() and "GRAPH_REPORT.md" in target_text:
+                meta.setdefault("route_hint", "use smart-read robot hand for Graphify report before raw fallback")
+                meta.setdefault("correct_tool_path", "mcp2cli @smart-read sc-read")
+                meta.setdefault(
+                    "retry_command_template",
+                    "mcp2cli '@smart-read' sc-read --file-path /mnt/c/Users/paulcooke1976/claude-config/graphify-out/GRAPH_REPORT.md --mode full --offset 1 --limit 80",
+                )
             if stale_without_gap:
                 decision = "deny"
                 matched_policy = "robot_hand_discovery_required"
@@ -219,6 +235,25 @@ def agt_action_gateway(
             elif named_gap:
                 matched_policy = "robot_hand_discovery_required"
                 reason = f"explicit robot-hand gap permits raw fallback: {named_gap}"
+
+    if decision == "allow" and "ponytail_wrong_tool_path" in policy_list:
+        if meta.get("ponytail_wrong_tool_path") is True:
+            decision = "deny"
+            matched_policy = "ponytail_wrong_tool_path"
+            reason = "PONYTAIL_WRONG_TOOL_PATH: use cli-anything-ponytail-mcp, not ponytail or ponytail-mcp"
+
+    if decision == "allow" and "ponytail_required_for_code_write" in policy_list:
+        if meta.get("code_mutation") is True and meta.get("ponytail_available") is True:
+            if not meta.get("ponytail_proof_present"):
+                decision = "deny"
+                matched_policy = "ponytail_required_for_code_write"
+                reason = "PONYTAIL_GAP: code write requires Ponytail review/audit/debt/gain proof marker or explicit not-applicable/gap"
+
+    if decision == "allow" and "controller_side_effect_gate" in policy_list:
+        if meta.get("controller_side_effect_detected") is True:
+            decision = "quarantine"
+            matched_policy = "controller_side_effect_gate"
+            reason = "CONTROLLER_SIDE_EFFECT_DETECTED: Controller command-wrapper changed files outside tracking/proof/state"
 
     if decision == "allow" and "codegraph_current_before_edit" in policy_list:
         if meta.get("code_mutation") is True and meta.get("codegraph_stale") is True:

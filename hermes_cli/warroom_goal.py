@@ -238,6 +238,24 @@ ROBOT_HAND_STALE_MARKERS = (
     "CODEGRAPH_STALE",
     "CODEGRAPH_STALE_GAP",
 )
+PONYTAIL_TOOL_NAME = "cli-anything-ponytail-mcp"
+PONYTAIL_TOOL_PATH = "/home/alcoo/.local/bin/cli-anything-ponytail-mcp"
+PONYTAIL_RETRY_TEMPLATE = "cli-anything-ponytail-mcp review --target <path>"
+PONYTAIL_PROOF_MARKERS = (
+    "PONYTAIL_REVIEW",
+    "PONYTAIL_AUDIT",
+    "PONYTAIL_DEBT",
+    "PONYTAIL_GAIN",
+    "PONYTAIL_NOT_APPLICABLE",
+    "PONYTAIL_GAP",
+)
+PONYTAIL_WRONG_TOOL_RE = re.compile(r"(?:^|[\s;&|])(?:ponytail|ponytail-mcp)(?:\s|$)")
+CONTROLLER_SIDE_EFFECT_MARKER = "CONTROLLER_SIDE_EFFECT_DETECTED"
+CONTROLLER_SIDE_EFFECT_APPROVAL_MARKERS = (
+    "CONTROLLER_SOURCE_MUTATION_APPROVED",
+    "BUILDER_REPLAY_VERIFIED",
+    "BUILDER_REPLAY_APPROVED",
+)
 FINAL_CLAIM_RE = re.compile(r"\b(done|fixed|complete|completed|shipped|hardwired)\b", re.I)
 NEGATED_CLAIM_RE = re.compile(r"\b(not|no|isn[’\']t|is not|still|remain(?:s|ing)?|open|failed|blocked|gap)\b", re.I)
 E2E_CLAIM_RE = re.compile(r"\be2e\b|end[- ]to[- ]end", re.I)
@@ -801,6 +819,8 @@ def _write_async_quarantine(
     current_hash: str,
     expected_hash: Optional[str],
     expected_version: Optional[int],
+    dispatch_ts: Optional[str] = None,
+    target_scope: Optional[str] = None,
 ) -> str:
     tracking_dir = Path(state.tracking_dir or _default_tracking_dir())
     stamp = _utc_stamp().replace(":", "").replace("-", "")
@@ -809,15 +829,18 @@ def _write_async_quarantine(
         path,
         {
             "event": "stale_async_result",
-            "status": "quarantined",
+            "status": "STALE_SUPERSEDED_BY_CURRENT_VERIFICATION",
+            "state_class": "STALE_SUPERSEDED_BY_CURRENT_VERIFICATION",
             "role": role,
+            "dispatch_timestamp": dispatch_ts,
             "requested_status": status,
             "evidence_path": evidence_path,
+            "target_scope": target_scope or state.allowed_mutation_root or state.tracking_dir,
             "state_version": state.version,
             "expected_state_version": expected_version,
             "current_state_hash": current_hash,
             "expected_state_hash": expected_hash,
-            "next_safe_action": "Inspect quarantined artifact; rerun focused tests before accepting any late child result.",
+            "next_safe_action": "Treat late output as stale; harvest ledger/log/diff/current state, then rescue/requeue or Builder replay before accepting it.",
         },
     )
     return str(path)
@@ -833,7 +856,7 @@ def mark_role_stalled(
     elapsed: Optional[float] = None,
     current_phase: Optional[str] = None,
     evidence_path: Optional[str] = None,
-    next_safe_action: str = "Harvest ledger/log/diff/current state before retry or rescue.",
+    next_safe_action: str = "Harvest ledger/log/diff/current state; rescue/requeue is primary before accepting more source changes.",
 ) -> Optional[WarroomGoalState]:
     state = load_warroom_goal(session_id)
     if state is None:
@@ -1352,12 +1375,14 @@ def record_role_output(
             current_hash=current_hash,
             expected_hash=expected_state_hash,
             expected_version=expected_state_version,
+            dispatch_ts=record.get("dispatch_timestamp") or record.get("created_at") or record.get("last_seen_at"),
+            target_scope=record.get("target_scope") or state.allowed_mutation_root or state.tracking_dir,
         )
         record.update({
             "role": role,
-            "status": "stale_async_result",
+            "status": "STALE_SUPERSEDED_BY_CURRENT_VERIFICATION",
             "current_phase": "quarantined",
-            "state_class": "stale_async_result",
+            "state_class": "STALE_SUPERSEDED_BY_CURRENT_VERIFICATION",
             "quarantine_status": "quarantined",
             "quarantine_path": quarantine_path,
             "quarantined_evidence_path": evidence_path,
@@ -1516,6 +1541,177 @@ def _first_evidence_marker(state: WarroomGoalState, markers: tuple[str, ...]) ->
             if marker in item:
                 return marker
     return None
+
+
+def _ponytail_available() -> bool:
+    return bool(shutil.which(PONYTAIL_TOOL_NAME) or Path(PONYTAIL_TOOL_PATH).exists())
+
+
+def _ponytail_proof_present(state: WarroomGoalState) -> bool:
+    return _evidence_contains(state, PONYTAIL_PROOF_MARKERS)
+
+
+def _ponytail_policy_decision(state: WarroomGoalState, tool_name: str, args: Dict[str, Any], mutating: bool) -> Optional[str]:
+    command = str(args.get("command") or "")
+    if tool_name == "terminal" and PONYTAIL_WRONG_TOOL_RE.search(command):
+        decision = agt_action_gateway(
+            action="ponytail.route",
+            caller="hermes_cli.warroom_goal.enforce_tool_policy",
+            policies=("ponytail_wrong_tool_path",),
+            target=command,
+            state={"workflow": state.workflow, "current_role": state.current_role},
+            metadata={
+                "session_id": state.session_id,
+                "role": state.current_role,
+                "tool_name": tool_name,
+                "ponytail_wrong_tool_path": True,
+                "route_hint": "Use cli-anything-ponytail-mcp through the CLI-Anything wrapper.",
+                "correct_tool_path": PONYTAIL_TOOL_PATH,
+                "retry_command_template": PONYTAIL_RETRY_TEMPLATE,
+            },
+        )
+        return decision.error_message()
+    if not mutating or not _ponytail_available() or _controller_tracking_doc_allowed(state, tool_name, args):
+        return None
+    decision = agt_action_gateway(
+        action="code_mutation.ponytail_gate",
+        caller="hermes_cli.warroom_goal.enforce_tool_policy",
+        policies=("ponytail_required_for_code_write",),
+        target=str(args.get("path") or args.get("command") or ""),
+        state={"workflow": state.workflow, "current_role": state.current_role},
+        metadata={
+            "session_id": state.session_id,
+            "role": state.current_role,
+            "tool_name": tool_name,
+            "code_mutation": True,
+            "ponytail_available": True,
+            "ponytail_proof_present": _ponytail_proof_present(state),
+            "route_hint": "Record PONYTAIL_REVIEW/AUDIT/DEBT/GAIN, PONYTAIL_NOT_APPLICABLE, or PONYTAIL_GAP before code write.",
+            "correct_tool_path": PONYTAIL_TOOL_PATH,
+            "retry_command_template": PONYTAIL_RETRY_TEMPLATE,
+        },
+    )
+    if decision.blocked:
+        return decision.error_message()
+    return None
+
+
+def _git_status_paths(root: Path) -> Optional[set[str]]:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"],
+            text=True,
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    paths: set[str] = set()
+    for line in proc.stdout.splitlines():
+        if len(line) > 3:
+            paths.add(line[3:].split(" -> ")[-1])
+    return paths
+
+
+def _file_snapshot(root: Path) -> set[str]:
+    paths: set[str] = set()
+    try:
+        for path in root.rglob("*"):
+            if ".git" in path.parts or not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            paths.add(f"{path.relative_to(root)}:{stat.st_size}:{int(stat.st_mtime)}")
+    except Exception:
+        return set()
+    return paths
+
+
+def _worktree_snapshot(root: Path) -> Dict[str, Any]:
+    root = root.expanduser().resolve()
+    git_paths = _git_status_paths(root)
+    if git_paths is not None:
+        return {"kind": "git", "root": str(root), "paths": sorted(git_paths)}
+    return {"kind": "files", "root": str(root), "paths": sorted(_file_snapshot(root))}
+
+
+def _controller_side_effect_bypass(state: WarroomGoalState) -> bool:
+    return _evidence_contains(state, CONTROLLER_SIDE_EFFECT_APPROVAL_MARKERS)
+
+
+def _controller_command_wrapper_tool(tool_name: str, args: Dict[str, Any]) -> bool:
+    if tool_name in {"terminal", "delegate_task"}:
+        return True
+    return tool_name == "process" and str(args.get("action") or "") not in READ_ONLY_PROCESS_ACTIONS
+
+
+def controller_side_effect_snapshot(session_id: str, tool_name: str, args: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    state = load_warroom_goal(session_id)
+    if state is None or state.current_role != "controller" or not state.allowed_mutation_root:
+        return None
+    if not _controller_command_wrapper_tool(tool_name, args) or _controller_side_effect_bypass(state):
+        return None
+    try:
+        root = Path(state.allowed_mutation_root).expanduser().resolve()
+    except Exception:
+        return None
+    if not root.exists():
+        return None
+    snap = _worktree_snapshot(root)
+    snap.update({"session_id": session_id, "tool_name": tool_name})
+    return snap
+
+
+def _side_effect_path_allowed(state: WarroomGoalState, root: Path, rel: str) -> bool:
+    try:
+        abs_path = (root / rel.split(":", 1)[0]).resolve()
+    except Exception:
+        abs_path = root / rel.split(":", 1)[0]
+    return bool(state.tracking_dir and _path_inside(str(abs_path), state.tracking_dir)) or _parent_owned_proof_state_path(state, str(abs_path))
+
+
+def controller_side_effect_check(session_id: str, snapshot: Optional[Dict[str, Any]], result: Any) -> Any:
+    if not snapshot:
+        return result
+    state = load_warroom_goal(session_id)
+    if state is None or _controller_side_effect_bypass(state):
+        return result
+    root = Path(str(snapshot.get("root") or "")).expanduser()
+    before = set(snapshot.get("paths") or [])
+    after_snapshot = _worktree_snapshot(root)
+    offenders = sorted(p for p in set(after_snapshot.get("paths") or []) - before if not _side_effect_path_allowed(state, root, p))
+    if not offenders:
+        return result
+    decision = agt_action_gateway(
+        action="controller.command_wrapper.after_diff",
+        caller="hermes_cli.warroom_goal.controller_side_effect_check",
+        policies=("controller_side_effect_gate",),
+        target=str(root),
+        state={"workflow": state.workflow, "current_role": state.current_role},
+        metadata={
+            "session_id": state.session_id,
+            "role": state.current_role,
+            "controller_side_effect_detected": True,
+            "changed_paths": offenders,
+            "state_hash": warroom_state_hash(state),
+        },
+    )
+    msg = f"{CONTROLLER_SIDE_EFFECT_MARKER}: {', '.join(offenders[:8])}; {decision.error_message()}"
+    state.status = "gap"
+    state.gates["controller_side_effect"] = "blocked"
+    state.last_gap = msg
+    state.final_claim_allowed = False
+    state.final_claim_state_hash = None
+    state.gate_evidence.setdefault("controller_side_effect", []).append(msg)
+    save_warroom_goal(session_id, state)
+    if isinstance(result, str):
+        return result.rstrip() + "\n\n" + msg
+    return {"result": result, "error": msg}
 
 
 def _is_safe_local_doc_read(state: WarroomGoalState, tool_name: str, args: Dict[str, Any]) -> bool:
@@ -2250,6 +2446,9 @@ def enforce_tool_policy(session_id: str, tool_name: str, args: Dict[str, Any]) -
         return remote_block
 
     mutating = _tool_mutates(tool_name, args)
+    ponytail_block = _ponytail_policy_decision(state, tool_name, args, mutating)
+    if ponytail_block:
+        return ponytail_block
     if mutating and state.current_role not in {"builder", "controller", None}:
         return f"WARROOM V3 blocked: role {state.current_role or 'none'} cannot mutate code. Builder is the only mutation role."
 
