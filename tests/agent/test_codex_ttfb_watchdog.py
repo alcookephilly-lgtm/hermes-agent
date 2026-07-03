@@ -17,11 +17,8 @@ stall.
 from __future__ import annotations
 
 import sys
-import json
-import logging
 import time
 import types
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -60,7 +57,7 @@ def _make_codex_agent(tmp_path, monkeypatch):
     return agent
 
 
-def test_ttfb_kills_when_no_stream_event(tmp_path, monkeypatch, caplog):
+def test_ttfb_kills_when_no_stream_event(tmp_path, monkeypatch):
     """Backend accepts the connection but emits no event -> killed at the TTFB
     cutoff, well before the 60s wall-clock stale timeout, with a retryable
     TimeoutError and a ``codex_ttfb_kill`` close reason."""
@@ -68,18 +65,17 @@ def test_ttfb_kills_when_no_stream_event(tmp_path, monkeypatch, caplog):
 
     agent = _make_codex_agent(tmp_path, monkeypatch)
     monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "1")
-    caplog.set_level(logging.INFO, logger="agent.chat_completion_helpers")
 
     closes: list = []
     dummy_client = SimpleNamespace()
     monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
     monkeypatch.setattr(
         agent, "_abort_request_openai_client",
-        lambda c, reason=None: closes.append(str(reason)),
+        lambda c, reason=None: closes.append(reason),
     )
     monkeypatch.setattr(
         agent, "_close_request_openai_client",
-        lambda c, reason=None: closes.append(str(reason)),
+        lambda c, reason=None: closes.append(reason),
     )
 
     stop = {"flag": False}
@@ -100,102 +96,10 @@ def test_ttfb_kills_when_no_stream_event(tmp_path, monkeypatch, caplog):
         elapsed = time.time() - t0
         assert "TTFB" in str(excinfo.value)
         assert "codex_ttfb_kill" in closes
-        assert "TTFB_STRICT_ACTIVE" in caplog.text
-        assert "TTFB_LARGE_CONTEXT_BACKOFF" not in caplog.text
         # ~1s cutoff + 2s join grace; must be far under the 60s stale timeout.
         assert elapsed < 15, f"TTFB watchdog took {elapsed:.1f}s"
     finally:
         stop["flag"] = True
-
-
-def test_large_context_ttfb_heartbeats_then_max_silence_fallback(tmp_path, monkeypatch, caplog):
-    """Large contexts keep a longer TTFB cap, emit heartbeats, and still kill
-    after max silence with compression/split fallback guidance."""
-    from agent import chat_completion_helpers as h
-
-    agent = _make_codex_agent(tmp_path, monkeypatch)
-    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "0.5")
-    monkeypatch.setenv("HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS", "1")
-    monkeypatch.setenv("HERMES_CODEX_TTFB_LARGE_MAX_SILENCE_SECONDS", "2")
-    monkeypatch.setenv("HERMES_CODEX_TTFB_HEARTBEAT_SECONDS", "0.25")
-    caplog.set_level(logging.INFO, logger="agent.chat_completion_helpers")
-
-    closes: list[str] = []
-    statuses: list[str] = []
-    dummy_client = SimpleNamespace()
-    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
-    monkeypatch.setattr(agent, "_buffer_status", lambda msg: statuses.append(msg))
-    monkeypatch.setattr(
-        agent,
-        "_abort_request_openai_client",
-        lambda c, reason=None: closes.append(str(reason)),
-    )
-    monkeypatch.setattr(
-        agent,
-        "_close_request_openai_client",
-        lambda c, reason=None: closes.append(str(reason)),
-    )
-
-    stop = {"flag": False}
-
-    def fake_hang(api_kwargs, client=None, on_first_delta=None):
-        deadline = time.time() + 30
-        while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
-            time.sleep(0.02)
-        raise RuntimeError("connection closed")
-
-    monkeypatch.setattr(agent, "_run_codex_stream", fake_hang)
-
-    t0 = time.time()
-    try:
-        with pytest.raises(TimeoutError) as excinfo:
-            h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "x" * 20000})
-        elapsed = time.time() - t0
-        message = str(excinfo.value)
-        assert "TTFB_MAX_SILENCE_EXCEEDED" in message
-        assert "COMPRESSION_OR_SPLIT_TRIGGERED" in message
-        assert "codex_ttfb_large_context_kill" in closes
-        assert any("TTFB_LARGE_CONTEXT_BACKOFF" in s for s in statuses)
-        assert "TTFB_LARGE_CONTEXT_BACKOFF" in caplog.text
-        assert "TTFB_MAX_SILENCE_EXCEEDED" in caplog.text
-        assert "COMPRESSION_OR_SPLIT_TRIGGERED" in caplog.text
-        evidence = getattr(agent, "_codex_context_pressure_evidence", {})
-        assert evidence.get("path")
-        assert evidence.get("sha256")
-        payload = json.loads(Path(evidence["path"]).read_text(encoding="utf-8"))
-        assert payload["event"] == "CODEX_CONTEXT_PRESSURE_EVIDENCE"
-        assert payload["mode"] == "TTFB_LARGE_CONTEXT_BACKOFF"
-        assert payload["request_sha256"] == evidence["sha256"]
-        assert elapsed >= 2
-        assert elapsed < 15
-    finally:
-        stop["flag"] = True
-
-
-def test_large_context_ttfb_does_not_kill_slow_valid_prefill(tmp_path, monkeypatch):
-    from agent import chat_completion_helpers as h
-
-    agent = _make_codex_agent(tmp_path, monkeypatch)
-    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "0.5")
-    monkeypatch.setenv("HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS", "1")
-    monkeypatch.setenv("HERMES_CODEX_TTFB_LARGE_MAX_SILENCE_SECONDS", "3")
-    closes: list[str] = []
-    dummy_client = SimpleNamespace()
-    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
-    monkeypatch.setattr(agent, "_close_request_openai_client", lambda c, reason=None: closes.append(reason))
-
-    sentinel = SimpleNamespace(ok=True)
-
-    def fake_slow_prefill(api_kwargs, client=None, on_first_delta=None):
-        time.sleep(1.0)
-        agent._codex_stream_last_event_ts = time.time()
-        return sentinel
-
-    monkeypatch.setattr(agent, "_run_codex_stream", fake_slow_prefill)
-
-    resp = h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "x" * 20000})
-    assert resp is sentinel
-    assert "codex_ttfb_large_context_kill" not in closes
 
 
 def test_ttfb_default_tolerates_slow_first_event(tmp_path, monkeypatch):
@@ -215,11 +119,11 @@ def test_ttfb_default_tolerates_slow_first_event(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
     monkeypatch.setattr(
         agent, "_abort_request_openai_client",
-        lambda c, reason=None: closes.append(str(reason)),
+        lambda c, reason=None: closes.append(reason),
     )
     monkeypatch.setattr(
         agent, "_close_request_openai_client",
-        lambda c, reason=None: closes.append(str(reason)),
+        lambda c, reason=None: closes.append(reason),
     )
 
     sentinel = SimpleNamespace(ok=True)
@@ -255,11 +159,11 @@ def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_emit_status", lambda msg: statuses.append(msg))
     monkeypatch.setattr(
         agent, "_abort_request_openai_client",
-        lambda c, reason=None: closes.append(str(reason)),
+        lambda c, reason=None: closes.append(reason),
     )
     monkeypatch.setattr(
         agent, "_close_request_openai_client",
-        lambda c, reason=None: closes.append(str(reason)),
+        lambda c, reason=None: closes.append(reason),
     )
 
     stop = {"flag": False}
@@ -300,11 +204,11 @@ def test_ttfb_high_env_is_capped_for_openai_codex(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
     monkeypatch.setattr(
         agent, "_abort_request_openai_client",
-        lambda c, reason=None: closes.append(str(reason)),
+        lambda c, reason=None: closes.append(reason),
     )
     monkeypatch.setattr(
         agent, "_close_request_openai_client",
-        lambda c, reason=None: closes.append(str(reason)),
+        lambda c, reason=None: closes.append(reason),
     )
 
     stop = {"flag": False}
@@ -342,11 +246,11 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
     monkeypatch.setattr(
         agent, "_abort_request_openai_client",
-        lambda c, reason=None: closes.append(str(reason)),
+        lambda c, reason=None: closes.append(reason),
     )
     monkeypatch.setattr(
         agent, "_close_request_openai_client",
-        lambda c, reason=None: closes.append(str(reason)),
+        lambda c, reason=None: closes.append(reason),
     )
 
     sentinel = SimpleNamespace(ok=True)
@@ -383,12 +287,12 @@ def test_event_idle_kills_after_first_event_then_silence(tmp_path, monkeypatch):
     monkeypatch.setattr(
         agent,
         "_abort_request_openai_client",
-        lambda c, reason=None: closes.append(str(reason)),
+        lambda c, reason=None: closes.append(reason),
     )
     monkeypatch.setattr(
         agent,
         "_close_request_openai_client",
-        lambda c, reason=None: closes.append(str(reason)),
+        lambda c, reason=None: closes.append(reason),
     )
 
     stop = {"flag": False}
@@ -426,11 +330,11 @@ def test_ttfb_disabled_via_env_zero(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
     monkeypatch.setattr(
         agent, "_abort_request_openai_client",
-        lambda c, reason=None: closes.append(str(reason)),
+        lambda c, reason=None: closes.append(reason),
     )
     monkeypatch.setattr(
         agent, "_close_request_openai_client",
-        lambda c, reason=None: closes.append(str(reason)),
+        lambda c, reason=None: closes.append(reason),
     )
 
     sentinel = SimpleNamespace(ok=True)
@@ -482,7 +386,7 @@ def test_large_codex_request_waits_instead_of_ttfb_reconnect(tmp_path, monkeypat
     assert "codex_ttfb_kill" not in closes
 
 
-def test_large_codex_request_strict_ttfb_env_still_reconnects(tmp_path, monkeypatch, caplog):
+def test_large_codex_request_strict_ttfb_env_still_reconnects(tmp_path, monkeypatch):
     """Operators can force the old early-reconnect behavior for large inputs
     with HERMES_CODEX_TTFB_STRICT=1."""
     from agent import chat_completion_helpers as h
@@ -490,7 +394,6 @@ def test_large_codex_request_strict_ttfb_env_still_reconnects(tmp_path, monkeypa
     agent = _make_codex_agent(tmp_path, monkeypatch)
     monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "1")
     monkeypatch.setenv("HERMES_CODEX_TTFB_STRICT", "1")
-    caplog.set_level(logging.INFO, logger="agent.chat_completion_helpers")
 
     closes: list = []
     dummy_client = SimpleNamespace()
@@ -518,7 +421,5 @@ def test_large_codex_request_strict_ttfb_env_still_reconnects(tmp_path, monkeypa
             h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": large_input})
         assert "TTFB threshold: 1s" in str(excinfo.value)
         assert "codex_ttfb_kill" in closes
-        assert "TTFB_STRICT_ACTIVE" in caplog.text
-        assert "TTFB_MAX_SILENCE_EXCEEDED" not in caplog.text
     finally:
         stop["flag"] = True

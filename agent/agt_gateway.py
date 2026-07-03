@@ -33,11 +33,16 @@ AGT_POLICIES = frozenset(
         "codegraph_current_before_edit",
         "ponytail_required_for_code_write",
         "ponytail_wrong_tool_path",
-        "controller_side_effect_gate",
         "model_inherit_controller_default",
         "stale_async_quarantine",
+        "native_update_safe_work_ledger_required",
+        "agt_hardwire_overwrite_requires_danger_phrase",
     }
 )
+
+AGT_HARDWIRE_OVERWRITE_APPROVAL = "AL_APPROVES_OVERWRITE_AGT_HARDWIRES"
+NATIVE_UPDATE_LOCAL_WORK_STATES = frozenset({"dirty", "ahead", "diverged"})
+NATIVE_UPDATE_SAFE_LEDGER_STATUSES = frozenset({"update-safe", "preserved"})
 
 RECEIPT_ONLY_EVIDENCE = frozenset(
     {
@@ -151,6 +156,85 @@ def _metadata_strings(metadata: Mapping[str, Any], *keys: str) -> list[str]:
     return values
 
 
+def _proof_present(value: Any) -> bool:
+    if value in {False, None, "", "false", "False", "no", "NO", "0", 0, "unknown", "UNKNOWN"}:
+        return False
+    return bool(value)
+
+
+def _bool_meta(meta: Mapping[str, Any], *keys: str) -> bool:
+    return any(_proof_present(meta.get(key)) for key in keys)
+
+
+def _local_work_states(*sources: Mapping[str, Any]) -> list[str]:
+    values: list[str] = []
+    for source in sources:
+        raw = source.get("local_work_states", source.get("local_work_state", []))
+        if isinstance(raw, str):
+            values.append(raw)
+        elif isinstance(raw, Sequence) and not isinstance(raw, (bytes, bytearray, str)):
+            values.extend(str(v) for v in raw)
+        for name in NATIVE_UPDATE_LOCAL_WORK_STATES:
+            if source.get(name) is True:
+                values.append(name)
+    seen: set[str] = set()
+    states: list[str] = []
+    for value in values:
+        normalized = str(value).strip().lower()
+        if normalized in NATIVE_UPDATE_LOCAL_WORK_STATES and normalized not in seen:
+            seen.add(normalized)
+            states.append(normalized)
+    return states
+
+
+def _ledger_entries(meta: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    raw = meta.get("safe_work_ledger_entries") or meta.get("ledger_entries")
+    if raw is None:
+        ledger = meta.get("safe_work_ledger") or meta.get("ledger")
+        if isinstance(ledger, Mapping):
+            raw = ledger.get("entries") or ledger.get("local_work")
+    if isinstance(raw, Mapping):
+        return [raw]
+    if isinstance(raw, Sequence) and not isinstance(raw, (bytes, bytearray, str)):
+        return [entry for entry in raw if isinstance(entry, Mapping)]
+    return []
+
+
+def _ledger_entry_for_state(meta: Mapping[str, Any], state_name: str) -> Mapping[str, Any]:
+    for entry in _ledger_entries(meta):
+        entry_states = _local_work_states(entry)
+        if state_name in entry_states or str(entry.get("state") or "").strip().lower() == state_name:
+            return entry
+    return {}
+
+
+def _first_value(*maps: Mapping[str, Any], keys: Sequence[str]) -> Any:
+    for mapping in maps:
+        for key in keys:
+            value = mapping.get(key)
+            if value not in {None, ""}:
+                return value
+    return None
+
+
+def _safe_work_ledger_complete(meta: Mapping[str, Any], state_name: str) -> tuple[bool, str]:
+    entry = _ledger_entry_for_state(meta, state_name)
+    status = str(_first_value(entry, meta, keys=("safe_work_ledger_status", "ledger_status", "status")) or "")
+    if status not in NATIVE_UPDATE_SAFE_LEDGER_STATUSES:
+        return False, "safe work ledger status must be update-safe or preserved"
+    if not _proof_present(_first_value(entry, meta, keys=("restore_proof", "restore_proof_present", "has_restore_proof", "preservation_proof", "restore_path"))):
+        return False, "safe work ledger requires restore proof"
+    if not _proof_present(_first_value(entry, meta, keys=("test_proof", "test_proof_present", "has_test_proof", "tests", "test_result"))):
+        return False, "safe work ledger requires test proof"
+    if not _proof_present(_first_value(entry, meta, keys=("decision_approval", "decision_approved", "approval_present", "has_required_approval", "approval", "decision"))):
+        return False, "safe work ledger requires decision/approval proof"
+    if state_name == "diverged" and not _proof_present(
+        _first_value(entry, meta, keys=("divergence_plan", "rebase_plan", "cherry_pick_plan", "drop_plan", "has_divergence_plan", "plan"))
+    ):
+        return False, "diverged native update requires rebase/cherry-pick/drop plan"
+    return True, "safe work ledger proof complete"
+
+
 def agt_action_gateway(
     *,
     action: str,
@@ -189,6 +273,27 @@ def agt_action_gateway(
             decision = "quarantine"
             matched_policy = "no_terminal_junk_as_user_intent"
             reason = "terminal control/cursor junk is not user intent"
+
+    if decision == "allow" and "agt_hardwire_overwrite_requires_danger_phrase" in policy_list:
+        if meta.get("protected_hardwire_overwrite") is True or meta.get("hardwire_overwrite") is True:
+            phrase = str(meta.get("approval_phrase") or meta.get("hardwire_overwrite_approval") or "").strip()
+            if phrase != AGT_HARDWIRE_OVERWRITE_APPROVAL:
+                decision = "deny"
+                matched_policy = "agt_hardwire_overwrite_requires_danger_phrase"
+                reason = "protected AGT hardwire overwrite requires exact AL_APPROVES_OVERWRITE_AGT_HARDWIRES phrase"
+
+    if decision == "allow" and "native_update_safe_work_ledger_required" in policy_list:
+        local_states = _local_work_states(state_map, meta)
+        for state_name in local_states:
+            ok, proof_reason = _safe_work_ledger_complete(meta, state_name)
+            if not ok:
+                decision = "deny"
+                matched_policy = "native_update_safe_work_ledger_required"
+                reason = f"unknown or unproven native-update {state_name} state blocks before risky update operations: {proof_reason}"
+                break
+        if decision == "allow" and local_states:
+            matched_policy = "native_update_safe_work_ledger_required"
+            reason = "safe work ledger proof allows known preserved native-update local work"
 
     if decision == "allow" and "remote_target_requires_ssh" in policy_list:
         remote_target = str(meta.get("remote_target") or state_map.get("remote_target") or "")
@@ -249,11 +354,6 @@ def agt_action_gateway(
                 matched_policy = "ponytail_required_for_code_write"
                 reason = "PONYTAIL_GAP: code write requires Ponytail review/audit/debt/gain proof marker or explicit not-applicable/gap"
 
-    if decision == "allow" and "controller_side_effect_gate" in policy_list:
-        if meta.get("controller_side_effect_detected") is True:
-            decision = "quarantine"
-            matched_policy = "controller_side_effect_gate"
-            reason = "CONTROLLER_SIDE_EFFECT_DETECTED: Controller command-wrapper changed files outside tracking/proof/state"
 
     if decision == "allow" and "codegraph_current_before_edit" in policy_list:
         if meta.get("code_mutation") is True and meta.get("codegraph_stale") is True:

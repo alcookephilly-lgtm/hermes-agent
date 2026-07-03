@@ -41,7 +41,7 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         "--backup",
         action="store_true",
         default=False,
-        help="Force a pre-update backup for this run (off by default; overrides updates.pre_update_backup)",
+        help="Force a pre-update backup for this run (off by default; overrides updates.pre_update_backup=false)",
     )
     update_parser.add_argument(
         "--yes",
@@ -49,6 +49,24 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         action="store_true",
         default=False,
         help="Assume yes for interactive prompts (config migration, stash restore). API-key entry is skipped; run 'hermes config migrate' separately for those.",
+    )
+    update_parser.add_argument(
+        "--safe-work-ledger",
+        default=None,
+        metavar="PATH",
+        help="JSON ledger proving local dirty/ahead/diverged work is preserved before native update mutations.",
+    )
+    update_parser.add_argument(
+        "--approve-hardwire-overwrite",
+        default=None,
+        metavar="PHRASE",
+        help="Danger phrase required to permit AGT hardwire overwrite; --yes never implies this approval.",
+    )
+    update_parser.add_argument(
+        "--hardwire-overwrite-reason",
+        default=None,
+        metavar="TEXT",
+        help="Optional audit reason when --approve-hardwire-overwrite is used.",
     )
     update_parser.add_argument(
         "--branch",
@@ -66,17 +84,5 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         action="store_true",
         default=False,
         help="Windows: proceed with the update even when another hermes.exe is detected. The concurrent process will likely cause WinError 32 warnings and may leave a reboot-deferred .exe replacement.",
-    )
-    update_parser.add_argument(
-        "--approve-hardwire-overwrite",
-        default=None,
-        metavar="PHRASE",
-        help="Explicit AGT hardwire overwrite approval phrase. Must equal AL_APPROVES_OVERWRITE_AGT_HARDWIRES.",
-    )
-    update_parser.add_argument(
-        "--hardwire-overwrite-reason",
-        default=None,
-        metavar="TEXT",
-        help="Reason logged when approving AGT hardwire overwrite during update.",
     )
     update_parser.set_defaults(func=cmd_update)

@@ -40,61 +40,18 @@ import logging
 import threading
 import time
 import uuid
-import weakref
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures.thread import _threads_queues, _worker
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.agt_gateway import agt_action_gateway
+from tools.daemon_pool import DaemonThreadPoolExecutor
+from tools.thread_context import propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
 
-
-class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
-    """ThreadPoolExecutor variant whose workers do not block process exit.
-
-    Stdlib ``ThreadPoolExecutor`` workers are non-daemon. Background
-    delegation is explicitly best-effort detached work, so a long child should
-    be interruptible by ``/stop``/shutdown but must not keep a CLI process alive
-    after the user exits.
-    """
-
-    def _adjust_thread_count(self) -> None:
-        if self._idle_semaphore.acquire(timeout=0):
-            return
-
-        def weakref_cb(_, q=self._work_queue):
-            q.put(None)
-
-        num_threads = len(self._threads)
-        if num_threads < self._max_workers:
-            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
-            create_worker_context = getattr(self, "_create_worker_context", None)
-            if create_worker_context is not None:
-                worker_args = (
-                    weakref.ref(self, weakref_cb),
-                    create_worker_context(),
-                    self._work_queue,
-                )
-            else:
-                worker_args = (
-                    weakref.ref(self, weakref_cb),
-                    self._work_queue,
-                    getattr(self, "_initializer", None),
-                    getattr(self, "_initargs", ()),
-                )
-            t = threading.Thread(
-                name=thread_name,
-                target=_worker,
-                args=worker_args,
-                daemon=True,
-            )
-            t.start()
-            self._threads.add(t)
-            try:
-                _threads_queues.__setitem__(t, self._work_queue)  # type: ignore[attr-defined]
-            except Exception:
-                pass
+# Back-compat alias — the daemon executor now lives in tools.daemon_pool so
+# other subsystems (tool_executor, memory_manager, delegate_tool, skills_hub)
+# can share it. Existing imports of ``_DaemonThreadPoolExecutor`` keep working.
+_DaemonThreadPoolExecutor = DaemonThreadPoolExecutor
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +68,10 @@ _records_lock = threading.Lock()
 # delegation_id -> record dict. Kept for the lifetime of the run plus a short
 # tail after completion so `list_async_delegations()` can show recent results.
 _records: Dict[str, Dict[str, Any]] = {}
+# reservation_token -> reservation metadata. Reservations occupy capacity while
+# delegate_task builds child agents before handing the accepted unit to the
+# async executor.
+_reservations: Dict[str, Dict[str, Any]] = {}
 
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # How many completed records to retain for status queries before pruning.
@@ -137,9 +98,52 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
 
 
 def active_count() -> int:
-    """Number of async delegations currently running."""
+    """Number of async delegations currently running or reserved."""
     with _records_lock:
-        return sum(1 for r in _records.values() if r.get("status") == "running")
+        return sum(1 for r in _records.values() if r.get("status") == "running") + len(_reservations)
+
+
+def reserve_async_delegation_slot(
+    *,
+    max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Reserve async capacity before expensive child construction."""
+    token = f"resv_{uuid.uuid4().hex[:8]}"
+    with _records_lock:
+        active_or_reserved = sum(
+            1 for r in _records.values() if r.get("status") == "running"
+        ) + len(_reservations)
+        if active_or_reserved >= max_async_children:
+            return {
+                "status": "rejected",
+                "error": (
+                    f"Async delegation capacity reached ({max_async_children} "
+                    f"running/reserved). Wait for one to finish (its result will re-enter "
+                    f"the chat), or run this task synchronously "
+                    f"(background=false). Raise delegation.max_concurrent_children in "
+                    f"config.yaml to allow more concurrent background subagents."
+                ),
+            }
+        _reservations[token] = {
+            "reservation_token": token,
+            "reserved_at": time.time(),
+            "metadata": dict(metadata) if isinstance(metadata, dict) else metadata,
+        }
+    return {"status": "reserved", "reservation_token": token}
+
+
+def release_async_delegation_slot(reservation_token: Optional[str]) -> bool:
+    """Release a capacity reservation that never became a dispatch record."""
+    if not reservation_token:
+        return False
+    with _records_lock:
+        return _reservations.pop(str(reservation_token), None) is not None
+
+
+def release_async_delegation_reservation(reservation_token: Optional[str]) -> bool:
+    """Backward-compatible alias for releasing an async delegation reservation."""
+    return release_async_delegation_slot(reservation_token)
 
 
 def _new_delegation_id() -> str:
@@ -164,6 +168,60 @@ def _prune_completed_locked() -> None:
         _records.pop(rid, None)
 
 
+def _record_warroom_role_output_if_applicable(
+    record: Dict[str, Any], result: Dict[str, Any], status: str
+) -> None:
+    """Best-effort Warroom role evidence recording for async completions."""
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict):
+        return
+    session_id = str(metadata.get("warroom_session_id") or "").strip()
+    role = str(metadata.get("warroom_role") or "").strip()
+    if not session_id or not role:
+        return
+
+    role_result: Dict[str, Any] = result if isinstance(result, dict) else {}
+    child_results = role_result.get("results")
+    if isinstance(child_results, list) and child_results and isinstance(child_results[0], dict):
+        role_result = child_results[0]
+
+    evidence_path = (
+        metadata.get("evidence_path")
+        or role_result.get("evidence_path")
+        or role_result.get("artifact_path")
+        or role_result.get("artifact")
+    )
+    if not evidence_path:
+        logger.debug(
+            "Async delegation %s has Warroom metadata but no evidence_path; skipping role output record",
+            record.get("delegation_id"),
+        )
+        return
+
+    role_status = "done" if status in {"completed", "success"} else str(status or "done")
+    try:
+        from hermes_cli.warroom_goal import record_role_output
+
+        record_role_output(
+            session_id,
+            role,
+            evidence_path=str(evidence_path),
+            status=role_status,
+            verdict=role_result.get("verdict") or metadata.get("verdict"),
+            expected_state_hash=metadata.get("dispatch_state_hash") or metadata.get("state_hash"),
+            expected_state_version=metadata.get("state_version"),
+            expected_role_run_id=metadata.get("role_run_id"),
+            child_session_id=role_result.get("child_session_id") or role_result.get("session_id"),
+            delegation_id=str(record.get("delegation_id") or ""),
+            current_phase="completed" if role_status == "done" else role_status,
+        )
+    except Exception as exc:  # pragma: no cover - guardrail must not lose result event
+        logger.debug(
+            "Async delegation %s Warroom role output record failed: %s",
+            record.get("delegation_id"), exc,
+        )
+
+
 def dispatch_async_delegation(
     *,
     goal: str,
@@ -175,6 +233,8 @@ def dispatch_async_delegation(
     runner: Callable[[], Dict[str, Any]],
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    reservation_token: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -215,6 +275,7 @@ def dispatch_async_delegation(
         "role": role,
         "model": model,
         "session_key": session_key,
+        "metadata": dict(metadata) if isinstance(metadata, dict) else metadata,
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -224,20 +285,28 @@ def dispatch_async_delegation(
     # active_count() separately would let two concurrent dispatches (e.g.
     # from different gateway sessions) both pass the check and exceed the cap.
     with _records_lock:
-        running = sum(
-            1 for r in _records.values() if r.get("status") == "running"
-        )
-        if running >= max_async_children:
-            return {
-                "status": "rejected",
-                "error": (
-                    f"Async delegation capacity reached ({max_async_children} "
-                    f"running). Wait for one to finish (its result will re-enter "
-                    f"the chat), or run this task synchronously "
-                    f"(background=false). Raise delegation.max_async_children in "
-                    f"config.yaml to allow more concurrent background subagents."
-                ),
-            }
+        if reservation_token:
+            reservation = _reservations.pop(str(reservation_token), None)
+            if reservation is None:
+                return {
+                    "status": "rejected",
+                    "error": "Async delegation reservation was missing or already consumed.",
+                }
+        else:
+            running = sum(
+                1 for r in _records.values() if r.get("status") == "running"
+            ) + len(_reservations)
+            if running >= max_async_children:
+                return {
+                    "status": "rejected",
+                    "error": (
+                        f"Async delegation capacity reached ({max_async_children} "
+                        f"running/reserved). Wait for one to finish (its result will re-enter "
+                        f"the chat), or run this task synchronously "
+                        f"(background=false). Raise delegation.max_concurrent_children in "
+                        f"config.yaml to allow more concurrent background subagents."
+                    ),
+                }
         _records[delegation_id] = record
 
     executor = _get_executor(max_async_children)
@@ -262,10 +331,13 @@ def dispatch_async_delegation(
             _finalize(delegation_id, result, status)
 
     try:
-        executor.submit(_worker)
+        # Propagate the dispatching profile so the detached child resolves
+        # get_hermes_home() under the right profile.
+        executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
             _records.pop(delegation_id, None)
+        release_async_delegation_slot(reservation_token)
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
@@ -316,22 +388,7 @@ def _push_completion_event(
     error = result.get("error")
     dispatched_at = record.get("dispatched_at") or time.time()
     completed_at = record.get("completed_at") or time.time()
-    decision = agt_action_gateway(
-        action="async_result.accept",
-        caller="tools.async_delegation._push_completion_event",
-        policies=("stale_async_quarantine", "no_child_self_report_as_proof"),
-        target=str(record.get("delegation_id") or ""),
-        state={"status": status, "role": record.get("role")},
-        metadata={
-            "dispatch_state_hash": record.get("state_hash"),
-            "current_state_hash": record.get("current_state_hash"),
-            "child_self_report": True,
-            "satisfies_proof": bool(result.get("satisfies_proof")),
-        },
-    )
-    if decision.blocked:
-        logger.warning("Async delegation %s blocked by AGT: %s", record.get("delegation_id"), decision.error_message())
-        return
+    _record_warroom_role_output_if_applicable(record, result, status)
 
     evt = {
         "type": "async_delegation",
@@ -354,6 +411,7 @@ def _push_completion_event(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
+        "metadata": record.get("metadata"),
     }
     try:
         process_registry.completion_queue.put(evt)
@@ -362,6 +420,191 @@ def _push_completion_event(
             "Async delegation %s: failed to enqueue completion event; "
             "result lost: %s",
             record.get("delegation_id"), exc,
+        )
+
+
+def dispatch_async_delegation_batch(
+    *,
+    goals: List[str],
+    context: Optional[str],
+    toolsets: Optional[List[str]],
+    role: str,
+    model: Optional[str],
+    session_key: str,
+    runner: Callable[[], Dict[str, Any]],
+    interrupt_fn: Optional[Callable[[], None]] = None,
+    max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    reservation_token: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Dispatch a WHOLE fan-out batch as ONE background unit.
+
+    Unlike ``dispatch_async_delegation`` (which backs a single subagent),
+    ``runner`` here runs the entire batch — it builds and joins on every child
+    in parallel and returns the combined ``{"results": [...],
+    "total_duration_seconds": N}`` dict that the synchronous path would have
+    returned. We occupy ONE async slot for the whole batch (the in-batch
+    parallelism is bounded separately by ``max_concurrent_children``), so a
+    single ``delegate_task`` fan-out never exhausts the async pool by itself.
+
+    When the batch finishes, a SINGLE completion event is pushed onto the
+    shared ``process_registry.completion_queue`` carrying the full per-task
+    ``results`` list, so the consolidated summaries re-enter the conversation
+    as one message once every child is done — the chat is never blocked while
+    they run.
+
+    Returns ``{"status": "dispatched", "delegation_id": ...}`` on success or
+    ``{"status": "rejected", "error": ...}`` when the async pool is at
+    capacity.
+    """
+    delegation_id = _new_delegation_id()
+    dispatched_at = time.time()
+    n = len(goals)
+    # A combined goal label for status listings / the completion header.
+    combined_goal = (
+        goals[0] if n == 1 else f"{n} parallel subagents: " + "; ".join(g[:40] for g in goals)
+    )
+    record: Dict[str, Any] = {
+        "delegation_id": delegation_id,
+        "goal": combined_goal,
+        "goals": list(goals),
+        "context": context,
+        "toolsets": list(toolsets) if toolsets else None,
+        "role": role,
+        "model": model,
+        "session_key": session_key,
+        "metadata": dict(metadata) if isinstance(metadata, dict) else metadata,
+        "status": "running",
+        "dispatched_at": dispatched_at,
+        "completed_at": None,
+        "interrupt_fn": interrupt_fn,
+        "is_batch": True,
+    }
+    with _records_lock:
+        if reservation_token:
+            reservation = _reservations.pop(str(reservation_token), None)
+            if reservation is None:
+                return {
+                    "status": "rejected",
+                    "error": "Async delegation reservation was missing or already consumed.",
+                }
+        else:
+            running = sum(
+                1 for r in _records.values() if r.get("status") == "running"
+            ) + len(_reservations)
+            if running >= max_async_children:
+                return {
+                    "status": "rejected",
+                    "error": (
+                        f"Async delegation capacity reached ({max_async_children} "
+                        f"running/reserved). Wait for one to finish (its result will re-enter "
+                        f"the chat), or raise delegation.max_concurrent_children in "
+                        f"config.yaml to allow more concurrent background units."
+                    ),
+                }
+        _records[delegation_id] = record
+
+    executor = _get_executor(max_async_children)
+
+    def _worker() -> None:
+        combined: Dict[str, Any] = {}
+        status = "error"
+        try:
+            combined = runner() or {}
+            # Batch status: completed unless every child errored/was interrupted.
+            child_results = combined.get("results") or []
+            if child_results and all(
+                (r.get("status") not in ("completed", "success"))
+                for r in child_results
+            ):
+                status = "error"
+            else:
+                status = "completed"
+        except Exception as exc:  # noqa: BLE001 — must never crash the worker
+            logger.exception("Async delegation batch %s crashed", delegation_id)
+            combined = {
+                "results": [],
+                "error": f"{type(exc).__name__}: {exc}",
+                "total_duration_seconds": round(time.time() - dispatched_at, 2),
+            }
+            status = "error"
+        finally:
+            _finalize_batch(delegation_id, combined, status)
+
+    try:
+        # Propagate the dispatching profile to the detached batch children.
+        executor.submit(propagate_context_to_thread(_worker))
+    except Exception as exc:  # pragma: no cover
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        release_async_delegation_slot(reservation_token)
+        return {
+            "status": "rejected",
+            "error": f"Failed to schedule async delegation batch: {exc}",
+        }
+
+    logger.info(
+        "Dispatched async delegation batch %s (%d task(s), session_key=%s)",
+        delegation_id, n, session_key or "<cli>",
+    )
+    return {"status": "dispatched", "delegation_id": delegation_id}
+
+
+def _finalize_batch(
+    delegation_id: str, combined: Dict[str, Any], status: str
+) -> None:
+    """Mark a batch record complete and push ONE combined completion event."""
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is None:
+            return
+        record["status"] = status
+        record["completed_at"] = time.time()
+        record["interrupt_fn"] = None
+        event_record = dict(record)
+        _prune_completed_locked()
+
+    try:
+        from tools.process_registry import process_registry
+    except Exception as exc:  # pragma: no cover
+        logger.error(
+            "Async delegation batch %s finished but process_registry import "
+            "failed; result lost: %s",
+            delegation_id, exc,
+        )
+        return
+
+    dispatched_at = event_record.get("dispatched_at") or time.time()
+    completed_at = event_record.get("completed_at") or time.time()
+    _record_warroom_role_output_if_applicable(event_record, combined, status)
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": delegation_id,
+        "session_key": event_record.get("session_key", ""),
+        "goal": event_record.get("goal", ""),
+        "goals": event_record.get("goals"),
+        "context": event_record.get("context"),
+        "toolsets": event_record.get("toolsets"),
+        "role": event_record.get("role"),
+        "model": event_record.get("model"),
+        "status": status,
+        "is_batch": True,
+        # The full per-task results list — the formatter renders a
+        # consolidated multi-task block from this.
+        "results": combined.get("results") or [],
+        "error": combined.get("error"),
+        "total_duration_seconds": combined.get("total_duration_seconds"),
+        "dispatched_at": dispatched_at,
+        "completed_at": completed_at,
+        "metadata": event_record.get("metadata"),
+    }
+    try:
+        process_registry.completion_queue.put(evt)
+    except Exception as exc:  # pragma: no cover
+        logger.error(
+            "Async delegation batch %s: failed to enqueue completion event; "
+            "result lost: %s",
+            delegation_id, exc,
         )
 
 
@@ -415,3 +658,4 @@ def _reset_for_tests() -> None:
         _executor_max_workers = 0
     with _records_lock:
         _records.clear()
+        _reservations.clear()

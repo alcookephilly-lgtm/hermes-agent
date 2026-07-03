@@ -36,7 +36,7 @@ REAL_DELEGATED_RUNTIME_GAP = (
     "local_process pid receipts are spawn_receipt_only"
 )
 GRAPH_REPORT_PATH_RE = re.compile(
-    r"(?P<path>(?:[A-Za-z]:[\\/]|/)[^`\"'\r\n]*?graphify-out[\\/]GRAPH_REPORT\.md)"
+    r"(?P<path>(?:[A-Za-z]:[/\\]|/)[^`\"'\r\n]*?GRAPH_REPORT\.md)"
 )
 GRAPH_REPORT_HEADER_RE = re.compile(r"^# Graph Report - (?P<root>.+?)\s+\((?P<stamp>\d{4}-\d{2}-\d{2})\)\s*$")
 
@@ -169,6 +169,15 @@ def _native_background_delegate_adapter(parent_agent: Any):
             role="leaf",
             background=True,
             parent_agent=parent_agent,
+            metadata={
+                "warroom_session_id": state.session_id,
+                "warroom_role": role,
+                "role_run_id": state.role_run_ids.get(role),
+                "state_hash": warroom_state_hash(state),
+                "dispatch_state_hash": warroom_state_hash(state),
+                "evidence_path": evidence_path,
+                "phase": "role_dispatch",
+            },
         )
         try:
             payload = json.loads(raw)
@@ -211,14 +220,13 @@ ALL_ROLES = [
     "guardian",
 ]
 
-REQUIRED_SECTION_INTENTS = ("Acceptance", "Constraints", "Verify with")
+REQUIRED_SECTION_INTENTS = ("Goal", "Acceptance", "Constraints", "Verify with")
 HEADING_PREFIX_RE = re.compile(r"^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)")
 MUTATING_TOOLS = {"write_file", "patch", "skill_manage"}
 READ_ONLY_RECOVERY_TOOLS = {"read_file", "search_files", "session_search", "skill_view", "skills_list"}
 READ_ONLY_PROCESS_ACTIONS = {"list", "poll", "log", "wait"}
 ROBOT_HAND_CURRENT_MARKERS = (
     "ROBOT_HAND_DISCOVERY_PASS",
-    "GRAPHIFY_DISCOVERY_PASS",
     "JCODEMUNCH_INDEX_CURRENT",
     "CODEGRAPH_INDEX_CURRENT",
     "CODEGRAPH_SYNCED",
@@ -250,12 +258,6 @@ PONYTAIL_PROOF_MARKERS = (
     "PONYTAIL_GAP",
 )
 PONYTAIL_WRONG_TOOL_RE = re.compile(r"(?:^|[\s;&|])(?:ponytail|ponytail-mcp)(?:\s|$)")
-CONTROLLER_SIDE_EFFECT_MARKER = "CONTROLLER_SIDE_EFFECT_DETECTED"
-CONTROLLER_SIDE_EFFECT_APPROVAL_MARKERS = (
-    "CONTROLLER_SOURCE_MUTATION_APPROVED",
-    "BUILDER_REPLAY_VERIFIED",
-    "BUILDER_REPLAY_APPROVED",
-)
 FINAL_CLAIM_RE = re.compile(r"\b(done|fixed|complete|completed|shipped|hardwired)\b", re.I)
 NEGATED_CLAIM_RE = re.compile(r"\b(not|no|isn[’\']t|is not|still|remain(?:s|ing)?|open|failed|blocked|gap)\b", re.I)
 E2E_CLAIM_RE = re.compile(r"\be2e\b|end[- ]to[- ]end", re.I)
@@ -338,6 +340,13 @@ class WarroomGoalState:
     roles_started: Dict[str, bool] = field(default_factory=dict)
     role_records: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     role_spawn_attempts: List[Dict[str, Any]] = field(default_factory=list)
+    role_queue: List[str] = field(default_factory=list)
+    role_dependencies: Dict[str, List[str]] = field(default_factory=dict)
+    role_run_ids: Dict[str, str] = field(default_factory=dict)
+    active_role_run_ids: Dict[str, str] = field(default_factory=dict)
+    role_scheduler_events: List[Dict[str, Any]] = field(default_factory=list)
+    max_active_non_controller_roles: int = 3
+    guardian_delay_reason: Optional[str] = None
     role_spawn_adapter: Optional[str] = None
     role_spawn_evidence_path: Optional[str] = None
     role_spawn_gap: Optional[str] = None
@@ -379,7 +388,14 @@ class WarroomGoalState:
             last_seen = record.get("last_seen_at") or "unknown"
             phase = record.get("current_phase") or status
             stale = "stale" if record.get("stale") else "not-stale"
-            active_bits.append(f"{role}:{status}:{child_session}:last_seen={last_seen}:phase={phase}:{stale}")
+            evidence = record.get("evidence_path") or "none"
+            heartbeat = record.get("last_heartbeat_path") or "none"
+            parent_progress = record.get("last_parent_progress_path") or "none"
+            active_bits.append(
+                f"{role}:{status}:{child_session}:last_seen={last_seen}:"
+                f"phase={phase}:{stale}:evidence={evidence}:heartbeat={heartbeat}:"
+                f"parent_progress={parent_progress}"
+            )
         progress = "; ".join(active_bits) if active_bits else "no role records"
         return (
             f"WARROOM V3 {self.workflow}: {self.status} (role={self.current_role or 'none'}) "
@@ -473,19 +489,15 @@ def _normalize_heading(line: str) -> str:
 
 def _classify_heading_intent(line: str) -> Optional[str]:
     stripped = (line or "").strip()
-    if not stripped or (":" not in stripped and not HEADING_PREFIX_RE.match(line or "")):
-        return None
-    normalized = _normalize_heading(line)
-    if not normalized:
-        return None
-    if normalized.startswith("verify with"):
-        return "Verify with"
-    if normalized.startswith("test with") or normalized in {"verification", "commands to run", "proof commands"}:
-        return "Verify with"
-    if normalized in {"acceptance", "acceptance criteria", "accepted when", "done when"}:
+    exact = stripped.casefold()
+    if exact == "goal:":
+        return "Goal"
+    if exact == "acceptance:":
         return "Acceptance"
-    if normalized in {"constraints", "constraint", "boundaries", "limitations", "requirements"}:
+    if exact == "constraints:":
         return "Constraints"
+    if exact == "verify with:":
+        return "Verify with"
     return None
 
 
@@ -810,6 +822,203 @@ def _write_role_heartbeat(state: WarroomGoalState, record: Dict[str, Any]) -> Op
         return None
 
 
+def _role_evidence_truth(evidence_path: str) -> Dict[str, Any]:
+    path_text = str(evidence_path or "").strip()
+    if not path_text:
+        return {"ok": False, "reason": "missing_evidence_path", "path": path_text}
+    path = Path(path_text)
+    if not path.exists():
+        return {"ok": False, "reason": "missing_evidence_file", "path": path_text}
+    try:
+        size = path.stat().st_size
+    except Exception as exc:
+        return {"ok": False, "reason": f"evidence_stat_failed:{exc}", "path": path_text}
+    if size <= 0:
+        return {"ok": False, "reason": "empty_evidence_file", "path": path_text, "bytes": size}
+    return {
+        "ok": True,
+        "reason": "evidence_file_present",
+        "path": path_text,
+        "bytes": size,
+        "sha256": _sha256_file(str(path)),
+    }
+
+
+def _capacity_exception(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "capacity" in text and ("reached" in text or "full" in text or "running" in text)
+
+
+def _active_non_controller_role_count(state: WarroomGoalState) -> int:
+    active_statuses = {"active_child_work", "dispatching"}
+    return sum(
+        1
+        for role, record in (state.role_records or {}).items()
+        if role != "controller" and str(record.get("status") or "") in active_statuses
+    )
+
+
+def _role_has_real_done_evidence(record: Dict[str, Any]) -> bool:
+    if not record or str(record.get("status") or "") not in {"done", "completed"}:
+        return False
+    if record.get("spawn_receipt_only"):
+        return False
+    if not (record.get("child_session_id") or record.get("delegation_id")):
+        return False
+    truth = record.get("evidence_truth")
+    if not isinstance(truth, dict):
+        truth = _role_evidence_truth(str(record.get("evidence_path") or ""))
+    return bool(truth.get("ok"))
+
+
+def _required_role_outputs_ready(state: WarroomGoalState, roles: List[str]) -> Dict[str, Any]:
+    refresh_role_runtime_status(state)
+    gaps: List[str] = []
+    stalled: List[str] = []
+    for role in roles:
+        record = state.role_records.get(role)
+        if not record:
+            gaps.append(f"{role}:missing")
+            continue
+        status = str(record.get("status") or "")
+        if status in {"stalled", "stale_dead_pid", "STALE_SUPERSEDED_BY_CURRENT_VERIFICATION"} or record.get("stale"):
+            stalled.append(f"{role}:{status or record.get('stale_reason') or 'stale'}")
+            continue
+        if status not in {"done", "completed"}:
+            gaps.append(f"{role}:not_completed:{status or 'unknown'}")
+            continue
+        has_real_runtime = bool(record.get("child_session_id") or record.get("delegation_id"))
+        if record.get("spawn_receipt_only") and not has_real_runtime:
+            gaps.append(f"{role}:spawn_receipt_only")
+            continue
+        if not has_real_runtime:
+            gaps.append(f"{role}:missing_real_runtime_id")
+            continue
+        active_role_run_id = str(state.active_role_run_ids.get(role) or "")
+        record_role_run_id = str(record.get("role_run_id") or state.role_run_ids.get(role) or "")
+        if active_role_run_id:
+            if not record_role_run_id or active_role_run_id != record_role_run_id:
+                gaps.append(f"{role}:role_run_id_mismatch")
+                continue
+            gaps.append(f"{role}:active_role_run_id_not_cleared")
+            continue
+        truth = record.get("evidence_truth")
+        if not isinstance(truth, dict):
+            truth = _role_evidence_truth(str(record.get("evidence_path") or ""))
+            record["evidence_truth"] = truth
+        if not truth.get("ok"):
+            gaps.append(f"{role}:{truth.get('reason') or 'invalid_evidence'}")
+    return {"ready": not gaps and not stalled, "gaps": gaps, "stalled": stalled}
+
+
+def _guardian_prerequisites_met(state: WarroomGoalState) -> bool:
+    proof = str(state.proof_packet_path or "")
+    if not proof or not Path(proof).exists():
+        return False
+    return bool(_required_role_outputs_ready(state, ["builder", "adversary", "reviewer"])["ready"])
+
+
+def _queue_role(
+    state: WarroomGoalState,
+    role: str,
+    *,
+    reason: str,
+    evidence_path: str,
+    role_card_path: str,
+) -> Dict[str, Any]:
+    wait_kind = "capacity" if "capacity" in reason.lower() else "dependencies"
+    record = _role_record(
+        role=role,
+        status="queued",
+        role_card_path=role_card_path,
+        adapter="scheduler_queue",
+        runtime_id="queued",
+        evidence_path=evidence_path,
+        runtime_kind="scheduler_queue",
+        current_phase=f"queued_waiting_for_{wait_kind}",
+        spawn_receipt_only=False,
+    )
+    record["queue_reason"] = reason
+    record["queued_at"] = record.get("started_at")
+    record = _annotate_role_record(record, state=state, role=role, role_card_path=role_card_path)
+    state.role_records[role] = record
+    state.roles_started[role] = False
+    if role not in state.role_queue:
+        state.role_queue.append(role)
+    state.role_scheduler_events.append({"role": role, "event": "queued", "reason": reason, "at": _utc_stamp()})
+    if role == "guardian":
+        state.guardian_delay_reason = reason
+    try:
+        _write_json(Path(evidence_path), {"record": record, "event": "role_queued", "reason": reason})
+    except Exception:
+        pass
+    return record
+
+
+def _current_role_evidence_gaps(state: WarroomGoalState) -> List[str]:
+    gaps: List[str] = []
+    for role, record in (state.role_records or {}).items():
+        if role == "controller":
+            continue
+        if record.get("status") == "evidence_gap":
+            truth = record.get("evidence_truth")
+            if not isinstance(truth, dict):
+                truth = _role_evidence_truth(str(record.get("evidence_path") or ""))
+            if not truth.get("ok"):
+                gaps.append(f"{role}:{truth.get('reason') or 'invalid_evidence'}")
+            continue
+        truth = record.get("evidence_truth")
+        if isinstance(truth, dict) and not truth.get("ok"):
+            gaps.append(f"{role}:{truth.get('reason') or 'invalid_evidence'}")
+    return gaps
+
+
+def _clear_role_evidence_gap_if_resolved(state: WarroomGoalState) -> None:
+    remaining = _current_role_evidence_gaps(state)
+    if remaining:
+        state.gates["role_evidence"] = "gap"
+        return
+    if state.gates.get("role_evidence") == "gap":
+        state.gates["role_evidence"] = "pass"
+    if str(state.last_gap or "").startswith("Role evidence missing or invalid for "):
+        state.last_gap = None
+
+
+def _write_parent_progress(
+    state: WarroomGoalState,
+    *,
+    role: str,
+    event: str,
+    record: Dict[str, Any],
+    extra: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    if not state.tracking_dir:
+        return None
+    try:
+        stamp = _utc_stamp().replace(":", "").replace("-", "")
+        path = Path(state.tracking_dir) / "parent-progress" / f"{role}-{stamp}.json"
+        payload = {
+            "event": event,
+            "role": role,
+            "status": record.get("status"),
+            "current_phase": record.get("current_phase"),
+            "runtime_kind": record.get("runtime_kind"),
+            "spawn_receipt_only": record.get("spawn_receipt_only"),
+            "child_session_id": record.get("child_session_id"),
+            "delegation_id": record.get("delegation_id"),
+            "runtime_id": record.get("runtime_id"),
+            "evidence_path": record.get("evidence_path"),
+            "last_seen_at": record.get("last_seen_at"),
+            "state_hash": warroom_state_hash(state),
+        }
+        if extra:
+            payload.update(extra)
+        _write_json(path, payload)
+        return str(path)
+    except Exception:
+        return None
+
+
 def _write_async_quarantine(
     state: WarroomGoalState,
     *,
@@ -990,6 +1199,9 @@ def _start_roles_for_state(
 
     missing_cards: List[str] = []
     failed_roles: List[str] = []
+    queued_roles: List[str] = []
+    active_count_at_tick_start = _active_non_controller_role_count(state)
+    dispatched_this_tick = 0
     for role in roles_to_start:
         role_card_path = state.role_cards.get(role) or _role_cards_for(state.tracking_dir or _default_tracking_dir()).get(role, "")
         if not role_card_path or not Path(role_card_path).exists():
@@ -1016,6 +1228,32 @@ def _start_roles_for_state(
             continue
 
         evidence_path = str(evidence_dir / f"{role}.json")
+        existing_record = state.role_records.get(role) or {}
+        if role != "controller" and str(existing_record.get("status") or "") in {"active_child_work", "done", "completed"}:
+            continue
+        if role == "guardian" and not _guardian_prerequisites_met(state):
+            record = _queue_role(
+                state,
+                role,
+                reason="queued_waiting_for_dependencies: guardian requires builder/adversary/reviewer done evidence and proof_packet_path",
+                evidence_path=evidence_path,
+                role_card_path=role_card_path,
+            )
+            queued_roles.append(role)
+            continue
+        if role != "controller" and active_count_at_tick_start + dispatched_this_tick >= state.max_active_non_controller_roles:
+            record = _queue_role(
+                state,
+                role,
+                reason="queued_waiting_for_capacity: max_active_non_controller_roles reached",
+                evidence_path=evidence_path,
+                role_card_path=role_card_path,
+            )
+            queued_roles.append(role)
+            continue
+        if role == "guardian":
+            state.role_queue = [queued for queued in state.role_queue if queued != role]
+            state.guardian_delay_reason = None
         if role == "controller":
             record = _role_record(
                 role=role,
@@ -1029,6 +1267,9 @@ def _start_roles_for_state(
             _write_json(Path(evidence_path), {"record": record, "event": "controller_state_created"})
         else:
             try:
+                role_run_id = f"{role}:{int(time.time() * 1000000)}:{len(state.role_spawn_attempts) + dispatched_this_tick + 1}"
+                state.role_run_ids[role] = role_run_id
+                state.active_role_run_ids[role] = role_run_id
                 child_session_id: Optional[str] = None
                 delegation_id: Optional[str] = None
                 runtime_kind: Optional[str] = None
@@ -1126,6 +1367,9 @@ def _start_roles_for_state(
                     current_phase=current_phase,
                     spawn_receipt_only=spawn_receipt_only,
                 )
+                record["role_run_id"] = role_run_id
+                record["dispatch_state_hash"] = warroom_state_hash(state)
+                record["dispatch_timestamp"] = record.get("started_at")
                 if isinstance(result, dict) and result.get("model"):
                     record["model"] = str(result.get("model"))
                 if isinstance(result, dict) and result.get("provider"):
@@ -1144,7 +1388,19 @@ def _start_roles_for_state(
                 record = _annotate_role_record(record, state=state, role=role, role_card_path=role_card_path)
                 if not Path(evidence_path).exists():
                     _write_json(Path(evidence_path), {"record": record, "event": "role_spawned"})
+                dispatched_this_tick += 1
             except Exception as exc:
+                if _capacity_exception(exc):
+                    record = _queue_role(
+                        state,
+                        role,
+                        reason=f"queued_waiting_for_capacity: {exc}",
+                        evidence_path=evidence_path,
+                        role_card_path=role_card_path,
+                    )
+                    queued_roles.append(role)
+                    state.role_records[role] = record
+                    continue
                 failed_roles.append(f"{role}: {exc}")
                 record = _role_record(
                     role=role,
@@ -1157,6 +1413,13 @@ def _start_roles_for_state(
                 )
                 record = _annotate_role_record(record, state=state, role=role, role_card_path=role_card_path)
                 _write_json(Path(evidence_path), {"record": record, "event": "role_spawn_failed"})
+        state.role_records[role] = record
+        heartbeat_path = _write_role_heartbeat(state, record)
+        if heartbeat_path:
+            record["last_heartbeat_path"] = heartbeat_path
+        progress_path = _write_parent_progress(state, role=role, event="role_spawn_recorded", record=record)
+        if progress_path:
+            record["last_parent_progress_path"] = progress_path
         state.role_records[role] = record
         state.roles_started[role] = record.get("status") in {"running", "spawned", "spawn_receipt_only", "active_child_work", "done"}
         state.role_spawn_attempts.append({
@@ -1184,18 +1447,20 @@ def _start_roles_for_state(
     else:
         state.gates["role_cards"] = "pass"
         adapters = {str(r.get("adapter") or "") for r in state.role_records.values()}
+        runtime_adapters = adapters - {"scheduler_queue"}
         real_non_controller_children = any(
             role != "controller" and (record.get("child_session_id") or record.get("delegation_id"))
             for role, record in state.role_records.items()
             if role in relevant_roles
         )
+        has_queued_roles = (bool(state.role_queue) or bool(queued_roles)) and adapter is not None
         delegate_runtime_gate = "pass"
-        if not real_non_controller_children and adapters and adapters <= {"controller_state", "local_process"}:
+        if not real_non_controller_children and not has_queued_roles and runtime_adapters and runtime_adapters <= {"controller_state", "local_process"}:
             delegate_runtime_gate = "stub_only"
-        elif not real_non_controller_children:
+        elif not real_non_controller_children and not has_queued_roles:
             delegate_runtime_gate = "gap"
 
-        if require_real_non_controller_runtime and not real_non_controller_children:
+        if require_real_non_controller_runtime and not real_non_controller_children and not has_queued_roles:
             state.status = "gap"
             state.gates["role_spawn"] = "gap"
             state.gates["delegate_runtime"] = delegate_runtime_gate
@@ -1205,10 +1470,10 @@ def _start_roles_for_state(
             state.last_gap = REAL_DELEGATED_RUNTIME_GAP
             state.required_action = "blocked_gap"
         else:
-            state.gates["role_spawn"] = "pass"
-            state.gates["delegate_runtime"] = delegate_runtime_gate
-            state.delegate_runtime_available = delegate_runtime_gate == "pass"
-            state.required_action = None
+            state.gates["role_spawn"] = "partial_pass_queued" if has_queued_roles else "pass"
+            state.gates["delegate_runtime"] = "pass" if has_queued_roles else delegate_runtime_gate
+            state.delegate_runtime_available = state.gates["delegate_runtime"] == "pass"
+            state.required_action = "continue_scheduler" if has_queued_roles else None
             state.role_spawn_gap = None
             state.last_gap = None
             if state.status == "gap":
@@ -1295,6 +1560,14 @@ def record_child_progress(
     heartbeat_path = _write_role_heartbeat(state, matched_record)
     if heartbeat_path:
         matched_record["last_heartbeat_path"] = heartbeat_path
+    progress_path = _write_parent_progress(
+        state,
+        role=_role_from_record(state, matched_record),
+        event="child_progress",
+        record=matched_record,
+    )
+    if progress_path:
+        matched_record["last_parent_progress_path"] = progress_path
     save_warroom_goal(session_id, state)
     return state
 
@@ -1312,6 +1585,20 @@ def start_plan_build_roles_if_ready(
         return state
     if state.gates.get("plan") != "pass" or state.gates.get("tracking") != "pass":
         state.gates["build_role_spawn"] = "blocked"
+        save_warroom_goal(session_id, state)
+        return state
+    readiness = _required_role_outputs_ready(state, ["plan_builder", "plan_adversary", "plan_reviewer"])
+    if not readiness["ready"]:
+        state.gates["build_role_spawn"] = "blocked"
+        state.gates["plan_role_outputs"] = "stalled" if readiness["stalled"] else "waiting"
+        state.gate_evidence.setdefault("plan_role_outputs", []).append(json.dumps(readiness, sort_keys=True))
+        if readiness["stalled"]:
+            state.status = "gap"
+            state.required_action = "stalled_diagnostic"
+            state.last_gap = "STALLED_DIAGNOSTIC blocks Builder: " + ", ".join(readiness["stalled"])
+        else:
+            state.required_action = "wait_for_plan_roles"
+            state.last_gap = "Plan role outputs not ready: " + ", ".join(readiness["gaps"])
         save_warroom_goal(session_id, state)
         return state
     for role in BUILD_ROLES:
@@ -1335,6 +1622,7 @@ def record_role_output(
     verdict: Optional[str] = None,
     expected_state_hash: Optional[str] = None,
     expected_state_version: Optional[int] = None,
+    expected_role_run_id: Optional[str] = None,
     child_session_id: Optional[str] = None,
     delegation_id: Optional[str] = None,
     current_phase: Optional[str] = None,
@@ -1343,16 +1631,25 @@ def record_role_output(
     if state is None:
         return None
     record: Dict[str, Any] = dict(state.role_records.get(role) or {})
-    if child_session_id:
-        record["child_session_id"] = child_session_id
-    if delegation_id:
-        record["delegation_id"] = delegation_id
     current_hash = warroom_state_hash(state)
     stale_async = False
     if expected_state_version is not None and expected_state_version != state.version:
         stale_async = True
     if expected_state_hash is not None and expected_state_hash != current_hash:
         stale_async = True
+    role_run_id_mismatch = False
+    if expected_role_run_id is not None:
+        expected_role_run_id = str(expected_role_run_id)
+        active_role_run_id = str(state.active_role_run_ids.get(role) or "")
+        record_role_run_id = str(record.get("role_run_id") or state.role_run_ids.get(role) or "")
+        if active_role_run_id and expected_role_run_id != active_role_run_id:
+            role_run_id_mismatch = True
+        if record_role_run_id and expected_role_run_id != record_role_run_id:
+            role_run_id_mismatch = True
+        if not active_role_run_id and not record_role_run_id:
+            role_run_id_mismatch = True
+        if role_run_id_mismatch:
+            stale_async = True
     if role != "controller" and (state.status in {"done", "halted"} or stale_async):
         decision = agt_action_gateway(
             action="async_result.accept",
@@ -1387,23 +1684,37 @@ def record_role_output(
             "quarantine_path": quarantine_path,
             "quarantined_evidence_path": evidence_path,
             "stale": True,
-            "stale_reason": "state hash/version advanced before async result arrived" if stale_async else f"state already advanced to {state.status}",
+            "stale_reason": "role_run_id mismatch before async result arrived" if role_run_id_mismatch else ("state hash/version advanced before async result arrived" if stale_async else f"state already advanced to {state.status}"),
             "last_seen_at": _utc_stamp(),
             "last_seen_epoch": time.time(),
         })
         state.role_records[role] = record
+        progress_path = _write_parent_progress(
+            state,
+            role=role,
+            event="role_output_quarantined",
+            record=record,
+            extra={"quarantine_path": quarantine_path},
+        )
+        if progress_path:
+            record["last_parent_progress_path"] = progress_path
+            state.role_records[role] = record
         state.gate_evidence.setdefault("async_stale_quarantine", []).append(
             f"{role}: stale after state={state.status}; {decision.error_message()}"
         )
         save_warroom_goal(session_id, state)
         return state
     requested_status = str(status or "").strip() or "done"
+    if child_session_id:
+        record["child_session_id"] = str(child_session_id)
+    if delegation_id:
+        record["delegation_id"] = str(delegation_id)
     receipt_only = bool(record.get("spawn_receipt_only")) or str(record.get("runtime_kind") or "") in {
         "spawn_receipt",
         "local_process",
     }
     has_real_runtime = bool(record.get("child_session_id") or record.get("delegation_id"))
-    if role != "controller" and receipt_only and not has_real_runtime and requested_status in {"active_child_work", "completed"}:
+    if role != "controller" and receipt_only and not has_real_runtime and requested_status in {"active_child_work", "completed", "done"}:
         decision = agt_action_gateway(
             action="warroom.role_execution_proof",
             caller="hermes_cli.warroom_goal.record_role_output",
@@ -1428,6 +1739,47 @@ def record_role_output(
         })
         state.role_records[role] = record
         state.gate_evidence.setdefault("receipt_only_verdict", []).append(decision.error_message())
+        progress_path = _write_parent_progress(state, role=role, event="receipt_only_output_blocked", record=record)
+        if progress_path:
+            record["last_parent_progress_path"] = progress_path
+            state.role_records[role] = record
+        save_warroom_goal(session_id, state)
+        return state
+
+    evidence_truth = _role_evidence_truth(evidence_path)
+    if role != "controller" and requested_status in {"done", "completed"} and not evidence_truth["ok"]:
+        record.update({
+            "role": role,
+            "status": "evidence_gap",
+            "current_phase": "evidence_gap",
+            "last_seen_at": _utc_stamp(),
+            "last_seen_epoch": time.time(),
+            "evidence_path": evidence_path,
+            "evidence_truth": evidence_truth,
+            "stale": False,
+            "stale_reason": None,
+        })
+        if role == "guardian":
+            state.guardian_pass = False
+            state.final_claim_allowed = False
+            state.final_claim_state_hash = None
+            state.gates["guardian"] = "blocked"
+        state.role_records[role] = record
+        state.gates["role_evidence"] = "gap"
+        state.gate_evidence.setdefault("role_evidence", []).append(
+            f"{role}:{evidence_truth['reason']}:{evidence_path}"
+        )
+        state.last_gap = f"Role evidence missing or invalid for {role}: {evidence_truth['reason']}"
+        progress_path = _write_parent_progress(
+            state,
+            role=role,
+            event="role_output_evidence_gap",
+            record=record,
+            extra={"evidence_truth": evidence_truth},
+        )
+        if progress_path:
+            record["last_parent_progress_path"] = progress_path
+            state.role_records[role] = record
         save_warroom_goal(session_id, state)
         return state
 
@@ -1438,6 +1790,7 @@ def record_role_output(
         "last_seen_at": _utc_stamp(),
         "last_seen_epoch": time.time(),
         "evidence_path": evidence_path,
+        "evidence_truth": evidence_truth,
         "state_hash": current_hash,
         "stale": False,
         "stale_reason": None,
@@ -1445,14 +1798,27 @@ def record_role_output(
     if record.get("child_session_id") or record.get("delegation_id"):
         record["runtime_kind"] = "real_child_session"
         record["spawn_receipt_only"] = False
+    active_role_run_id = state.active_role_run_ids.get(role)
+    completed_role_run_id = expected_role_run_id or record.get("role_run_id") or state.role_run_ids.get(role)
+    if active_role_run_id and completed_role_run_id and str(active_role_run_id) == str(completed_role_run_id):
+        state.active_role_run_ids.pop(role, None)
     state.role_records[role] = record
+    _clear_role_evidence_gap_if_resolved(state)
+    progress_path = _write_parent_progress(state, role=role, event="role_output_recorded", record=record)
+    if progress_path:
+        record["last_parent_progress_path"] = progress_path
+        state.role_records[role] = record
     if role == "guardian":
         state.guardian_verdict_path = evidence_path
         evidence_file = Path(evidence_path)
         evidence_text = evidence_file.read_text(encoding="utf-8", errors="replace") if evidence_file.exists() else ""
         verdict_pass = str(verdict or "").upper() == "PASS" and "PASS" in evidence_text.upper() and "GUARDIAN" in evidence_text.upper()
         state.guardian_pass = verdict_pass
-        state.final_claim_allowed = state.guardian_pass and bool(state.proof_packet_path and Path(state.proof_packet_path).exists())
+        state.final_claim_allowed = (
+            state.guardian_pass
+            and bool(state.proof_packet_path and Path(state.proof_packet_path).exists())
+            and bool(_required_role_outputs_ready(state, [role for role in state.required_roles if role != "controller"])["ready"])
+        )
         state.gates["guardian"] = "pass" if state.guardian_pass else "blocked"
         state.final_claim_state_hash = _final_claim_state_hash(state) if state.final_claim_allowed else None
         if not state.guardian_pass:
@@ -1595,123 +1961,6 @@ def _ponytail_policy_decision(state: WarroomGoalState, tool_name: str, args: Dic
         return decision.error_message()
     return None
 
-
-def _git_status_paths(root: Path) -> Optional[set[str]]:
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"],
-            text=True,
-            capture_output=True,
-            timeout=2,
-            check=False,
-        )
-    except Exception:
-        return None
-    if proc.returncode != 0:
-        return None
-    paths: set[str] = set()
-    for line in proc.stdout.splitlines():
-        if len(line) > 3:
-            paths.add(line[3:].split(" -> ")[-1])
-    return paths
-
-
-def _file_snapshot(root: Path) -> set[str]:
-    paths: set[str] = set()
-    try:
-        for path in root.rglob("*"):
-            if ".git" in path.parts or not path.is_file():
-                continue
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            paths.add(f"{path.relative_to(root)}:{stat.st_size}:{int(stat.st_mtime)}")
-    except Exception:
-        return set()
-    return paths
-
-
-def _worktree_snapshot(root: Path) -> Dict[str, Any]:
-    root = root.expanduser().resolve()
-    git_paths = _git_status_paths(root)
-    if git_paths is not None:
-        return {"kind": "git", "root": str(root), "paths": sorted(git_paths)}
-    return {"kind": "files", "root": str(root), "paths": sorted(_file_snapshot(root))}
-
-
-def _controller_side_effect_bypass(state: WarroomGoalState) -> bool:
-    return _evidence_contains(state, CONTROLLER_SIDE_EFFECT_APPROVAL_MARKERS)
-
-
-def _controller_command_wrapper_tool(tool_name: str, args: Dict[str, Any]) -> bool:
-    if tool_name in {"terminal", "delegate_task"}:
-        return True
-    return tool_name == "process" and str(args.get("action") or "") not in READ_ONLY_PROCESS_ACTIONS
-
-
-def controller_side_effect_snapshot(session_id: str, tool_name: str, args: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    state = load_warroom_goal(session_id)
-    if state is None or state.current_role != "controller" or not state.allowed_mutation_root:
-        return None
-    if not _controller_command_wrapper_tool(tool_name, args) or _controller_side_effect_bypass(state):
-        return None
-    try:
-        root = Path(state.allowed_mutation_root).expanduser().resolve()
-    except Exception:
-        return None
-    if not root.exists():
-        return None
-    snap = _worktree_snapshot(root)
-    snap.update({"session_id": session_id, "tool_name": tool_name})
-    return snap
-
-
-def _side_effect_path_allowed(state: WarroomGoalState, root: Path, rel: str) -> bool:
-    try:
-        abs_path = (root / rel.split(":", 1)[0]).resolve()
-    except Exception:
-        abs_path = root / rel.split(":", 1)[0]
-    return bool(state.tracking_dir and _path_inside(str(abs_path), state.tracking_dir)) or _parent_owned_proof_state_path(state, str(abs_path))
-
-
-def controller_side_effect_check(session_id: str, snapshot: Optional[Dict[str, Any]], result: Any) -> Any:
-    if not snapshot:
-        return result
-    state = load_warroom_goal(session_id)
-    if state is None or _controller_side_effect_bypass(state):
-        return result
-    root = Path(str(snapshot.get("root") or "")).expanduser()
-    before = set(snapshot.get("paths") or [])
-    after_snapshot = _worktree_snapshot(root)
-    offenders = sorted(p for p in set(after_snapshot.get("paths") or []) - before if not _side_effect_path_allowed(state, root, p))
-    if not offenders:
-        return result
-    decision = agt_action_gateway(
-        action="controller.command_wrapper.after_diff",
-        caller="hermes_cli.warroom_goal.controller_side_effect_check",
-        policies=("controller_side_effect_gate",),
-        target=str(root),
-        state={"workflow": state.workflow, "current_role": state.current_role},
-        metadata={
-            "session_id": state.session_id,
-            "role": state.current_role,
-            "controller_side_effect_detected": True,
-            "changed_paths": offenders,
-            "state_hash": warroom_state_hash(state),
-        },
-    )
-    msg = f"{CONTROLLER_SIDE_EFFECT_MARKER}: {', '.join(offenders[:8])}; {decision.error_message()}"
-    state.status = "gap"
-    state.gates["controller_side_effect"] = "blocked"
-    state.last_gap = msg
-    state.final_claim_allowed = False
-    state.final_claim_state_hash = None
-    state.gate_evidence.setdefault("controller_side_effect", []).append(msg)
-    save_warroom_goal(session_id, state)
-    if isinstance(result, str):
-        return result.rstrip() + "\n\n" + msg
-    return {"result": result, "error": msg}
 
 
 def _is_safe_local_doc_read(state: WarroomGoalState, tool_name: str, args: Dict[str, Any]) -> bool:
@@ -1913,6 +2162,9 @@ def _graphify_alternatives(repo_root: Path, *, preferred_report: Optional[Path] 
     for tool_name in ("mcp2cli", "graphify", "cli-anything-jcodemunch-mcp", "cli-anything-smart-read-mcp"):
         if shutil.which(tool_name):
             alternatives.append(f"GRAPH_ALTERNATE_DISCOVERY:{tool_name}")
+            if tool_name == "mcp2cli":
+                alternatives.append("SMART_READ_ROUTE_HINT:mcp2cli '@smart-read' sc-read --file-path <GRAPH_REPORT.md> --mode full")
+                alternatives.append("GRAPHIFY_DISCOVERY_PASS:smart-read route available for graph report recovery")
             break
     return alternatives
 
@@ -1962,11 +2214,16 @@ def _graphify_refresh_block_reason(goal_text: str, *, report_path: Path, refresh
         "no-index" in normalized
         or "no index" in normalized
         or "no indexing" in normalized
-        or "no-mutation" in normalized
-        or "no mutation" in normalized
-        or "do not mutate" in normalized
     ):
-        return "GRAPH_REFRESH_EXCEPTION:explicit_no_index_no_mutation_boundary"
+        return "GRAPH_REFRESH_EXCEPTION:explicit_no_index_boundary"
+    if (
+        "do not refresh graph" in normalized
+        or "do not update graph" in normalized
+        or "do not mutate graph" in normalized
+        or "no graph refresh" in normalized
+        or "no graph mutation" in normalized
+    ):
+        return "GRAPH_REFRESH_EXCEPTION:explicit_graph_refresh_boundary"
     if not _is_generated_graphify_output(report_path, refresh_root):
         return "GRAPH_REFRESH_EXCEPTION:destructive_delete_uninit_risk_non_generated_output"
     sensitive_parts = {"secret", "secrets", "credential", "credentials", "vault", ".ssh", ".aws"}
@@ -2006,6 +2263,7 @@ def _evaluate_graphify_gate(goal_text: str, *, allowed_root: str, now: Optional[
     allowed_path = Path(allowed_root or Path.cwd()).expanduser().resolve()
     repo_root = _repo_root_for(allowed_path) or allowed_path
     preferred_report = _extract_graph_report_path(goal_text)
+    preferred_report_explicit = preferred_report is not None
     local_report = _graphify_generated_report_path(repo_root)
     candidates: List[Path] = []
     for candidate in (preferred_report, local_report):
@@ -2018,17 +2276,31 @@ def _evaluate_graphify_gate(goal_text: str, *, allowed_root: str, now: Optional[
     selected_report: Optional[Path] = None
     selected_corpus: Optional[str] = None
     saw_wrong_corpus = False
+    preferred_report_unusable = False
     for candidate in candidates:
         if not candidate.exists():
+            if preferred_report_explicit and candidate == preferred_report:
+                preferred_report_unusable = True
+                evidence.append(f"GRAPH_REPORT_MISSING:{candidate}")
             continue
         corpus_root, _stamp = _parse_graph_report_header(candidate)
         covers_repo = _graphify_covers_target(corpus_root, repo_root=repo_root, allowed_path=allowed_path)
-        if covers_repo:
+        explicit_generated_graphify_report = False
+        if preferred_report_explicit and candidate == preferred_report and corpus_root:
+            explicit_generated_graphify_report = _is_generated_graphify_output(
+                candidate,
+                _graphify_refresh_root(corpus_root, fallback_root=repo_root),
+            )
+        if covers_repo or explicit_generated_graphify_report:
             selected_report = candidate
             selected_corpus = corpus_root
             if preferred_report is not None and candidate != preferred_report:
                 evidence.append(f"GRAPH_ALTERNATE_PATH:{candidate}")
+            if explicit_generated_graphify_report and not covers_repo:
+                evidence.append(f"GRAPH_SHARED_REPORT_SELECTED:{candidate} corpus={corpus_root} repo={repo_root}")
             break
+        if preferred_report_explicit and candidate == preferred_report:
+            preferred_report_unusable = True
         if corpus_root:
             saw_wrong_corpus = True
             evidence.append(f"GRAPH_NOT_APPLICABLE:{candidate} corpus={corpus_root} repo={repo_root}")
@@ -2036,6 +2308,15 @@ def _evaluate_graphify_gate(goal_text: str, *, allowed_root: str, now: Optional[
             evidence.append(f"GRAPH_REPORT_HEADER_UNPARSEABLE:{candidate}")
 
     if selected_report is None:
+        if preferred_report_unusable:
+            gap = "GRAPH_REFRESH_EXCEPTION:preferred_report_not_generated_or_header_unparseable"
+            return {
+                "gate": "gap",
+                "status": "gap",
+                "evidence": evidence + [gap],
+                "last_gap": gap,
+                "required_action": "blocked_gap",
+            }
         alternatives = _graphify_alternatives(repo_root, preferred_report=preferred_report)
         if saw_wrong_corpus:
             if alternatives:
@@ -2116,7 +2397,15 @@ def _evaluate_graphify_gate(goal_text: str, *, allowed_root: str, now: Optional[
             "last_gap": gap,
             "required_action": "blocked_gap",
         }
-    if not _graphify_covers_target(refreshed_corpus, repo_root=repo_root, allowed_path=allowed_path):
+    refreshed_generated_explicit_report = bool(
+        preferred_report_explicit
+        and selected_report == preferred_report
+        and _is_generated_graphify_output(
+            selected_report,
+            _graphify_refresh_root(refreshed_corpus, fallback_root=repo_root),
+        )
+    )
+    if not _graphify_covers_target(refreshed_corpus, repo_root=repo_root, allowed_path=allowed_path) and not refreshed_generated_explicit_report:
         gap = "GRAPH_REFRESH_EXCEPTION:refresh_output_wrong_corpus"
         return {
             "gate": "gap",
@@ -2377,14 +2666,24 @@ def _plan_build_roles_missing(state: WarroomGoalState) -> bool:
     return any(role not in state.role_records for role in BUILD_ROLES)
 
 
-def _auto_start_build_roles_if_ready(session_id: str, state: WarroomGoalState) -> WarroomGoalState:
+def _auto_start_build_roles_if_ready(
+    session_id: str,
+    state: WarroomGoalState,
+    *,
+    parent_agent: Optional[Any] = None,
+) -> WarroomGoalState:
     if (
         state.workflow in WARROOM_PLAN_WORKFLOWS
         and state.gates.get("plan") == "pass"
         and state.gates.get("tracking") == "pass"
         and _plan_build_roles_missing(state)
     ):
-        started = start_plan_build_roles_if_ready(session_id)
+        role_adapter = _native_background_delegate_adapter(parent_agent) if parent_agent is not None else None
+        started = start_plan_build_roles_if_ready(
+            session_id,
+            adapter=role_adapter,
+            use_local_process=parent_agent is None,
+        )
         if started is not None:
             return started
     return state
@@ -2397,7 +2696,13 @@ def _record_noncritical_halt_text(session_id: str, response: str) -> Optional[Wa
     return None
 
 
-def enforce_tool_policy(session_id: str, tool_name: str, args: Dict[str, Any]) -> Optional[str]:
+def enforce_tool_policy(
+    session_id: str,
+    tool_name: str,
+    args: Dict[str, Any],
+    *,
+    parent_agent: Optional[Any] = None,
+) -> Optional[str]:
     state = load_warroom_goal(session_id)
     if state is None or state.status == "done":
         return None
@@ -2420,7 +2725,7 @@ def enforce_tool_policy(session_id: str, tool_name: str, args: Dict[str, Any]) -
         if _tool_mutates(tool_name, args):
             return f"WARROOM V3 blocked: {parser_block_reason}"
         return None
-    state = _auto_start_build_roles_if_ready(session_id, state)
+    state = _auto_start_build_roles_if_ready(session_id, state, parent_agent=parent_agent)
     if state.status in {"halted", "gap"}:
         if _read_only_recovery_tool_allowed(tool_name, args):
             return None
@@ -2563,6 +2868,11 @@ def goal_completion_output(state: WarroomGoalState, response: str) -> str:
     )
 
 
+def _final_role_evidence_gaps(state: WarroomGoalState) -> List[str]:
+    readiness = _required_role_outputs_ready(state, [role for role in state.required_roles if role != "controller"])
+    return list(readiness.get("gaps") or []) + list(readiness.get("stalled") or [])
+
+
 def guard_final_response(session_id: str, response: str, *, closure: bool = False) -> str:
     state = load_warroom_goal(session_id)
     if state is None or not response:
@@ -2582,6 +2892,20 @@ def guard_final_response(session_id: str, response: str, *, closure: bool = Fals
     if has_final_claim:
         proof = state.proof_packet_path
         proof_exists = bool(proof and Path(proof).exists())
+        role_spawn_evidence_exists = bool(state.role_spawn_evidence_path and Path(state.role_spawn_evidence_path).exists())
+        guardian_record = state.role_records.get("guardian", {}) if state.role_records else {}
+        guardian_evidence_truth = guardian_record.get("evidence_truth")
+        if not isinstance(guardian_evidence_truth, dict):
+            guardian_evidence_truth = _role_evidence_truth(str(guardian_record.get("evidence_path") or ""))
+        role_evidence_gaps = _final_role_evidence_gaps(state)
+        if not proof_exists or not role_spawn_evidence_exists or not guardian_evidence_truth.get("ok") or role_evidence_gaps:
+            return (
+                "WARROOM V3 FINAL BLOCKED: GOAL COMPLETED output requires proof packet, role spawn evidence, "
+                "Guardian evidence, and completed required role evidence.\n"
+                f"GAP: proof_packet_exists={proof_exists}; role_spawn_evidence_exists={role_spawn_evidence_exists}; "
+                f"guardian_evidence={guardian_evidence_truth.get('reason')}; "
+                f"role_evidence_gaps={role_evidence_gaps}"
+            )
         current_state_hash = _final_claim_state_hash(state)
         state_hash_matches = bool(state.final_claim_state_hash and state.final_claim_state_hash == current_state_hash)
         final_decision = agt_action_gateway(
@@ -2593,6 +2917,9 @@ def guard_final_response(session_id: str, response: str, *, closure: bool = Fals
             metadata={
                 "final_completion_claim": True,
                 "proof_packet_exists": proof_exists,
+                "role_spawn_evidence_exists": role_spawn_evidence_exists,
+                "guardian_evidence_exists": bool(guardian_evidence_truth.get("ok")),
+                "role_evidence_gaps": role_evidence_gaps,
                 "guardian_pass": bool(state.final_claim_allowed),
                 "current_state_hash": current_state_hash,
                 "final_claim_state_hash": state.final_claim_state_hash,

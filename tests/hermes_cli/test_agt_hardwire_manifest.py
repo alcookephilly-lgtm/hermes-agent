@@ -247,3 +247,44 @@ def test_native_update_blocks_before_checkout_pull_or_reset_can_erase_hardwires(
     audits = list((tmp_path / "audit").glob("*.json"))
     assert audits
     assert read_audit(audits[-1])["status"] == hw.BLOCKED_HARDWIRE_OVERWRITE
+
+
+def test_update_yes_does_not_set_hardwire_overwrite_approval_phrase():
+    import argparse
+
+    from hermes_cli.subcommands.update import build_update_parser
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    build_update_parser(subparsers, cmd_update=lambda _args: None)
+
+    parsed = parser.parse_args(["update", "--yes"])
+
+    assert parsed.yes is True
+    assert parsed.approve_hardwire_overwrite is None
+
+    parsed_with_phrase = parser.parse_args(
+        ["update", "--yes", "--approve-hardwire-overwrite", hw.APPROVAL_PHRASE]
+    )
+    assert parsed_with_phrase.yes is True
+    assert parsed_with_phrase.approve_hardwire_overwrite == hw.APPROVAL_PHRASE
+
+
+
+def test_update_parser_keeps_safe_work_ledger_and_hardwire_overwrite_separate():
+    import argparse
+    from hermes_cli.subcommands.update import build_update_parser
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd")
+    build_update_parser(sub, cmd_update=lambda args: None)
+    args = parser.parse_args([
+        "update",
+        "--yes",
+        "--safe-work-ledger",
+        "ledger.json",
+        "--approve-hardwire-overwrite",
+        "AL_APPROVES_OVERWRITE_AGT_HARDWIRES",
+    ])
+    assert args.yes is True
+    assert args.safe_work_ledger == "ledger.json"
+    assert args.approve_hardwire_overwrite == "AL_APPROVES_OVERWRITE_AGT_HARDWIRES"

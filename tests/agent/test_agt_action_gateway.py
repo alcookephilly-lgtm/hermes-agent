@@ -341,3 +341,160 @@ def test_codegraph_stale_gateway_blocks_edit_until_synced(monkeypatch, tmp_path)
         metadata={"code_mutation": True, "codegraph_stale": True, "codegraph_synced": True},
     )
     assert synced.allowed
+
+
+def test_agt_denies_unknown_dirty_ahead_diverged_native_update_states(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    for state in ("dirty", "ahead", "diverged"):
+        decision = agt_action_gateway(
+            action="native_update.local_work_gate",
+            caller="test",
+            policies=("native_update_safe_work_ledger_required",),
+            metadata={"local_work_states": [state]},
+        )
+        assert decision.decision == "deny"
+        assert decision.policy == "native_update_safe_work_ledger_required"
+        assert state in decision.reason
+
+
+def test_agt_allows_known_preserved_dirty_ahead_diverged_with_complete_metadata(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    decision = agt_action_gateway(
+        action="native_update.local_work_gate",
+        caller="test",
+        policies=("native_update_safe_work_ledger_required",),
+        metadata={
+            "local_work_states": ["dirty", "ahead", "diverged"],
+            "safe_work_ledger_entries": [
+                {"state": "dirty", "status": "preserved", "restore_proof": "patch", "test_proof": "pytest", "decision": "keep"},
+                {"state": "ahead", "status": "update-safe", "restore_proof": "tag", "test_proof": "pytest", "decision": "keep"},
+                {
+                    "state": "diverged",
+                    "status": "preserved",
+                    "restore_proof": "restore pack",
+                    "test_proof": "pytest",
+                    "approval": "approved",
+                    "divergence_plan": "rebase/cherry-pick/drop plan",
+                },
+            ],
+        },
+    )
+
+    assert decision.allowed
+    assert decision.policy == "native_update_safe_work_ledger_required"
+
+
+def test_agt_denies_hardwire_overwrite_with_assume_yes_but_no_danger_phrase_on_native_update_gate(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    decision = agt_action_gateway(
+        action="native_update.agt_hardwire_overwrite_gate",
+        caller="test",
+        policies=("agt_hardwire_overwrite_requires_danger_phrase",),
+        metadata={"protected_hardwire_overwrite": True, "assume_yes": True},
+    )
+
+    assert decision.decision == "deny"
+    assert "AL_APPROVES_OVERWRITE_AGT_HARDWIRES" in decision.reason
+
+
+def test_agt_allows_hardwire_overwrite_only_with_exact_danger_phrase_on_native_update_gate(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    wrong = agt_action_gateway(
+        action="native_update.agt_hardwire_overwrite_gate",
+        caller="test",
+        policies=("agt_hardwire_overwrite_requires_danger_phrase",),
+        metadata={"protected_hardwire_overwrite": True, "approval_phrase": "approve"},
+    )
+    allowed = agt_action_gateway(
+        action="native_update.agt_hardwire_overwrite_gate",
+        caller="test",
+        policies=("agt_hardwire_overwrite_requires_danger_phrase",),
+        metadata={
+            "protected_hardwire_overwrite": True,
+            "approval_phrase": "AL_APPROVES_OVERWRITE_AGT_HARDWIRES",
+        },
+    )
+
+    assert wrong.decision == "deny"
+    assert allowed.allowed
+
+
+def test_normal_update_yes_does_not_equal_hardwire_overwrite_approval(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    decision = agt_action_gateway(
+        action="native_update.agt_hardwire_overwrite_gate",
+        caller="test",
+        policies=("agt_hardwire_overwrite_requires_danger_phrase",),
+        metadata={"protected_hardwire_overwrite": True, "normal_update_yes": True, "assume_yes": True},
+    )
+
+    assert decision.decision == "deny"
+
+
+
+def test_agt_denies_unknown_native_update_local_work(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    decision = agt_action_gateway(
+        action="native_update.local_work_gate",
+        caller="test",
+        policies=("native_update_safe_work_ledger_required",),
+        metadata={"local_work_states": ["dirty"], "safe_work_ledger_status": "unknown"},
+    )
+    assert decision.decision == "deny"
+    assert decision.policy == "native_update_safe_work_ledger_required"
+    assert "dirty" in decision.reason
+
+
+def test_agt_allows_known_preserved_native_update_local_work(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    decision = agt_action_gateway(
+        action="native_update.local_work_gate",
+        caller="test",
+        policies=("native_update_safe_work_ledger_required",),
+        metadata={
+            "local_work_states": ["dirty", "ahead", "diverged"],
+            "safe_work_ledger_status": "preserved",
+            "restore_proof_present": True,
+            "test_proof_present": True,
+            "decision_approval": True,
+            "divergence_plan": True,
+        },
+    )
+    assert decision.allowed
+    assert decision.policy == "native_update_safe_work_ledger_required"
+
+
+def test_agt_denies_hardwire_overwrite_with_assume_yes_but_no_danger_phrase(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    decision = agt_action_gateway(
+        action="native_update.hardwire_overwrite",
+        caller="test",
+        policies=("agt_hardwire_overwrite_requires_danger_phrase",),
+        metadata={"protected_hardwire_overwrite": True, "assume_yes": True},
+    )
+    assert decision.decision == "deny"
+    assert decision.policy == "agt_hardwire_overwrite_requires_danger_phrase"
+    assert "AL_APPROVES_OVERWRITE_AGT_HARDWIRES" in decision.reason
+
+
+def test_agt_allows_hardwire_overwrite_only_with_exact_danger_phrase(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    wrong = agt_action_gateway(
+        action="native_update.hardwire_overwrite",
+        caller="test",
+        policies=("agt_hardwire_overwrite_requires_danger_phrase",),
+        metadata={"protected_hardwire_overwrite": True, "approval_phrase": "yes"},
+    )
+    allowed = agt_action_gateway(
+        action="native_update.hardwire_overwrite",
+        caller="test",
+        policies=("agt_hardwire_overwrite_requires_danger_phrase",),
+        metadata={"protected_hardwire_overwrite": True, "approval_phrase": "AL_APPROVES_OVERWRITE_AGT_HARDWIRES"},
+    )
+    assert wrong.decision == "deny"
+    assert allowed.allowed

@@ -32,12 +32,15 @@ def hermes_home(tmp_path, monkeypatch):
 
 def _strict_goal(
     *,
+    goal_heading: str = "Goal:",
     acceptance_heading: str = "Acceptance:",
     constraints_heading: str = "Constraints:",
     verify_heading: str = "Verify with:",
 ) -> str:
     return (
-        "Use plan adversary skill for: build hardwire\n\n"
+        "Use plan adversary skill for:\n\n"
+        f"{goal_heading}\n"
+        "build hardwire\n\n"
         f"{acceptance_heading}\n"
         "- proof\n\n"
         f"{constraints_heading}\n"
@@ -59,11 +62,39 @@ def _unlock_runtime_for_policy_test(state):
     return state
 
 
+def _mark_non_guardian_roles_done_for_final(state, tmp_path: Path):
+    role_spawn = tmp_path / "role-spawn-evidence.json"
+    role_spawn.write_text('{"records":{}}\n', encoding="utf-8")
+    state.role_spawn_evidence_path = str(role_spawn)
+    for role in state.required_roles:
+        if role in {"controller", "guardian"}:
+            continue
+        evidence = tmp_path / f"{role}-final-evidence.txt"
+        evidence.write_text(f"{role} evidence PASS\n", encoding="utf-8")
+        record = state.role_records[role]
+        record.update(
+            {
+                "child_session_id": f"child-{role}",
+                "delegation_id": f"delegation-{role}",
+                "runtime_kind": "real_child_session",
+                "spawn_receipt_only": False,
+                "status": "done",
+                "current_phase": "done",
+                "evidence_path": str(evidence),
+                "evidence_truth": {"ok": True, "reason": "test_evidence", "path": str(evidence)},
+            }
+        )
+        state.active_role_run_ids.pop(role, None)
+        state.role_records[role] = record
+    return state
+
+
 def _agt_events(home: Path):
     for path in (home / "logs" / "agt_action_gateway.jsonl", home / "agt_action_gateway.jsonl"):
         if path.exists():
             return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     return []
+
 
 
 def _fake_background_delegate(monkeypatch):
@@ -200,51 +231,48 @@ def test_detect_warroom_goal_triggers_and_global_fallback():
     assert typo.workflow == "global_plan_adversary"
 
 
-@pytest.mark.parametrize(
-    "verify_heading",
-    [
-        "Verify with these read-only commands:",
-        "Verification:",
-        "Test with:",
-        "Commands to run:",
-        "Proof commands:",
-    ],
-)
-def test_detect_warroom_goal_accepts_verify_heading_variants(verify_heading):
+def test_detect_warroom_goal_accepts_exact_strict_headings_only():
     from hermes_cli.warroom_goal import detect_warroom_goal
 
-    strict = detect_warroom_goal(
-        _strict_goal(
-            acceptance_heading="Acceptance criteria:",
-            constraints_heading="Boundaries:",
-            verify_heading=verify_heading,
-        )
-    )
+    strict = detect_warroom_goal(_strict_goal())
     assert strict is not None
     assert strict.workflow == "strict_plan_adversary"
     assert strict.missing_sections == []
 
 
+@pytest.mark.parametrize("goal_heading", ["Goals:", "Goal -", "Goal for this planning session:", "Objective:"])
+def test_detect_warroom_goal_requires_exact_goal_heading(goal_heading):
+    from hermes_cli.warroom_goal import detect_warroom_goal
+
+    strict = detect_warroom_goal(_strict_goal(goal_heading=goal_heading))
+    assert strict is not None
+    assert strict.workflow == "strict_plan_adversary"
+    assert strict.missing_sections == ["Goal"]
+
+
 @pytest.mark.parametrize(
-    ("acceptance_heading", "constraints_heading"),
+    ("acceptance_heading", "constraints_heading", "verify_heading", "missing"),
     [
-        ("Acceptance criteria:", "Constraint:"),
-        ("Done when:", "Boundaries:"),
-        ("Accepted when:", "Limitations:"),
+        ("Acceptance for this planning session:", "Constraints:", "Verify with:", ["Acceptance"]),
+        ("Acceptance criteria:", "Constraints:", "Verify with:", ["Acceptance"]),
+        ("Acceptance:", "Boundaries:", "Verify with:", ["Constraints"]),
+        ("Acceptance:", "Constraints:", "Verification:", ["Verify with"]),
+        ("Acceptance:", "Constraints:", "Commands to run:", ["Verify with"]),
     ],
 )
-def test_detect_warroom_goal_accepts_acceptance_and_constraints_variants(acceptance_heading, constraints_heading):
+def test_detect_warroom_goal_blocks_strict_heading_variants(acceptance_heading, constraints_heading, verify_heading, missing):
     from hermes_cli.warroom_goal import detect_warroom_goal
 
     strict = detect_warroom_goal(
         _strict_goal(
             acceptance_heading=acceptance_heading,
             constraints_heading=constraints_heading,
-            verify_heading="Verification:",
+            verify_heading=verify_heading,
         )
     )
     assert strict is not None
-    assert strict.missing_sections == []
+    assert strict.workflow == "strict_plan_adversary"
+    assert strict.missing_sections == missing
 
 
 def test_global_goal_creates_plan_roles_without_budget_or_fallback(hermes_home, tmp_path, monkeypatch):
@@ -421,6 +449,54 @@ def test_shared_same_corpus_stale_graphify_report_refreshes_from_shared_root(her
     assert len(calls) == 3
 
 
+def test_explicit_generated_shared_graph_report_refreshes_even_when_repo_outside_corpus(hermes_home, tmp_path, monkeypatch):
+    from hermes_cli import warroom_goal
+    from hermes_cli.warroom_goal import create_warroom_goal
+
+    tracking = tmp_path / "tracking"
+    tracking.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    shared_root = tmp_path / "Shared Corpus"
+    shared_report = _write_graph_report(
+        shared_root / "graphify-out" / "GRAPH_REPORT.md",
+        shared_root,
+        age_seconds=169457,
+    )
+    refresh_calls = []
+    calls = _fake_background_delegate(monkeypatch)
+    parent_agent = type("ParentAgent", (), {"model": "gpt-5.5", "provider": "openai-codex"})()
+
+    monkeypatch.setattr(warroom_goal, "_repo_root_for", lambda path: repo)
+    monkeypatch.setattr(warroom_goal, "_graphify_refresh_command", lambda refresh_root: ["graphify-refresh-safe"])
+
+    def fake_run(command, **kwargs):
+        refresh_calls.append({"command": list(command), "cwd": kwargs.get("cwd")})
+        _write_graph_report(shared_report, shared_root, age_seconds=0)
+        os.utime(shared_report, None)
+        return type("Proc", (), {"returncode": 0, "stdout": "refreshed", "stderr": ""})()
+
+    monkeypatch.setattr(warroom_goal.subprocess, "run", fake_run)
+
+    state = create_warroom_goal(
+        "sid-graphify-explicit-shared-refresh",
+        _strict_goal()
+        + f"\ngraphify: Shared graph is at {shared_report}. Gate=PASS only when shared graph + report are fresh."
+        + "\nDo not mutate source files.",
+        tracking_dir=str(tracking),
+        allowed_mutation_root=str(repo),
+        parent_agent=parent_agent,
+    )
+
+    assert refresh_calls == [{"command": ["graphify-refresh-safe"], "cwd": str(shared_root)}]
+    assert state.gates["graphify"] == "pass"
+    assert state.status == "active"
+    assert any(item.startswith("GRAPH_SHARED_REPORT_SELECTED:") for item in state.gate_evidence["graphify"])
+    assert any(item.startswith("GRAPH_REFRESHED:") for item in state.gate_evidence["graphify"])
+    assert len(calls) == 3
+
+
 def test_stale_graphify_no_index_boundary_halts_without_refresh(hermes_home, tmp_path, monkeypatch):
     from hermes_cli import warroom_goal
     from hermes_cli.warroom_goal import create_warroom_goal
@@ -451,7 +527,7 @@ def test_stale_graphify_no_index_boundary_halts_without_refresh(hermes_home, tmp
 
     assert state.status in {"blocked", "gap"}
     assert state.gates["graphify"] == "blocked"
-    assert "explicit_no_index_no_mutation_boundary" in (state.last_gap or "")
+    assert "explicit_no_index_boundary" in (state.last_gap or "")
     assert refresh_calls == []
 
 
@@ -496,7 +572,7 @@ def test_stale_graphify_refresh_rc0_noop_stays_gap(hermes_home, tmp_path, monkey
     assert len(calls) == 0
 
 
-def test_wrong_corpus_graphify_report_marks_not_applicable_and_continues(hermes_home, tmp_path, monkeypatch):
+def test_explicit_non_generated_wrong_corpus_graph_report_gaps(hermes_home, tmp_path, monkeypatch):
     from hermes_cli import warroom_goal
     from hermes_cli.warroom_goal import create_warroom_goal
 
@@ -505,25 +581,13 @@ def test_wrong_corpus_graphify_report_marks_not_applicable_and_continues(hermes_
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / ".git").mkdir()
-    shared_report = _write_graph_report(
-        tmp_path / "shared" / "graphify-out" / "GRAPH_REPORT.md",
-        tmp_path / "other",
-        age_seconds=169457,
-    )
+    shared_root = tmp_path / "shared"
+    foreign_root = tmp_path / "other"
+    shared_report = _write_graph_report(shared_root / "reports" / "GRAPH_REPORT.md", foreign_root, age_seconds=0)
     calls = _fake_background_delegate(monkeypatch)
     parent_agent = type("ParentAgent", (), {"model": "gpt-5.5", "provider": "openai-codex"})()
 
     monkeypatch.setattr(warroom_goal, "_repo_root_for", lambda path: repo)
-    monkeypatch.setattr(
-        warroom_goal.shutil,
-        "which",
-        lambda tool_name: "/bin/mcp2cli" if tool_name == "mcp2cli" else None,
-    )
-
-    def fail_run(*args, **kwargs):
-        raise AssertionError("graph refresh should not run")
-
-    monkeypatch.setattr(warroom_goal.subprocess, "run", fail_run)
 
     state = create_warroom_goal(
         "sid-graphify-wrong-corpus",
@@ -533,12 +597,79 @@ def test_wrong_corpus_graphify_report_marks_not_applicable_and_continues(hermes_
         parent_agent=parent_agent,
     )
 
+    assert state.gates["graphify"] == "gap"
+    assert state.status == "gap"
+    assert any(item.startswith("GRAPH_NOT_APPLICABLE:") for item in state.gate_evidence["graphify"])
+    assert "preferred_report_not_generated_or_header_unparseable" in (state.last_gap or "")
+    assert len(calls) == 0
+
+
+def test_explicit_header_unparseable_graph_report_gaps(hermes_home, tmp_path, monkeypatch):
+    from hermes_cli import warroom_goal
+    from hermes_cli.warroom_goal import create_warroom_goal
+
+    tracking = tmp_path / "tracking"
+    tracking.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    shared_root = tmp_path / "Shared Corpus"
+    shared_report = shared_root / "graphify-out" / "GRAPH_REPORT.md"
+    shared_report.parent.mkdir(parents=True)
+    shared_report.write_text("# Broken Report\n\nNo generated root header here.\n", encoding="utf-8")
+    calls = _fake_background_delegate(monkeypatch)
+    parent_agent = type("ParentAgent", (), {"model": "gpt-5.5", "provider": "openai-codex"})()
+    monkeypatch.setattr(warroom_goal, "_repo_root_for", lambda path: repo)
+
+    state = create_warroom_goal(
+        "sid-graphify-header-unparseable",
+        _strict_goal() + f"\ngraphify: Shared graph is at {shared_report}. Gate=PASS only when shared graph + report are fresh.",
+        tracking_dir=str(tracking),
+        allowed_mutation_root=str(repo),
+        parent_agent=parent_agent,
+    )
+
+    assert state.gates["graphify"] == "gap"
+    assert state.status == "gap"
+    assert any(item.startswith("GRAPH_REPORT_HEADER_UNPARSEABLE:") for item in state.gate_evidence["graphify"])
+    assert "preferred_report_not_generated_or_header_unparseable" in (state.last_gap or "")
+    assert len(calls) == 0
+
+
+def test_no_explicit_graph_wrong_local_corpus_uses_alternate_discovery_with_route_hint(hermes_home, tmp_path, monkeypatch):
+    from hermes_cli import warroom_goal
+    from hermes_cli.warroom_goal import create_warroom_goal
+
+    tracking = tmp_path / "tracking"
+    tracking.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    foreign_root = tmp_path / "foreign"
+    local_report = _write_graph_report(repo / "graphify-out" / "GRAPH_REPORT.md", foreign_root, age_seconds=0)
+    calls = _fake_background_delegate(monkeypatch)
+    parent_agent = type("ParentAgent", (), {"model": "gpt-5.5", "provider": "openai-codex"})()
+    monkeypatch.setattr(warroom_goal, "_repo_root_for", lambda path: repo)
+    monkeypatch.setattr(
+        warroom_goal.shutil,
+        "which",
+        lambda tool_name: "/bin/mcp2cli" if tool_name == "mcp2cli" else None,
+    )
+
+    state = create_warroom_goal(
+        "sid-graphify-no-explicit-wrong-local",
+        _strict_goal(),
+        tracking_dir=str(tracking),
+        allowed_mutation_root=str(repo),
+        parent_agent=parent_agent,
+    )
+
     assert state.gates["graphify"] == "pass"
     assert state.status == "active"
-    assert state.gates["role_spawn"] == "pass"
-    assert state.gates["delegate_runtime"] == "pass"
-    assert any(item.startswith("GRAPH_NOT_APPLICABLE:") for item in state.gate_evidence["graphify"])
+    assert any(item.startswith(f"GRAPH_NOT_APPLICABLE:{local_report}") for item in state.gate_evidence["graphify"])
     assert "GRAPH_ALTERNATE_DISCOVERY:mcp2cli" in state.gate_evidence["graphify"]
+    assert any(item.startswith("SMART_READ_ROUTE_HINT:") for item in state.gate_evidence["graphify"])
+    assert "GRAPHIFY_DISCOVERY_PASS:smart-read route available for graph report recovery" in state.gate_evidence["graphify"]
     assert len(calls) == 3
 
 
@@ -585,7 +716,7 @@ def test_strict_state_requires_plan_before_mutation(hermes_home, tmp_path):
 
     state = create_warroom_goal(
         "sid-strict",
-        "Use plan adversary skill for: build hardwire\n\nAcceptance:\n- proof\n\nConstraints:\n- worktree only\n\nVerify with:\npytest",
+        "Use plan adversary skill for:\n\nGoal:\nbuild hardwire\n\nAcceptance:\n- proof\n\nConstraints:\n- worktree only\n\nVerify with:\npytest",
         tracking_dir=str(tmp_path),
         allowed_mutation_root=str(tmp_path),
     )
@@ -608,13 +739,13 @@ def test_strict_parser_block_reports_missing_sections_and_allows_read_only_termi
         allowed_mutation_root=str(tmp_path),
     )
     assert state.status == "blocked"
-    assert state.last_gap == "Missing required strict sections: Verify with"
+    assert state.last_gap == "Missing required strict sections: Goal, Acceptance, Constraints, Verify with"
     assert state.gates["plan"] == "blocked"
     assert state.gates["role_spawn"] == "blocked"
     assert state.required_action is None
 
     notice = notice_for_state(state)
-    assert "GAP: Missing required strict sections: Verify with" in notice
+    assert "GAP: Missing required strict sections: Goal, Acceptance, Constraints, Verify with" in notice
     assert "required role spawn action is pending" not in notice
     assert "spawned with persisted evidence" not in notice
 
@@ -628,7 +759,7 @@ def test_strict_parser_block_reports_missing_sections_and_allows_read_only_termi
         "write_file",
         {"path": str(tmp_path / "x.py")},
     )
-    assert blocked == "WARROOM V3 blocked: Missing required strict sections: Verify with"
+    assert blocked == "WARROOM V3 blocked: Missing required strict sections: Goal, Acceptance, Constraints, Verify with"
     assert "spawn" not in blocked.lower()
 
 
@@ -672,6 +803,11 @@ def test_final_guard_blocks_done_without_proof_and_health_only(hermes_home, tmp_
 
     state.proof_packet_path = str(tmp_path / "proof-packet.md")
     Path(state.proof_packet_path).write_text("Status: PASS\nGuardian verdict: PASS\n", encoding="utf-8")
+    _mark_non_guardian_roles_done_for_final(state, tmp_path)
+    state.role_records["guardian"]["child_session_id"] = "child-guardian"
+    state.role_records["guardian"]["delegation_id"] = "delegation-guardian"
+    state.role_records["guardian"]["runtime_kind"] = "real_child_session"
+    state.role_records["guardian"]["spawn_receipt_only"] = False
     save_warroom_goal("sid-final", state)
     guardian = tmp_path / "guardian.txt"
     guardian.write_text("Guardian verdict: PASS\n", encoding="utf-8")
@@ -786,8 +922,12 @@ def test_role_spawn_success_persists_ids_hashes_and_evidence(hermes_home, tmp_pa
         assert record["role_card_sha256"]
         assert record["runtime_id"]
         assert Path(record["evidence_path"]).exists()
-        assert role == "controller" or record["runtime_kind"] == "spawn_receipt"
-        assert role == "controller" or record["spawn_receipt_only"] is True
+        if role == "guardian":
+            assert record["runtime_kind"] == "scheduler_queue"
+            assert record["spawn_receipt_only"] is False
+        else:
+            assert role == "controller" or record["runtime_kind"] == "spawn_receipt"
+            assert role == "controller" or record["spawn_receipt_only"] is True
     assert Path(state.role_spawn_evidence_path).exists()
 
 
@@ -1175,14 +1315,22 @@ def test_missing_role_card_blocks_spawn_with_explicit_gap(hermes_home, tmp_path)
     assert blocked.role_records["reviewer"]["runtime_id"] == "missing-role-card"
 
 
-def test_strict_plan_starts_plan_roles_then_build_roles_after_gates(hermes_home, tmp_path):
-    from hermes_cli.warroom_goal import create_warroom_goal, save_warroom_goal, start_plan_build_roles_if_ready
+def test_strict_plan_starts_plan_roles_then_build_roles_after_gates(hermes_home, tmp_path, monkeypatch):
+    from hermes_cli.warroom_goal import _native_background_delegate_adapter, create_warroom_goal, record_role_output, save_warroom_goal, start_plan_build_roles_if_ready
+
+    class Parent:
+        model = "gpt-5.5"
+        provider = "nous"
+
+    parent = Parent()
+    calls = _fake_background_delegate(monkeypatch)
 
     state = create_warroom_goal(
         "sid-plan-sequence",
-        "Use plan adversary skill for: build hardwire\n\nAcceptance:\n- proof\n\nConstraints:\n- worktree only\n\nVerify with:\npytest",
+        "Use plan adversary skill for:\n\nGoal:\nbuild hardwire\n\nAcceptance:\n- proof\n\nConstraints:\n- worktree only\n\nVerify with:\npytest",
         tracking_dir=str(tmp_path),
         allowed_mutation_root=str(tmp_path),
+        parent_agent=parent,
     )
     assert set(state.role_records) == {"controller", "plan_builder", "plan_adversary", "plan_reviewer"}
     assert "builder" not in state.role_records
@@ -1190,12 +1338,177 @@ def test_strict_plan_starts_plan_roles_then_build_roles_after_gates(hermes_home,
     state.gates["plan"] = "pass"
     state.gates["tracking"] = "pass"
     save_warroom_goal("sid-plan-sequence", state)
-    advanced = start_plan_build_roles_if_ready("sid-plan-sequence")
+    for role in ["plan_builder", "plan_adversary", "plan_reviewer"]:
+        evidence = tmp_path / f"{role}-evidence.txt"
+        evidence.write_text(f"{role} evidence", encoding="utf-8")
+        state = record_role_output(
+            "sid-plan-sequence",
+            role,
+            evidence_path=str(evidence),
+            status="done",
+            delegation_id=state.role_records[role]["delegation_id"],
+            expected_role_run_id=state.role_run_ids[role],
+        )
+    assert state is not None
+    state.gates["plan"] = "pass"
+    state.gates["tracking"] = "pass"
+    save_warroom_goal("sid-plan-sequence", state)
+    advanced = start_plan_build_roles_if_ready("sid-plan-sequence", adapter=_native_background_delegate_adapter(parent), use_local_process=False)
     assert advanced is not None
-    assert {"builder", "adversary", "reviewer", "guardian"}.issubset(set(advanced.role_records))
-    assert advanced.gates["build_role_spawn"] == "gap"
-    assert advanced.required_action == "blocked_gap"
-    assert "real delegated role runtime missing" in (advanced.last_gap or "")
+    dispatched_roles = [call["goal"].split("Role: ", 1)[1].split("\n", 1)[0] for call in calls]
+    assert dispatched_roles == [
+        "plan_builder",
+        "plan_adversary",
+        "plan_reviewer",
+        "builder",
+        "adversary",
+        "reviewer",
+    ]
+    assert advanced.role_records["guardian"]["status"] == "queued"
+    assert advanced.role_queue == ["guardian"]
+    assert advanced.gates["build_role_spawn"] in {"pass", "partial_pass_queued"}
+    assert advanced.required_action in {None, "continue_scheduler"}
+    assert advanced.last_gap is None
+
+
+def test_fast_adversary_scheduler_caps_three_and_queues_guardian(hermes_home, tmp_path, monkeypatch):
+    from hermes_cli.warroom_goal import create_warroom_goal
+
+    class Parent:
+        model = "gpt-5.5"
+        provider = "nous"
+
+    calls = _fake_background_delegate(monkeypatch)
+    state = create_warroom_goal(
+        "sid-fast-scheduler",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+        parent_agent=Parent(),
+    )
+
+    dispatched_roles = [call["goal"].split("Role: ", 1)[1].split("\n", 1)[0] for call in calls]
+    assert dispatched_roles == ["builder", "adversary", "reviewer"]
+    assert state.max_active_non_controller_roles == 3
+    assert state.role_queue == ["guardian"]
+    assert state.role_records["guardian"]["status"] == "queued"
+    assert state.role_records["guardian"]["runtime_id"] == "queued"
+    assert state.gates["role_spawn"] == "partial_pass_queued"
+    assert state.gates["delegate_runtime"] == "pass"
+    assert state.status == "active"
+    assert state.required_action == "continue_scheduler"
+    assert state.last_gap is None
+
+
+def test_async_capacity_rejection_queues_role_without_gap_or_fallback(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, save_warroom_goal, start_warroom_roles
+
+    state = create_warroom_goal(
+        "sid-capacity-queue",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.status = "active"
+    state.gates["role_spawn"] = "pending"
+    state.gates["delegate_runtime"] = "pending"
+    state.required_action = "spawn_roles"
+    save_warroom_goal("sid-capacity-queue", state)
+
+    def capacity_full(**kwargs):
+        raise RuntimeError("Async delegation capacity reached (3 running). Wait for one to finish")
+
+    updated = start_warroom_roles("sid-capacity-queue", ["reviewer"], adapter=capacity_full, use_local_process=False)
+    assert updated is not None
+    assert updated.status == "active"
+    assert updated.required_action == "continue_scheduler"
+    assert updated.last_gap is None
+    assert updated.role_spawn_gap is None
+    assert "reviewer" in updated.role_queue
+    assert updated.role_records["reviewer"]["status"] == "queued"
+    assert updated.role_records["reviewer"]["adapter"] == "scheduler_queue"
+    assert updated.role_records["reviewer"]["runtime_id"] == "queued"
+    assert "spawn-failed" not in json.dumps(updated.role_records["reviewer"])
+
+
+def test_guardian_starts_serial_after_dependencies_and_proof_packet(hermes_home, tmp_path, monkeypatch):
+    from hermes_cli.warroom_goal import _native_background_delegate_adapter, create_warroom_goal, record_role_output, save_warroom_goal, start_warroom_roles
+
+    class Parent:
+        model = "gpt-5.5"
+        provider = "nous"
+
+    parent = Parent()
+    calls = _fake_background_delegate(monkeypatch)
+    state = create_warroom_goal(
+        "sid-guardian-serial",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+        parent_agent=parent,
+    )
+    assert [call["goal"].split("Role: ", 1)[1].split("\n", 1)[0] for call in calls] == ["builder", "adversary", "reviewer"]
+
+    for role in ["builder", "adversary", "reviewer"]:
+        evidence = tmp_path / f"{role}-evidence.txt"
+        evidence.write_text(f"{role} evidence", encoding="utf-8")
+        state = record_role_output(
+            "sid-guardian-serial",
+            role,
+            evidence_path=str(evidence),
+            status="done",
+            delegation_id=state.role_records[role]["delegation_id"],
+            expected_role_run_id=state.role_run_ids[role],
+        )
+    assert state is not None
+    state.proof_packet_path = str(tmp_path / "proof-packet.md")
+    Path(state.proof_packet_path).write_text("proof packet", encoding="utf-8")
+    save_warroom_goal("sid-guardian-serial", state)
+
+    updated = start_warroom_roles("sid-guardian-serial", adapter=_native_background_delegate_adapter(parent), use_local_process=False)
+    assert updated is not None
+    dispatched_roles = [call["goal"].split("Role: ", 1)[1].split("\n", 1)[0] for call in calls]
+    assert dispatched_roles == ["builder", "adversary", "reviewer", "guardian"]
+    assert updated.role_queue == []
+    assert updated.role_records["guardian"]["status"] == "active_child_work"
+
+
+def test_stale_async_result_with_old_role_run_id_is_quarantined(hermes_home, tmp_path, monkeypatch):
+    from hermes_cli.warroom_goal import create_warroom_goal, record_role_output, save_warroom_goal
+
+    class Parent:
+        model = "gpt-5.5"
+        provider = "nous"
+
+    _fake_background_delegate(monkeypatch)
+    state = create_warroom_goal(
+        "sid-stale-role-run-id",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+        parent_agent=Parent(),
+    )
+    stale_role_run_id = state.role_run_ids["adversary"]
+    state.role_run_ids["adversary"] = "role-run-new"
+    state.active_role_run_ids["adversary"] = "role-run-new"
+    save_warroom_goal("sid-stale-role-run-id", state)
+
+    evidence = tmp_path / "late-adversary.txt"
+    evidence.write_text("late adversary evidence", encoding="utf-8")
+    updated = record_role_output(
+        "sid-stale-role-run-id",
+        "adversary",
+        evidence_path=str(evidence),
+        status="done",
+        delegation_id=state.role_records["adversary"]["delegation_id"],
+        expected_role_run_id=stale_role_run_id,
+    )
+
+    assert updated is not None
+    record = updated.role_records["adversary"]
+    assert record["status"] == "STALE_SUPERSEDED_BY_CURRENT_VERIFICATION"
+    assert record["quarantine_status"] == "quarantined"
+    assert "role_run_id" in record["stale_reason"]
 
 
 def test_warroom_roles_record_controller_model_for_plan_and_adversary(hermes_home, tmp_path):
@@ -1206,7 +1519,7 @@ def test_warroom_roles_record_controller_model_for_plan_and_adversary(hermes_hom
 
     plan = create_warroom_goal(
         "sid-plan-model",
-        "Use plan adversary skill for: build hardwire\n\nAcceptance:\n- proof\n\nConstraints:\n- worktree only\n\nVerify with:\npytest",
+        "Use plan adversary skill for:\n\nGoal:\nbuild hardwire\n\nAcceptance:\n- proof\n\nConstraints:\n- worktree only\n\nVerify with:\npytest",
         tracking_dir=str(tmp_path / "plan"),
         allowed_mutation_root=str(tmp_path),
         parent_agent=Parent(),
@@ -1285,6 +1598,16 @@ def test_receipt_only_role_output_cannot_mark_active_or_completed(hermes_home, t
     assert completed is not None
     assert completed.role_records["builder"]["status"] == "spawn_receipt_only"
     assert "receipt_only_verdict" in completed.gate_evidence
+
+    done = record_role_output(
+        "sid-receipt-output-block",
+        "builder",
+        evidence_path=str(tmp_path / "builder-done.txt"),
+        status="done",
+    )
+    assert done is not None
+    assert done.role_records["builder"]["status"] == "spawn_receipt_only"
+    assert done.role_records["builder"]["spawn_receipt_only"] is True
 
 
 def test_remote_vps_target_blocks_local_target_paths(hermes_home, tmp_path):
@@ -1508,18 +1831,17 @@ def test_builder_self_report_cannot_unlock_guardian_final_gate(hermes_home, tmp_
     guardian.write_text("Guardian verdict: PASS\n", encoding="utf-8")
     unlocked = record_role_output("sid-guardian-unlock", "guardian", evidence_path=str(guardian), verdict="PASS")
     assert unlocked.guardian_pass is True
-    assert unlocked.final_claim_allowed is True
+    assert unlocked.final_claim_allowed is False
     completed = guard_final_response("sid-guardian-unlock", "DONE. pytest E2E passed and proof packet written.", closure=True)
-    assert completed.startswith("GOAL COMPLETED")
-    assert "Role spawn evidence:" in completed
-    assert "Normal chat fallback: NO" in completed
+    assert "FINAL BLOCKED" in completed
+    assert "role_evidence_gaps" in completed
     from hermes_cli.warroom_goal import load_warroom_goal
     completed_state = load_warroom_goal("sid-guardian-unlock")
     assert completed_state is not None
-    assert completed_state.status == "done"
-    assert completed_state.gates["proof_packet"] == "pass"
-    assert completed_state.gates["e2e_claim"] == "pass"
-    assert "GOAL COMPLETED emitted" in completed_state.gate_evidence["completion_output"]
+    assert completed_state.status != "done"
+    assert completed_state.gates["proof_packet"] == "pending"
+    assert completed_state.gates["e2e_claim"] == "pending"
+    assert "completion_output" not in completed_state.gate_evidence
 
 
 def test_final_claim_requires_current_state_hash_match(hermes_home, tmp_path):
@@ -1534,7 +1856,26 @@ def test_final_claim_requires_current_state_hash_match(hermes_home, tmp_path):
     proof = tmp_path / "proof-packet.md"
     proof.write_text("tests passed\n", encoding="utf-8")
     state.proof_packet_path = str(proof)
+    role_spawn = tmp_path / "role-spawn-evidence.json"
+    role_spawn.write_text('{"records":{}}\n', encoding="utf-8")
+    state.role_spawn_evidence_path = str(role_spawn)
+    for role in state.required_roles:
+        if role == "controller":
+            continue
+        record = state.role_records[role]
+        record["child_session_id"] = f"child-{role}"
+        record["delegation_id"] = f"delegation-{role}"
+        record["runtime_kind"] = "real_child_session"
+        record["spawn_receipt_only"] = False
+        state.role_records[role] = record
     save_warroom_goal("sid-final-hash", state)
+
+    for role in (role for role in state.required_roles if role not in {"controller", "guardian"}):
+        evidence = tmp_path / f"{role}.json"
+        evidence.write_text('{"verdict":"PASS"}\n', encoding="utf-8")
+        recorded = record_role_output("sid-final-hash", role, evidence_path=str(evidence), status="done")
+        assert recorded is not None
+        assert recorded.role_records[role]["evidence_truth"]["ok"] is True
 
     guardian = tmp_path / "guardian.txt"
     guardian.write_text("Guardian verdict: PASS\n", encoding="utf-8")
@@ -1542,12 +1883,13 @@ def test_final_claim_requires_current_state_hash_match(hermes_home, tmp_path):
     assert unlocked is not None
     assert unlocked.final_claim_state_hash
 
-    unlocked.role_records["builder"] = {"status": "done", "evidence_path": str(tmp_path / "late-builder.txt")}
+    unlocked.gate_evidence.setdefault("state_hash_test", []).append("mutated after Guardian PASS")
     save_warroom_goal("sid-final-hash", unlocked)
 
     blocked = guard_final_response("sid-final-hash", "DONE. pytest E2E passed and proof packet written.", closure=True)
     assert "FINAL BLOCKED" in blocked
     assert "state hash" in blocked
+    assert "role_evidence_gaps" not in blocked
 
 
 def test_normal_chat_does_not_run_final_guard_while_spawn_pending(hermes_home, tmp_path):
@@ -1621,9 +1963,9 @@ def test_role_ledger_distinguishes_real_child_session_stale_pid_and_status_line(
 
     updated = start_warroom_roles("sid-real-child", ["reviewer"], adapter=adapter, use_local_process=False)
     assert updated is not None
-    assert updated.gates["role_spawn"] == "pass"
+    assert updated.gates["role_spawn"] in {"pass", "partial_pass_queued"}
     assert updated.gates["delegate_runtime"] == "pass"
-    assert updated.required_action is None
+    assert updated.required_action in {None, "continue_scheduler"}
     record = updated.role_records["reviewer"]
     assert record["runtime_kind"] == "real_child_session"
     assert record["spawn_receipt_only"] is False
@@ -1654,7 +1996,80 @@ def test_role_ledger_distinguishes_real_child_session_stale_pid_and_status_line(
     line = refreshed.status_line()
     assert "child-session-1" in line
     assert "phase=delegate heartbeat" in line
+    assert "evidence=" in line
+    assert "heartbeat=" in line
+    assert "parent_progress=" in line
     assert "stale" in line
+
+
+def test_non_guardian_role_done_requires_real_evidence_file_and_clears_gap_when_resolved(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, record_role_output, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-role-evidence-truth",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.role_records["reviewer"]["child_session_id"] = "child-reviewer"
+    state.role_records["reviewer"]["delegation_id"] = "delegation-reviewer"
+    state.role_records["reviewer"]["runtime_kind"] = "real_child_session"
+    state.role_records["reviewer"]["spawn_receipt_only"] = False
+    save_warroom_goal("sid-role-evidence-truth", state)
+
+    missing = record_role_output(
+        "sid-role-evidence-truth",
+        "reviewer",
+        evidence_path=str(tmp_path / "missing-reviewer.json"),
+        status="done",
+    )
+
+    assert missing is not None
+    assert missing.role_records["reviewer"]["status"] == "evidence_gap"
+    assert missing.gates["role_evidence"] == "gap"
+    assert "missing_evidence_file" in missing.last_gap
+
+    evidence = tmp_path / "reviewer.json"
+    evidence.write_text('{"verdict":"PASS"}\n', encoding="utf-8")
+    recorded = record_role_output(
+        "sid-role-evidence-truth",
+        "reviewer",
+        evidence_path=str(evidence),
+        status="done",
+    )
+    assert recorded.role_records["reviewer"]["status"] == "done"
+    assert recorded.role_records["reviewer"]["evidence_truth"]["ok"] is True
+    assert recorded.gates["role_evidence"] == "pass"
+    assert recorded.last_gap is None
+
+
+def test_role_evidence_gap_clear_does_not_hide_unrelated_gap(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, record_role_output, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-role-evidence-other-gap",
+        "Use adversary skill for: build hardwire",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    state.role_records["reviewer"]["child_session_id"] = "child-reviewer"
+    state.role_records["reviewer"]["delegation_id"] = "delegation-reviewer"
+    state.role_records["reviewer"]["runtime_kind"] = "real_child_session"
+    state.role_records["reviewer"]["spawn_receipt_only"] = False
+    state.gates["role_evidence"] = "gap"
+    state.last_gap = "Unrelated parser gap"
+    save_warroom_goal("sid-role-evidence-other-gap", state)
+
+    evidence = tmp_path / "reviewer.json"
+    evidence.write_text('{"verdict":"PASS"}\n', encoding="utf-8")
+    recorded = record_role_output(
+        "sid-role-evidence-other-gap",
+        "reviewer",
+        evidence_path=str(evidence),
+        status="done",
+    )
+    assert recorded.gates["role_evidence"] == "pass"
+    assert recorded.last_gap == "Unrelated parser gap"
 
 
 def test_controller_can_write_tracking_docs_but_not_source(hermes_home, tmp_path):
@@ -1674,6 +2089,7 @@ def test_controller_can_write_tracking_docs_but_not_source(hermes_home, tmp_path
     blocked = enforce_tool_policy("sid-controller-tracking", "write_file", {"path": str(tmp_path / "source.py")})
     assert blocked is not None
     assert "Builder is the only mutation role" in blocked
+
 
 
 def test_rc0_empty_transport_is_incomplete_not_success(hermes_home, tmp_path):
@@ -1838,6 +2254,11 @@ def test_guardian_unlock_requires_existing_guardian_pass_evidence(hermes_home, t
     proof = tmp_path / "proof-packet.md"
     proof.write_text("proof\n", encoding="utf-8")
     state.proof_packet_path = str(proof)
+    _mark_non_guardian_roles_done_for_final(state, tmp_path)
+    state.role_records["guardian"]["child_session_id"] = "child-guardian"
+    state.role_records["guardian"]["delegation_id"] = "delegation-guardian"
+    state.role_records["guardian"]["runtime_kind"] = "real_child_session"
+    state.role_records["guardian"]["spawn_receipt_only"] = False
     save_warroom_goal("sid-guardian-evidence", state)
 
     missing = record_role_output("sid-guardian-evidence", "guardian", evidence_path=str(tmp_path / "missing.txt"), verdict="PASS")
@@ -2035,8 +2456,10 @@ def test_warroom_roles_record_actual_delegate_model_for_fast_adversary_roles(her
         parent_agent=parent_agent,
     )
 
-    assert len(calls) == 4
-    for role in ("builder", "adversary", "reviewer", "guardian"):
+    assert len(calls) == 3
+    assert state.role_queue == ["guardian"]
+    assert state.role_records["guardian"]["status"] == "queued"
+    for role in ("builder", "adversary", "reviewer"):
         record = state.role_records[role]
         assert record["model"] == "gpt-5.5"
         assert record["provider"] == "openai-codex"
@@ -2118,8 +2541,11 @@ def test_warroom_goal_clears_legacy_goalmanager_state(hermes_home, tmp_path):
     assert not cleared.is_active()
 
 
-def test_plan_build_roles_auto_start_when_builder_mutation_reaches_policy(hermes_home, tmp_path):
+def test_plan_build_roles_auto_start_with_parent_agent_no_nudge(hermes_home, tmp_path, monkeypatch):
+    from types import SimpleNamespace
     from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, load_warroom_goal, save_warroom_goal
+
+    calls = _fake_background_delegate(monkeypatch)
 
     state = create_warroom_goal(
         "sid-auto-build-roles",
@@ -2131,17 +2557,148 @@ def test_plan_build_roles_auto_start_when_builder_mutation_reaches_policy(hermes
     _unlock_runtime_for_policy_test(state)
     state.gates["plan"] = "pass"
     state.gates["tracking"] = "pass"
+    _mark_non_guardian_roles_done_for_final(state, tmp_path)
     state.current_role = "builder"
     save_warroom_goal("sid-auto-build-roles", state)
 
-    blocked = enforce_tool_policy("sid-auto-build-roles", "write_file", {"path": str(tmp_path / "x.py")})
-    assert blocked is not None
-    assert "real delegated role runtime missing" in blocked
+    parent_agent = SimpleNamespace(session_id="sid-auto-build-roles", model="gpt-5.5", provider="openai-codex")
+    blocked = enforce_tool_policy(
+        "sid-auto-build-roles",
+        "terminal",
+        {"command": "git status --short", "workdir": str(tmp_path)},
+        parent_agent=parent_agent,
+    )
+    assert blocked is None
     updated = load_warroom_goal("sid-auto-build-roles")
     assert updated is not None
     assert {"builder", "adversary", "reviewer", "guardian"}.issubset(updated.role_records)
-    assert updated.gates["build_role_spawn"] == "gap"
-    assert updated.required_action == "blocked_gap"
+    assert updated.gates["build_role_spawn"] == "partial_pass_queued"
+    assert updated.gates["delegate_runtime"] == "pass"
+    assert updated.required_action == "continue_scheduler"
+    assert len(calls) == 3
+    assert updated.role_queue == ["guardian"]
+    assert updated.role_records["guardian"]["status"] == "queued"
+    for role in ("builder", "adversary", "reviewer"):
+        assert updated.role_records[role]["runtime_kind"] == "real_child_session"
+
+
+def test_plan_build_roles_auto_start_without_parent_agent_fails_closed(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, enforce_tool_policy, load_warroom_goal, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-auto-build-roles-no-parent",
+        "ship plan then build",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    assert set(state.role_records) == {"controller", "plan_builder", "plan_adversary", "plan_reviewer"}
+    _unlock_runtime_for_policy_test(state)
+    state.gates["plan"] = "pass"
+    state.gates["tracking"] = "pass"
+    _mark_non_guardian_roles_done_for_final(state, tmp_path)
+    state.current_role = "builder"
+    save_warroom_goal("sid-auto-build-roles-no-parent", state)
+
+    blocked = enforce_tool_policy(
+        "sid-auto-build-roles-no-parent",
+        "write_file",
+        {"path": str(tmp_path / "x.py")},
+    )
+    assert blocked is None
+    updated = load_warroom_goal("sid-auto-build-roles-no-parent")
+    assert updated is not None
+    assert {"builder", "adversary", "reviewer", "guardian"}.issubset(updated.role_records)
+    assert updated.gates["build_role_spawn"] == "pass"
+
+
+@pytest.mark.parametrize(
+    ("role", "status", "spawn_receipt_only"),
+    [
+        ("plan_builder", "missing", False),
+        ("plan_builder", "active_child_work", False),
+        ("plan_adversary", "done", True),
+        ("plan_reviewer", "stalled", False),
+    ],
+)
+def test_plan_to_build_requires_current_accepted_plan_role_outputs(hermes_home, tmp_path, role, status, spawn_receipt_only):
+    from hermes_cli.warroom_goal import create_warroom_goal, save_warroom_goal, start_plan_build_roles_if_ready
+
+    state = create_warroom_goal(
+        f"sid-plan-barrier-{role}-{status}",
+        _strict_goal(),
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    _unlock_runtime_for_policy_test(state)
+    state.gates["plan"] = "pass"
+    state.gates["tracking"] = "pass"
+    _mark_non_guardian_roles_done_for_final(state, tmp_path)
+    if status == "missing":
+        state.role_records.pop(role, None)
+    else:
+        state.role_records[role]["status"] = status
+        state.role_records[role]["current_phase"] = status
+        state.role_records[role]["spawn_receipt_only"] = spawn_receipt_only
+        if spawn_receipt_only:
+            state.role_records[role]["child_session_id"] = None
+            state.role_records[role]["delegation_id"] = None
+        if status == "stalled":
+            state.role_records[role]["stale"] = True
+            state.role_records[role]["diagnostic_path"] = str(tmp_path / f"{role}-diagnostic.json")
+    save_warroom_goal(state.session_id, state)
+
+    updated = start_plan_build_roles_if_ready(state.session_id, adapter=lambda **kwargs: {"delegation_id": "should-not-run"}, use_local_process=False)
+
+    assert updated is not None
+    assert "builder" not in updated.role_records
+    assert updated.gates["build_role_spawn"] == "blocked"
+    assert updated.required_action in {"wait_for_plan_roles", "stalled_diagnostic"}
+
+
+def test_accepted_plan_outputs_unlock_builder(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, save_warroom_goal, start_plan_build_roles_if_ready
+
+    state = create_warroom_goal(
+        "sid-plan-outputs-unlock-builder",
+        _strict_goal(),
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    _unlock_runtime_for_policy_test(state)
+    state.gates["plan"] = "pass"
+    state.gates["tracking"] = "pass"
+    _mark_non_guardian_roles_done_for_final(state, tmp_path)
+    save_warroom_goal("sid-plan-outputs-unlock-builder", state)
+
+    updated = start_plan_build_roles_if_ready("sid-plan-outputs-unlock-builder", adapter=None, use_local_process=True)
+
+    assert updated is not None
+    assert {"builder", "adversary", "reviewer", "guardian"}.issubset(updated.role_records)
+    assert updated.gates.get("plan_role_outputs") != "waiting"
+
+
+def test_stalled_required_role_diagnostic_blocks_next_phase(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, mark_role_stalled, save_warroom_goal, start_plan_build_roles_if_ready
+
+    state = create_warroom_goal("sid-stalled-plan-role-blocks", _strict_goal(), tracking_dir=str(tmp_path), allowed_mutation_root=str(tmp_path))
+    _unlock_runtime_for_policy_test(state)
+    state.gates["plan"] = "pass"
+    state.gates["tracking"] = "pass"
+    _mark_non_guardian_roles_done_for_final(state, tmp_path)
+    save_warroom_goal("sid-stalled-plan-role-blocks", state)
+
+    stalled = mark_role_stalled("sid-stalled-plan-role-blocks", "plan_builder", delegation_id="deleg-plan-builder", elapsed=999, current_phase="waiting")
+    assert stalled is not None
+    assert stalled.role_records["plan_builder"]["status"] == "stalled"
+    assert stalled.role_records["plan_builder"]["diagnostic_path"]
+
+    blocked = start_plan_build_roles_if_ready("sid-stalled-plan-role-blocks", adapter=lambda **kwargs: {"delegation_id": "should-not-run"}, use_local_process=False)
+    assert blocked is not None
+    assert blocked.status == "gap"
+    assert blocked.required_action == "stalled_diagnostic"
+    assert blocked.last_gap is not None
+    assert "STALLED_DIAGNOSTIC" in blocked.last_gap
+    assert "builder" not in blocked.role_records
 
 
 def test_noncritical_stop_phrase_is_auto_continued_in_final_guard(hermes_home, tmp_path):
@@ -2175,7 +2732,21 @@ def test_goal_completion_output_hardwire_emits_goal_completed(hermes_home, tmp_p
     proof = tmp_path / "proof-packet.md"
     proof.write_text("PROOF PACKET\nTests: PASS\nRole evidence: PASS\n", encoding="utf-8")
     state.proof_packet_path = str(proof)
+    role_spawn = tmp_path / "role-spawn-evidence.json"
+    role_spawn.write_text('{"records":{}}\n', encoding="utf-8")
+    state.role_spawn_evidence_path = str(role_spawn)
+    for role in ("plan_builder", "plan_adversary", "plan_reviewer"):
+        record = state.role_records[role]
+        record["child_session_id"] = f"child-{role}"
+        record["delegation_id"] = f"delegation-{role}"
+        record["runtime_kind"] = "real_child_session"
+        record["spawn_receipt_only"] = False
+        state.role_records[role] = record
     save_warroom_goal("sid-completion-output", state)
+    for role in ("plan_builder", "plan_adversary", "plan_reviewer"):
+        role_evidence = tmp_path / f"{role}.json"
+        role_evidence.write_text('{"verdict":"PASS"}\n', encoding="utf-8")
+        record_role_output("sid-completion-output", role, evidence_path=str(role_evidence), status="done")
     guardian = tmp_path / "guardian.txt"
     guardian.write_text("Guardian verdict: PASS\n", encoding="utf-8")
     record_role_output("sid-completion-output", "guardian", evidence_path=str(guardian), verdict="PASS")
@@ -2193,3 +2764,31 @@ def test_goal_completion_output_hardwire_emits_goal_completed(hermes_home, tmp_p
     assert state.gates["proof_packet"] == "pass"
     assert state.gates["e2e_claim"] == "pass"
     assert "GOAL COMPLETED emitted" in state.gate_evidence["completion_output"]
+
+
+def test_final_completion_requires_role_and_guardian_evidence_files(hermes_home, tmp_path):
+    from hermes_cli.warroom_goal import create_warroom_goal, guard_final_response, record_role_output, save_warroom_goal
+
+    state = create_warroom_goal(
+        "sid-final-evidence-proof",
+        "Use plan adversary skill for:\n\nGoal:\nwire final proof\n\nAcceptance:\n- proof\n\nConstraints:\n- worktree only\n\nVerify with:\npytest",
+        tracking_dir=str(tmp_path),
+        allowed_mutation_root=str(tmp_path),
+    )
+    proof = tmp_path / "proof-packet.md"
+    proof.write_text("PROOF PACKET\nTests: PASS\nRole evidence: PASS\n", encoding="utf-8")
+    state.proof_packet_path = str(proof)
+    state.role_spawn_evidence_path = str(tmp_path / "missing-role-spawn-evidence.json")
+    save_warroom_goal("sid-final-evidence-proof", state)
+
+    guardian = tmp_path / "guardian.txt"
+    guardian.write_text("Guardian verdict: PASS\n", encoding="utf-8")
+    record_role_output("sid-final-evidence-proof", "guardian", evidence_path=str(guardian), verdict="PASS")
+
+    blocked = guard_final_response(
+        "sid-final-evidence-proof",
+        "DONE. pytest E2E passed and proof packet written.",
+        closure=True,
+    )
+    assert "FINAL BLOCKED" in blocked
+    assert "role spawn evidence" in blocked

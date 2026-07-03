@@ -1,123 +1,131 @@
 {
-  "approval_phrase": "AL_APPROVES_OVERWRITE_AGT_HARDWIRES",
-  "generated_from_head": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
+  "generated_at": "2026-07-02T00:00:00Z",
   "protected_files": [
     {
-      "commit_source": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
-      "git_blob_sha": "4a27fe52c0f8ecb3266e8f3ff8cc80e08e36018b",
+      "commit_source": "sandbox-manual-overlay-port-20260702",
+      "git_blob_sha": "d2db570350ceaff3852cc6a2493d3d88a0a23a0b",
       "path": "agent/agt_gateway.py",
       "reason": "AGT action gateway policy rail: adversary-skill and plan-adversary-skill enforcement core",
-      "sha256": "3ce1f5a6068c4f0ea7c19381569d8dd061d59eb797676e927139dc636f2a78a4",
-      "wave_introduced": "wave1",
-      "wave_last_touched": "wave6"
+      "sha256": "86556ba1f8b217e7e7c9610b9124955af763c732540925a36d7c080cf23e4315",
+      "wave_introduced": "sandbox-manual-port",
+      "wave_last_touched": "2026-07-02-native-update-safe-work-ledger"
     },
     {
-      "commit_source": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
-      "git_blob_sha": "3db86d33ca93c84b890cfa6804315b74a9b1b967",
+      "commit_source": "sandbox-manual-overlay-port-20260702",
+      "git_blob_sha": "7a7064d72fe29f2d985f001baf33f58de5899acc",
       "path": "agent/chat_completion_helpers.py",
-      "reason": "AGT final claim/proof hardwire helpers",
-      "sha256": "c9bc8f1d23c30899ac9bfdcce628dc98912643c53f75c12b97e91d71ca614ba4",
-      "wave_introduced": "wave2",
-      "wave_last_touched": "wave5"
+      "reason": "Chat completion helper hardwire used by adversary-skill runtime protections",
+      "sha256": "145708ada9b651ee931b956692ca3890d3c87f1d95bd01ff688b53d5fbfa107f",
+      "wave_introduced": "sandbox-manual-port",
+      "wave_last_touched": "2026-07-02-native-update-safe-work-ledger"
     },
     {
-      "commit_source": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
-      "git_blob_sha": "08bb83882d9d53e9c2d00f8cbf7749c1656dd75f",
+      "commit_source": "sandbox-manual-overlay-port-20260702",
+      "git_blob_sha": "0683838d84b2142d1270f5a56147b6872cf0968d",
       "path": "cli.py",
-      "reason": "CLI terminal ingestion and sanitizer hardwire path",
-      "sha256": "f6c089d3286367b30b82ca2666c640bc52c0ade8c9b7866904409b76a77b6970",
-      "wave_introduced": "wave2",
-      "wave_last_touched": "wave6"
+      "reason": "CLI ingress hardwire for adversary-skill protected runtime behavior",
+      "sha256": "dc78f02c7fdfca49dfea10b1c874146a73cb2bde108a80997c63db50c9d515d1",
+      "wave_introduced": "sandbox-manual-port",
+      "wave_last_touched": "2026-07-02-native-update-safe-work-ledger"
     },
     {
-      "commit_source": "wave7-working-tree",
-      "git_blob_sha": "1fb48766da3cccf53feadf5318fc5621135c9d42",
+      "commit_source": "sandbox-manual-overlay-port-20260702",
+      "git_blob_sha": "0df3d1f62f6e5e568dbb8b0e109b114d0e6e3f47",
       "path": "hermes_cli/warroom_goal.py",
       "reason": "Warroom runtime hardwire shared by adversary-skill and plan-adversary-skill",
-      "sha256": "386b90628c035fcc38d0dcab5f83a696e4dc476dc8f0c80c31b492a90cfa2182",
-      "wave_introduced": "wave1",
-      "wave_last_touched": "wave7"
+      "sha256": "79cf4f2dd7ad1dc62480251d1d906278d51076c77fe9441d0b793babe864d092",
+      "wave_introduced": "sandbox-manual-port",
+      "wave_last_touched": "2026-07-02-native-update-safe-work-ledger"
     },
     {
-      "commit_source": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
-      "git_blob_sha": "b179ba951767ce1f76fd02f323bc39b8b27e2849",
+      "commit_source": "sandbox-manual-overlay-port-20260702",
+      "git_blob_sha": "7fd384dd22629cd77cfe51eeb35bbc52f3f41305",
       "path": "tools/delegate_tool.py",
       "reason": "Delegate/subagent dispatch hardwire path",
-      "sha256": "2c2284979800eb7386f8e9daa3ea9d38f36d9a48055e8900fca1030cbbdc46fc",
-      "wave_introduced": "wave1",
-      "wave_last_touched": "wave4"
+      "sha256": "2ea9149d04c2c6208139107a23211df998b9dc7e08b9d96270ef645242c19822",
+      "wave_introduced": "sandbox-manual-port",
+      "wave_last_touched": "2026-07-03-delegate-task-toolsets-repair"
     },
     {
-      "commit_source": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
-      "git_blob_sha": "fd0b6489a9fd82897836a866ea9ff28a1ef1490b",
+      "commit_source": "sandbox-manual-overlay-port-20260702",
+      "git_blob_sha": "731d075140d85205a9d182191362d1bf7c9102ac",
       "path": "tests/agent/test_agt_action_gateway.py",
       "reason": "AGT action gateway regression tests",
-      "sha256": "71947a8da53ef0cadd28eb6c5ee20bbbf1600065bb9d5a02df514f44db210c10",
-      "wave_introduced": "wave1",
-      "wave_last_touched": "wave6"
+      "sha256": "dae4de0a0e94d30fd91a9fd7b2b22d5ea000442eeda0b473009af98a4a734837",
+      "wave_introduced": "sandbox-manual-port",
+      "wave_last_touched": "2026-07-02-native-update-safe-work-ledger"
     },
     {
-      "commit_source": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
-      "git_blob_sha": "bc49e5f33d9afbcec0d1b09c6e8b58a5ecd1784d",
+      "commit_source": "sandbox-manual-overlay-port-20260702",
+      "git_blob_sha": "d989d69d1e3adcf9e01f6f68f7f4343be442ebad",
       "path": "tests/agent/test_codex_ttfb_watchdog.py",
-      "reason": "TTFB/context pressure hardwire regression tests",
-      "sha256": "e85bfbce70e9f79e7fdad3afa891ff44689f4a0a2957b63015418ccba7c35005",
-      "wave_introduced": "wave5",
-      "wave_last_touched": "wave5"
+      "reason": "Codex watchdog hardwire regression tests",
+      "sha256": "908c5210b32c6409e31539c8ba709c123b7b8c1eb740ced3f7dd9b4755dac9d1",
+      "wave_introduced": "sandbox-manual-port",
+      "wave_last_touched": "2026-07-02-native-update-safe-work-ledger"
     },
     {
-      "commit_source": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
-      "git_blob_sha": "72a0b5271d9aecac59c9ca3dc267fdd4739b11c6",
+      "commit_source": "sandbox-manual-overlay-port-20260702",
+      "git_blob_sha": "1db16df90b80419627f9a736ea25f3162d95e25c",
       "path": "tests/cli/test_cli_terminal_response_sanitizer.py",
-      "reason": "CLI terminal junk sanitizer hardwire regression tests",
-      "sha256": "1db7e803bd82acd7cebd0ba9a19397a3443a224f1426deeac54f5ecd2bfb2a8d",
-      "wave_introduced": "wave2",
-      "wave_last_touched": "wave2"
+      "reason": "CLI terminal response sanitizer regression tests",
+      "sha256": "7153de957d0268df051e4e9d66c7ef9c96c8ac8f91f9a011a24c19bad87887b1",
+      "wave_introduced": "sandbox-manual-port",
+      "wave_last_touched": "2026-07-02-native-update-safe-work-ledger"
     },
     {
-      "commit_source": "wave7-working-tree",
-      "git_blob_sha": "022cc842d36c5efcfffbabf1736772a95a44258a",
+      "commit_source": "sandbox-manual-overlay-port-20260702",
+      "git_blob_sha": "4389b73ce736f0e5e8f9578f533ad1d57e98b7b4",
       "path": "tests/hermes_cli/test_warroom_goal_runtime.py",
       "reason": "Warroom runtime tests for adversary-skill and plan-adversary-skill hardwires",
-      "sha256": "e9c83b1e2cb27d0927867b60a76d1bb996828e5e4678a11adbbf74b272015770",
-      "wave_introduced": "wave1",
-      "wave_last_touched": "wave7"
+      "sha256": "ea62c631486995695356c8ea85552eecb0bbbc5f84a77b6232cd7648c2cdaad0",
+      "wave_introduced": "sandbox-manual-port",
+      "wave_last_touched": "2026-07-02-native-update-safe-work-ledger"
     },
     {
-      "commit_source": "bebb708a58da03df57cdc8b4a1e6fba3caf73d3e",
-      "git_blob_sha": "29c80d26aff072185b0fc03b78c29583a77e8b48",
+      "commit_source": "sandbox-manual-overlay-port-20260702",
+      "git_blob_sha": "d35d3627eb9900b2eff612f4bd9468a28bd19133",
       "path": "tests/tools/test_delegate.py",
       "reason": "Delegate/subagent hardwire regression tests",
-      "sha256": "6d77435a8dc2324109f89607811016e23c340544a5c04898e5a4a70b7ccfe66b",
-      "wave_introduced": "wave1",
-      "wave_last_touched": "wave4"
+      "sha256": "1a7bd7948f48ae66d028b13dbc9a57cadd8fc7f5e79e36b28db22f15533266e2",
+      "wave_introduced": "sandbox-manual-port",
+      "wave_last_touched": "2026-07-02-native-update-safe-work-ledger"
     },
     {
-      "commit_source": "wave7-working-tree",
-      "git_blob_sha": "900c90820cb4c5177326a95c7113eb82d555c73e",
+      "commit_source": "sandbox-manual-overlay-port-20260702",
+      "git_blob_sha": "7d4da75815a37bf140e414bdfbb30f79fc64d6c1",
       "path": "hermes_cli/main.py",
       "reason": "Native update git pull/reset/checkout guard wiring",
-      "sha256": "61dd6a313b938bb0a7479032bc2f988e23a682edde037b8b8a92b13c060b62fb",
-      "wave_introduced": "wave7",
-      "wave_last_touched": "wave7"
+      "sha256": "30578be46caf8a88c2c67e008b906cb27a853988348333c836909212d8bf8ec4",
+      "wave_introduced": "sandbox-manual-port",
+      "wave_last_touched": "2026-07-02-native-update-safe-work-ledger"
     },
     {
-      "commit_source": "wave7-working-tree",
-      "git_blob_sha": "fa193d3803b6800632a540e69d061487333033cf",
+      "commit_source": "sandbox-manual-overlay-port-20260702",
+      "git_blob_sha": "a9c6fbf22fd3060dd3b0664d6daa293a67683c6a",
       "path": "hermes_cli/subcommands/update.py",
       "reason": "Native update approval phrase CLI wiring",
-      "sha256": "6b682b8570ba2344dc13b794ffd051e8e8754e30d071a21eabac2774c6be1dce",
-      "wave_introduced": "wave7",
-      "wave_last_touched": "wave7"
+      "sha256": "033b05eb39ec3375a60ae0160fdb81acbd986a2827070309c8b291d1be5ccfad",
+      "wave_introduced": "sandbox-manual-port",
+      "wave_last_touched": "2026-07-02-native-update-safe-work-ledger"
     },
     {
-      "commit_source": "wave7-working-tree",
-      "git_blob_sha": "8cee1a4003e4afb71523365554923dbd347ece11",
-      "path": "tools/checkpoint_manager.py",
-      "reason": "Restore/rollback hardwire overwrite guard wiring",
-      "sha256": "845f2240e83890b10e9f882a67b27293425eed1ad89a8c71bcb92d60e4790923",
-      "wave_introduced": "wave7",
-      "wave_last_touched": "wave7"
+      "commit_source": "sandbox-manual-overlay-port-20260702",
+      "git_blob_sha": "b98bb5ad3caff765a42814596b48981a873a4c46",
+      "path": "tests/hermes_cli/test_agt_hardwire_manifest.py",
+      "reason": "AGT hardwire manifest/native update overwrite guard tests",
+      "sha256": "c2f97d66d24d6305221348cf789e1468fc590b38b902837033a2ec132d8ecea0",
+      "wave_introduced": "sandbox-manual-port",
+      "wave_last_touched": "2026-07-02-native-update-safe-work-ledger"
+    },
+    {
+      "commit_source": "sandbox-manual-overlay-port-20260702",
+      "git_blob_sha": "3d79f421a0dcf4ab9f0c84e72c49e5f23cd400bc",
+      "path": "tests/hermes_cli/test_update_safe_work_ledger.py",
+      "reason": "Native update Safe Work Ledger regression tests",
+      "sha256": "0aaa0425fec5bb243a0b936ff0961b50fe4826534cbe2c7c7cc609737f85fc68",
+      "wave_introduced": "sandbox-manual-port",
+      "wave_last_touched": "2026-07-02-native-update-safe-work-ledger"
     }
   ],
   "schema": "agt-hardwire-manifest.v1"
