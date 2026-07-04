@@ -1327,7 +1327,7 @@ class TestDoctorStaleMaxIterationsDrift:
     """Regression for #17534: a stale HERMES_MAX_ITERATIONS in .env shadows
     agent.max_turns in config.yaml. The repro symptom is config.yaml saying
     400 while the gateway activity line reads N/90. Doctor must detect the
-    drift, and `--fix` must remove the .env ghost (config.yaml wins).
+    drift, and `--fix` must stay warn-only without removing the .env ghost.
 
     The detector reads the .env FILE directly, NOT os.environ — the gateway
     startup bridge can already have overridden os.environ to the config value,
@@ -1384,15 +1384,16 @@ class TestDoctorStaleMaxIterationsDrift:
         # Warn-only must NOT mutate .env.
         assert "HERMES_MAX_ITERATIONS=90" in (hermes_home / ".env").read_text(encoding="utf-8")
 
-    def test_fix_removes_ghost(self, monkeypatch, tmp_path):
+    def test_fix_is_warn_only_and_keeps_ghost(self, monkeypatch, tmp_path):
         out, hermes_home = self._run_config_section(
             monkeypatch, tmp_path, fix=True, ghost=90, cfg_turns=400,
             os_environ_value=400,
         )
-        assert "Removed stale HERMES_MAX_ITERATIONS" in out
+        assert "doctor --fix is disabled by local safety policy" in out
+        assert "HERMES_MAX_ITERATIONS=90" in out
         env_after = (hermes_home / ".env").read_text(encoding="utf-8")
-        assert "HERMES_MAX_ITERATIONS" not in env_after
-        assert "OPENAI_API_KEY=sk-test" in env_after  # other keys preserved
+        assert "HERMES_MAX_ITERATIONS=90" in env_after
+        assert "OPENAI_API_KEY" in env_after  # other keys preserved
 
     def test_no_drift_when_values_match(self, monkeypatch, tmp_path):
         out, _ = self._run_config_section(

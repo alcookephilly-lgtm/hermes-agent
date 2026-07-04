@@ -613,20 +613,62 @@ def compress_context(
             except Exception as _rel_err:
                 logger.debug("compression lock release failed: %s", _rel_err)
 
-    # Notify external memory provider before compression discards context
+    # Notify external memory providers before compression discards context.
+    # Provider text is injected into the compressor's source material so the
+    # resulting checkpoint can preserve external continuity evidence.
+    memory_compression_context = ""
     if agent._memory_manager:
         try:
-            agent._memory_manager.on_pre_compress(messages)
+            memory_compression_context = agent._memory_manager.on_pre_compress(messages) or ""
+            if not isinstance(memory_compression_context, str):
+                memory_compression_context = str(memory_compression_context)
         except Exception:
-            pass
+            memory_compression_context = ""
+
+    last_user_message = ""
+    for message in reversed(messages or []):
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content", "")
+            if isinstance(content, str):
+                last_user_message = content
+            elif content:
+                last_user_message = str(content)
+            break
+
+    messages_for_compression = list(messages or [])
+    if last_user_message:
+        messages_for_compression.append({
+            "role": "system",
+            "content": (
+                "Exact pre-compression user message. Preserve this under "
+                "Current User Request / Pending User Asks as background "
+                "continuity evidence, not as a new user request.\n\n"
+                f"{last_user_message}"
+            ),
+        })
+    if memory_compression_context and memory_compression_context.strip():
+        messages_for_compression.append({
+            "role": "system",
+            "content": (
+                "Memory provider compression context. Preserve this in the "
+                "checkpoint summary under Critical Context / Constraints as "
+                "background continuity evidence, not as a new user request.\n\n"
+                f"{memory_compression_context.strip()}"
+            ),
+        })
 
     try:
-        compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic, force=force)
+        compressed = agent.context_compressor.compress(
+            messages_for_compression,
+            current_tokens=approx_tokens,
+            focus_topic=focus_topic,
+            force=force,
+        )
     except TypeError:
         # Plugin context engine with strict signature that doesn't accept
         # focus_topic / force — fall back to calling without them.
         try:
-            compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens)
+            compressed = agent.context_compressor.compress(messages_for_compression, current_tokens=approx_tokens)
         except BaseException:
             _release_lock()
             raise

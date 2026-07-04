@@ -510,7 +510,10 @@ def managed_scope_check() -> None:
 
 def run_doctor(args):
     """Run diagnostic checks."""
-    should_fix = getattr(args, 'fix', False)
+    fix_requested = bool(getattr(args, 'fix', False))
+    # Local safety policy: doctor may diagnose, but it must never mutate files.
+    # Keep --fix accepted for compatibility, then force warn-only mode.
+    should_fix = False
     ack_target = getattr(args, 'ack', None)
 
     # Doctor runs from the interactive CLI, so CLI-gated tool availability
@@ -556,6 +559,11 @@ def run_doctor(args):
     print(color("┌─────────────────────────────────────────────────────────┐", Colors.CYAN))
     print(color("│                 🩺 Hermes Doctor                        │", Colors.CYAN))
     print(color("└─────────────────────────────────────────────────────────┘", Colors.CYAN))
+    if fix_requested:
+        print(color(
+            "  ⚠ doctor --fix is disabled by local safety policy; running diagnostics only.",
+            Colors.YELLOW,
+        ))
 
     _section("Security Advisories")
     try:
@@ -948,7 +956,7 @@ def run_doctor(args):
                         check_warn(f"Auto-migration failed: {mig_err}")
                         issues.append("Run 'hermes setup' to migrate config")
                 else:
-                    issues.append("Run 'hermes doctor --fix' or 'hermes setup' to migrate config")
+                    issues.append("Run 'hermes setup' after manual config review (doctor auto-fix is disabled)")
             else:
                 check_ok(f"Config version up to date (v{current_ver})")
         except Exception:
@@ -988,7 +996,7 @@ def run_doctor(args):
                     check_ok("Migrated stale root-level keys into model section")
                     fixed_count += 1
                 else:
-                    issues.append("Stale root-level provider/base_url in config.yaml — run 'hermes doctor --fix'")
+                    issues.append("Stale root-level provider/base_url in config.yaml — manual config review required (doctor auto-fix disabled)")
         except Exception:
             pass
 
@@ -1044,7 +1052,7 @@ def run_doctor(args):
                 else:
                     issues.append(
                         "Stale HERMES_MAX_ITERATIONS in .env shadows config.yaml — "
-                        "run 'hermes doctor --fix'"
+                        "remove manually after review (doctor auto-fix disabled)"
                     )
         except Exception:
             pass
@@ -1265,7 +1273,7 @@ def run_doctor(args):
                         )
                 else:
                     issues.append(
-                        "state.db FTS write corruption — run 'hermes doctor --fix' "
+                        "state.db FTS write corruption — manual repair required (doctor auto-fix disabled) "
                         "(or 'hermes sessions repair') to rebuild the FTS index"
                     )
         except Exception as e:
@@ -1311,7 +1319,7 @@ def run_doctor(args):
                         )
                 else:
                     issues.append(
-                        "state.db schema malformed — run 'hermes doctor --fix' "
+                        "state.db schema malformed — manual repair required (doctor auto-fix disabled) "
                         "(or 'hermes sessions repair') to recover hidden sessions"
                     )
             else:
@@ -1338,7 +1346,7 @@ def run_doctor(args):
                     check_ok(f"WAL checkpoint performed ({wal_size // 1024}K → {new_size // 1024}K)")
                     fixed_count += 1
                 else:
-                    issues.append("Large WAL file — run 'hermes doctor --fix' to checkpoint")
+                    issues.append("Large WAL file — checkpoint manually only after backup/review (doctor auto-fix disabled)")
             elif wal_size > 10 * 1024 * 1024:  # 10 MB
                 check_info(f"WAL file is {wal_size // (1024*1024)} MB (normal for active sessions)")
         except Exception:
@@ -1396,7 +1404,7 @@ def run_doctor(args):
                         check_ok(f"Fixed symlink: {_cmd_link_display}/hermes → {_venv_bin}")
                         fixed_count += 1
                     else:
-                        issues.append(f"Broken symlink at {_cmd_link_display}/hermes — run 'hermes doctor --fix'")
+                        issues.append(f"Broken symlink at {_cmd_link_display}/hermes — manual repair required (doctor auto-fix disabled)")
             elif _cmd_link.exists():
                 # It's a regular file, not a symlink — possibly a wrapper script
                 check_ok(f"{_cmd_link_display}/hermes exists (non-symlink)")
@@ -1420,7 +1428,7 @@ def run_doctor(args):
                         )
                         manual_issues.append(f"Add {_cmd_link_display} to your PATH")
                 else:
-                    issues.append(f"Missing {_cmd_link_display}/hermes symlink — run 'hermes doctor --fix'")
+                    issues.append(f"Missing {_cmd_link_display}/hermes symlink — manual repair required (doctor auto-fix disabled)")
 
     _section("External Tools")
     # Git
@@ -2404,7 +2412,7 @@ def run_doctor(args):
             print(f"  {i}. {issue}")
         print()
         if not should_fix:
-            print(color("  Tip: run 'hermes doctor --fix' to auto-fix what's possible.", Colors.DIM))
+            print(color("  Tip: doctor auto-fix is disabled; use diagnostics, then make reviewed manual changes.", Colors.DIM))
     else:
         print(color("─" * 60, Colors.GREEN))
         print(color("  All checks passed! 🎉", Colors.GREEN, Colors.BOLD))

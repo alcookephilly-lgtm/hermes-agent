@@ -7632,7 +7632,7 @@ def show_config():
         if _env_ghost is not None and str(_env_ghost).strip() != str(_cfg_max_turns).strip():
             print(color(
                 f"                ⚠ .env has stale HERMES_MAX_ITERATIONS={_env_ghost} "
-                f"(run 'hermes doctor --fix' to remove)",
+                f"(remove manually after review; doctor auto-fix is disabled)",
                 Colors.YELLOW,
             ))
     except Exception:

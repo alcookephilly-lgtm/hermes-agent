@@ -20,7 +20,9 @@ def build_doctor_parser(subparsers, *, cmd_doctor: Callable) -> None:
         description="Diagnose issues with Hermes Agent setup",
     )
     doctor_parser.add_argument(
-        "--fix", action="store_true", help="Attempt to fix issues automatically"
+        "--fix",
+        action="store_true",
+        help="DISABLED locally: run diagnostics only; auto-fix mutations are blocked",
     )
     doctor_parser.add_argument(
         "--ack",

@@ -196,6 +196,7 @@ class TestImageRejectionPhraseIsolation:
         "model does not support image",
         "image_url'. expected",
         "no endpoints found that support image input",
+        "image data you provided does not represent a valid image",
     )
 
     def _matches(self, body: str) -> bool:
@@ -248,6 +249,7 @@ class TestImageRejectionPhraseIsolation:
             # OpenRouter 404 when no upstream endpoint for the model accepts
             # image input — issue #21160. The exact wording from the report.
             "HTTP 404: No endpoints found that support image input",
+            "The image data you provided does not represent a valid image. Please check your input and try again.",
         ]
         for body in bodies:
             assert self._matches(body) is True, f"false negative on: {body}"
