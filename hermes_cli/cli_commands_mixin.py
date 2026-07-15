@@ -2008,30 +2008,6 @@ class CLICommandsMixin:
 
         lower = arg.lower()
 
-        # Warroom /goal hardwire: literal /goal payloads are routed to the
-        # user-world runtime before legacy GoalManager fallback. Core keeps only
-        # this import/dispatch seam; behavior lives in ~/.hermes/tools.
-        try:
-            from hermes_cli.warroom_goal import handle_global_goal_slash
-            handled = handle_global_goal_slash(
-                getattr(self, "session_id", "") or "",
-                cmd,
-                parent_agent=getattr(self, "agent", None),
-            )
-        except Exception as exc:
-            handled = {"handled": True, "response": f"GAP: Warroom /goal runtime failed: {exc}", "kickoff": None}
-        if handled is not None:
-            response = handled.get("response") if isinstance(handled, dict) else str(handled)
-            if response:
-                _cprint(f"  {response}")
-            kickoff = handled.get("kickoff") if isinstance(handled, dict) else None
-            if kickoff:
-                try:
-                    self._pending_input.put(kickoff)
-                except Exception:
-                    pass
-            return
-
         # Bare /goal or /goal status → show current state
         if not arg or lower == "status":
             _cprint(f"  {mgr.status_line()}")
